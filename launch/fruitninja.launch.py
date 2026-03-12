@@ -12,10 +12,11 @@ def generate_launch_description():
 
     ur_robot_driver_dir = get_package_share_directory('ur_robot_driver')
     ur_moveit_config_dir = get_package_share_directory('ur_moveit_config')
+    fruitninja_dir = get_package_share_directory('fruitninja')
 
     robot_ip = '192.168.56.101'
     ur_type = 'ur3e'
-    urdf_file = '/home/dinesh/ros2_ws/src/ur3e_camera_workcell.urdf.xacro'
+    urdf_file = os.path.join(fruitninja_dir, 'urdf', 'ur3e_workcell.urdf.xacro')
 
     # -------------------------------------------------------
     # 1. UR Robot Driver (no RViz - MoveIt will handle that)
