@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, TimerAction, ExecuteProcess
+from launch.actions import IncludeLaunchDescription, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -12,14 +12,12 @@ def generate_launch_description():
 
     ur_robot_driver_dir = get_package_share_directory('ur_robot_driver')
     ur_moveit_config_dir = get_package_share_directory('ur_moveit_config')
-    fruitninja_dir = get_package_share_directory('fruitninja')
 
     robot_ip = '192.168.56.101'
     ur_type = 'ur3e'
-    urdf_file = os.path.join(fruitninja_dir, 'urdf', 'ur3e_workcell.urdf.xacro')
 
     # -------------------------------------------------------
-    # 1. UR Robot Driver (no RViz - MoveIt will handle that)
+    # 1. UR Robot Driver
     # -------------------------------------------------------
     ur_control = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -29,12 +27,13 @@ def generate_launch_description():
             'ur_type': ur_type,
             'robot_ip': robot_ip,
             'launch_rviz': 'false',
-            'urdf_file': urdf_file,
+            'description_package': 'fruitninja',
+            'description_file': 'ur3e_workcell.urdf.xacro',
         }.items()
     )
 
     # -------------------------------------------------------
-    # 2. MoveIt with RViz (delayed 5s to let driver start up)
+    # 2. MoveIt with RViz (delayed 5s)
     # -------------------------------------------------------
     ur_moveit = TimerAction(
         period=5.0,
@@ -47,16 +46,18 @@ def generate_launch_description():
                     'ur_type': ur_type,
                     'robot_ip': robot_ip,
                     'launch_rviz': 'true',
+                    'description_package': 'fruitninja',
+                    'description_file': 'ur3e_workcell.urdf.xacro',
                 }.items()
             )
         ]
     )
 
     # -------------------------------------------------------
-    # 3. Planning Scene (delayed 10s to let MoveIt start up)
+    # 3. Planning Scene (delayed 12s)
     # -------------------------------------------------------
     planning_scene = TimerAction(
-        period=10.0,
+        period=12.0,
         actions=[
             Node(
                 package='fruitninja',
