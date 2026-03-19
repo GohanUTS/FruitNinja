@@ -29,6 +29,8 @@ def generate_launch_description():
             'launch_rviz': 'false',
             'description_package': 'fruitninja',
             'description_file': 'ur3e_workcell.urdf.xacro',
+            'use_fake_hardware': 'true',
+            'initial_joint_controller': 'joint_trajectory_controller',
         }.items()
     )
 
@@ -48,6 +50,7 @@ def generate_launch_description():
                     'launch_rviz': 'true',
                     'description_package': 'fruitninja',
                     'description_file': 'ur3e_workcell.urdf.xacro',
+                    'use_sim_time': 'true',
                 }.items()
             )
         ]
