@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'planning_scene = fruitninja.planning_scene:main',
+            'movement = fruitninja.movement:main',
         ],
     },
 )

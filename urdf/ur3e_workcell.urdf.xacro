@@ -2,6 +2,10 @@
 <robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur3e_workcell">
   <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
 
+  <!-- Passed through from ur_control launch (enables mock hardware for fake/sim mode) -->
+  <xacro:arg name="use_fake_hardware" default="false"/>
+  <xacro:arg name="fake_sensor_commands" default="false"/>
+
   <!-- World frame -->
   <link name="world"/>
 
@@ -21,7 +25,9 @@
     joint_limits_parameters_file="$(find ur_description)/config/ur3e/joint_limits.yaml"
     kinematics_parameters_file="$(find ur_description)/config/ur3e/default_kinematics.yaml"
     physical_parameters_file="$(find ur_description)/config/ur3e/physical_parameters.yaml"
-    visual_parameters_file="$(find ur_description)/config/ur3e/visual_parameters.yaml">
+    visual_parameters_file="$(find ur_description)/config/ur3e/visual_parameters.yaml"
+    use_fake_hardware="$(arg use_fake_hardware)"
+    fake_sensor_commands="$(arg fake_sensor_commands)">
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </xacro:ur_robot>
 
