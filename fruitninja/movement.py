@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import math
 import rclpy
 from rclpy.node import Node
@@ -28,12 +29,13 @@ MOVE_GROUP = 'ur_manipulator'
 # shoulder_pan sweeps from PAN_START to PAN_END across NUM_CUTS positions.
 # All other joints remain fixed throughout.
 
-HOVER_LIFT = math.radians(-52)
-CUT_LIFT   = math.radians(-41)
+HOVER_LIFT     = math.radians(-52)
+CUT_LIFT       = math.radians(-41)
 
-PAN_START  = math.radians(15)
-PAN_END    = math.radians(-41)
-NUM_CUTS   = 5
+# Defaults — overridden by ROS2 params when launched from GUI
+PAN_CENTRE     = math.radians(-13)   # centre of sweep
+PAN_HALF_RANGE = math.radians(28)    # ± from centre  →  -41° to +15°
+NUM_CUTS       = 5
 
 FIXED_JOINTS = {
     'elbow_joint':   math.radians(103),
@@ -65,19 +67,24 @@ def make_joint_goal(pan, lift) -> Constraints:
     return c
 
 
-def pan_positions() -> list:
-    if NUM_CUTS == 1:
-        return [(PAN_START + PAN_END) / 2.0]
-    step = (PAN_END - PAN_START) / (NUM_CUTS - 1)
-    return [PAN_START + i * step for i in range(NUM_CUTS)]
+def pan_positions(centre: float, half_range: float, n: int) -> list:
+    if n == 1:
+        return [centre]
+    step = (2 * half_range) / (n - 1)
+    return [centre - half_range + i * step for i in range(n)]
 
 
 # ── Node ───────────────────────────────────────────────────────────────────────
 
 class MovementNode(Node):
-    def __init__(self):
+    def __init__(self, num_cuts=NUM_CUTS,
+                 pan_centre=PAN_CENTRE,
+                 pan_half_range=PAN_HALF_RANGE):
         super().__init__('fruitninja_movement')
-        self._client = ActionClient(self, MoveGroup, '/move_action')
+        self._client       = ActionClient(self, MoveGroup, '/move_action')
+        self._num_cuts     = num_cuts
+        self._pan_centre   = pan_centre
+        self._pan_half_range = pan_half_range
 
     def move_to(self, pan: float, lift: float, label: str) -> bool:
         self.get_logger().info(
@@ -150,9 +157,10 @@ class MovementNode(Node):
         return False
 
     def perform_cuts(self) -> None:
-        pans = pan_positions()
+        n    = self._num_cuts
+        pans = pan_positions(self._pan_centre, self._pan_half_range, n)
         for i, pan in enumerate(pans):
-            label = f'Cut {i+1}/{NUM_CUTS}  pan={math.degrees(pan):.1f}°'
+            label = f'Cut {i+1}/{n}  pan={math.degrees(pan):.1f}°'
             self.get_logger().info(f'--- {label} ---')
 
             if not self.move_to(pan, HOVER_LIFT, f'Hover {i+1}'):
@@ -171,14 +179,26 @@ class MovementNode(Node):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = MovementNode()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num-cuts',       type=int,   default=NUM_CUTS)
+    parser.add_argument('--pan-centre',     type=float, default=math.degrees(PAN_CENTRE))
+    parser.add_argument('--pan-half-range', type=float, default=math.degrees(PAN_HALF_RANGE))
+    parsed, remaining = parser.parse_known_args()
 
+    rclpy.init(args=remaining)
+    node = MovementNode(
+        num_cuts      = parsed.num_cuts,
+        pan_centre    = math.radians(parsed.pan_centre),
+        pan_half_range= math.radians(parsed.pan_half_range),
+    )
+
+    c, hr, n = node._pan_centre, node._pan_half_range, node._num_cuts
     print('=== FruitNinja Cutting Sequence ===')
-    print(f'  pan range  : {math.degrees(PAN_START):.1f}° → {math.degrees(PAN_END):.1f}°')
+    print(f'  pan centre : {math.degrees(c):.1f}°')
+    print(f'  pan range  : {math.degrees(c-hr):.1f}° → {math.degrees(c+hr):.1f}°')
     print(f'  hover lift : {math.degrees(HOVER_LIFT):.1f}°')
     print(f'  cut lift   : {math.degrees(CUT_LIFT):.1f}°')
-    print(f'  num cuts   : {NUM_CUTS}')
+    print(f'  num cuts   : {n}')
     print()
 
     node.move_to_ready()

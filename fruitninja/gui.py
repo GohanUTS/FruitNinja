@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QGroupBox, QTextEdit,
+    QSpinBox, QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QFont
@@ -291,13 +292,13 @@ class MainWindow(QMainWindow):
         top.addWidget(arm_group, stretch=2)
 
         ctrl_group = self._group('Controls')
-        ctrl_group.setFixedWidth(210)
+        ctrl_group.setFixedWidth(230)
         cl = ctrl_group.layout()
         cl.setSpacing(10)
 
-        self._btn_build  = self._btn('🔨  Rebuild',       '#1e4a7a', self._rebuild)
-        self._btn_launch = self._btn('🚀  Launch MoveIt', '#1e5c1e', self._launch)
-        self._btn_run    = self._btn('▶   Start Cuts',    '#6a1e1e', self._run)
+        self._btn_build    = self._btn('🔨  Rebuild',       '#1e4a7a', self._rebuild)
+        self._btn_launch   = self._btn('🚀  Launch MoveIt', '#1e5c1e', self._launch)
+        self._btn_run      = self._btn('▶   Start Cuts',    '#6a1e1e', self._run)
         self._btn_stop     = self._btn('■   Stop All',      '#444444', self._stop)
         self._btn_reset    = self._btn('↺   Reset',         '#4a3a00', self._reset)
         self._btn_shutdown = self._btn('⏻   Quit All',      '#5a1a1a', self._shutdown)
@@ -306,9 +307,43 @@ class MainWindow(QMainWindow):
         self._status.setAlignment(Qt.AlignCenter)
         self._status.setStyleSheet('color:#aaa; font-size:12px;')
 
+        # ── cut parameters ────────────────────────────────────────────────────
+        param_group = self._group('Cut Parameters')
+        pl = param_group.layout()
+        pl.setSpacing(6)
+
+        def _row(label, widget):
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setStyleSheet('color:#ccc; font-size:11px;')
+            row.addWidget(lbl)
+            row.addWidget(widget)
+            pl.addLayout(row)
+
+        self._spin_cuts = QSpinBox()
+        self._spin_cuts.setRange(1, 30)
+        self._spin_cuts.setValue(5)
+        self._spin_cuts.setStyleSheet('background:#333; color:white;')
+        _row('Num cuts:', self._spin_cuts)
+
+        self._spin_centre = QDoubleSpinBox()
+        self._spin_centre.setRange(-90, 90)
+        self._spin_centre.setValue(-13.0)
+        self._spin_centre.setSuffix('°')
+        self._spin_centre.setStyleSheet('background:#333; color:white;')
+        _row('Centre pan:', self._spin_centre)
+
+        self._spin_range = QDoubleSpinBox()
+        self._spin_range.setRange(1, 90)
+        self._spin_range.setValue(28.0)
+        self._spin_range.setSuffix('°')
+        self._spin_range.setStyleSheet('background:#333; color:white;')
+        _row('± Range:', self._spin_range)
+
         for w in (self._btn_build, self._btn_launch,
                   self._btn_run,   self._btn_stop,
-                  self._btn_reset, self._btn_shutdown):
+                  self._btn_reset, self._btn_shutdown,
+                  param_group):
             cl.addWidget(w)
         cl.addStretch()
         cl.addWidget(self._status)
@@ -368,10 +403,16 @@ class MainWindow(QMainWindow):
         self._status_set('🚀 MoveIt running', '#3a7aff')
 
     def _run(self):
+        n  = self._spin_cuts.value()
+        c  = self._spin_centre.value()
+        hr = self._spin_range.value()
         self._status_set('▶ Cutting…', '#ff5555')
         self._shell(
             'movement',
-            f'{self._ROS} && ros2 run fruitninja movement',
+            f'{self._ROS} && ros2 run fruitninja movement'
+            f' --num-cuts {n}'
+            f' --pan-centre {c}'
+            f' --pan-half-range {hr}',
             done_msg='✓ Sequence complete',
         )
 
