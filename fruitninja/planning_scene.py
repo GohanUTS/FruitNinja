@@ -1,11 +1,93 @@
 #!/usr/bin/env python3
 
+import os
+import xml.etree.ElementTree as ET
 import rclpy
 from rclpy.node import Node
 from moveit_msgs.msg import PlanningScene, CollisionObject
-from shape_msgs.msg import SolidPrimitive
-from geometry_msgs.msg import Pose
+from shape_msgs.msg import Mesh, MeshTriangle
+from geometry_msgs.msg import Pose, Point
+from ament_index_python.packages import get_package_share_directory
 import time
+
+_DAE_NS = {'c': 'http://www.collada.org/2005/11/COLLADASchema'}
+
+
+def load_dae_mesh(filepath: str, scale: float = 1.0) -> Mesh:
+    """Parse a COLLADA (.dae) file into a shape_msgs/Mesh.
+
+    scale=0.01 because UR3eTrolley.dae was authored in centimetres
+    but exported with unit=meter.
+    """
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+    ros_mesh = Mesh()
+
+    for geom in root.findall('.//c:geometry', _DAE_NS):
+        mesh_el = geom.find('c:mesh', _DAE_NS)
+        if mesh_el is None:
+            continue
+
+        # ── vertices ──────────────────────────────────────────────
+        positions_src = None
+        for src in mesh_el.findall('c:source', _DAE_NS):
+            if 'positions' in src.get('id', '').lower():
+                positions_src = src
+                break
+        if positions_src is None:
+            continue
+
+        fa = positions_src.find('c:float_array', _DAE_NS)
+        if fa is None or not fa.text:
+            continue
+
+        raw = list(map(float, fa.text.split()))
+        vertex_offset = len(ros_mesh.vertices)
+        for i in range(0, len(raw) - 2, 3):
+            ros_mesh.vertices.append(Point(
+                x=raw[i]     * scale,
+                y=raw[i + 1] * scale,
+                z=raw[i + 2] * scale,
+            ))
+
+        # ── triangles ─────────────────────────────────────────────
+        for tri_el in mesh_el.findall('c:triangles', _DAE_NS):
+            stride = len(tri_el.findall('c:input', _DAE_NS))
+            p_el = tri_el.find('c:p', _DAE_NS)
+            if p_el is None or not p_el.text:
+                continue
+            indices = list(map(int, p_el.text.split()))
+            for i in range(0, len(indices), stride * 3):
+                t = MeshTriangle()
+                t.vertex_indices = [
+                    indices[i]              + vertex_offset,
+                    indices[i + stride]     + vertex_offset,
+                    indices[i + stride * 2] + vertex_offset,
+                ]
+                ros_mesh.triangles.append(t)
+
+        for poly_el in mesh_el.findall('c:polylist', _DAE_NS):
+            stride = len(poly_el.findall('c:input', _DAE_NS))
+            p_el = poly_el.find('c:p', _DAE_NS)
+            if p_el is None or not p_el.text:
+                continue
+            indices = list(map(int, p_el.text.split()))
+            vcount_el = poly_el.find('c:vcount', _DAE_NS)
+            counts = list(map(int, vcount_el.text.split())) if vcount_el is not None else []
+            pos = 0
+            for count in counts:
+                verts = [indices[(pos + j) * stride] for j in range(count)]
+                for j in range(1, count - 1):
+                    t = MeshTriangle()
+                    t.vertex_indices = [
+                        verts[0]     + vertex_offset,
+                        verts[j]     + vertex_offset,
+                        verts[j + 1] + vertex_offset,
+                    ]
+                    ros_mesh.triangles.append(t)
+                pos += count
+
+    return ros_mesh
 
 
 class PlanningSceneSetup(Node):
@@ -25,98 +107,40 @@ class PlanningSceneSetup(Node):
         planning_scene = PlanningScene()
         planning_scene.is_diff = True
 
-        # -------------------------------------------------------
-        # TABLE TOP (5cm thick surface at z=1.0m)
-        # -------------------------------------------------------
-        table = CollisionObject()
-        table.id = 'table'
-        table.header.frame_id = 'world'
-
-        table_shape = SolidPrimitive()
-        table_shape.type = SolidPrimitive.BOX
-        table_shape.dimensions = [0.73, 0.71, 0.05]
-
-        table_pose = Pose()
-        table_pose.position.x = 0.365
-        table_pose.position.y = 0.355
-        table_pose.position.z = 0.975
-        table_pose.orientation.w = 1.0
-
-        table.primitives.append(table_shape)
-        table.primitive_poses.append(table_pose)
-        table.operation = CollisionObject.ADD
+        pkg_share = get_package_share_directory('fruitninja')
 
         # -------------------------------------------------------
-        # TABLE BODY (legs/base, 95cm tall)
+        # UR3e TROLLEY (mesh collision object)
+        # DAE authored in cm, exported as meters → scale=0.01
+        # Rotation (0.5, 0.5, 0.5, 0.5): stands mesh upright (Y-up→Z-up)
+        # and rotates 90° CCW to face correct direction.
+        # Position (0, 0, 0): world origin at floor level.
         # -------------------------------------------------------
-        table_body = CollisionObject()
-        table_body.id = 'table_body'
-        table_body.header.frame_id = 'world'
+        mesh_path = os.path.join(pkg_share, 'meshes', 'UR3eTrolley.dae')
+        self.get_logger().info(f'Loading trolley mesh: {mesh_path}')
 
-        body_shape = SolidPrimitive()
-        body_shape.type = SolidPrimitive.BOX
-        body_shape.dimensions = [0.73, 0.71, 0.95]
+        trolley = CollisionObject()
+        trolley.id = 'trolley'
+        trolley.header.frame_id = 'world'
 
-        body_pose = Pose()
-        body_pose.position.x = 0.365
-        body_pose.position.y = 0.355
-        body_pose.position.z = 0.475
-        body_pose.orientation.w = 1.0
+        trolley.meshes.append(load_dae_mesh(mesh_path, scale=0.01))
 
-        table_body.primitives.append(body_shape)
-        table_body.primitive_poses.append(body_pose)
-        table_body.operation = CollisionObject.ADD
+        mesh_pose = Pose()
+        mesh_pose.position.x = 0.0
+        mesh_pose.position.y = 0.0
+        mesh_pose.position.z = 0.0
+        # 90° around X (Y-up → Z-up) + 90° CCW around Z
+        mesh_pose.orientation.x = 0.5
+        mesh_pose.orientation.y = 0.5
+        mesh_pose.orientation.z = 0.5
+        mesh_pose.orientation.w = 0.5
+        trolley.mesh_poses.append(mesh_pose)
+        trolley.operation = CollisionObject.ADD
 
-        # -------------------------------------------------------
-        # ROBOT BASE MOUNT (cylinder, centred on table)
-        # -------------------------------------------------------
-        robot_base = CollisionObject()
-        robot_base.id = 'robot_base_mount'
-        robot_base.header.frame_id = 'world'
-
-        base_shape = SolidPrimitive()
-        base_shape.type = SolidPrimitive.CYLINDER
-        base_shape.dimensions = [0.05, 0.075]  # height, radius
-
-        base_pose = Pose()
-        base_pose.position.x = 0.365  # centre of table
-        base_pose.position.y = 0.355  # centre of table
-        base_pose.position.z = 1.025  # on top of table surface
-        base_pose.orientation.w = 1.0
-
-        robot_base.primitives.append(base_shape)
-        robot_base.primitive_poses.append(base_pose)
-        robot_base.operation = CollisionObject.ADD
-
-        # -------------------------------------------------------
-        # CHOPPING BLOCK (to the side, within UR3e reach)
-        # -------------------------------------------------------
-        chopping_block = CollisionObject()
-        chopping_block.id = 'chopping_block'
-        chopping_block.header.frame_id = 'world'
-
-        block_shape = SolidPrimitive()
-        block_shape.type = SolidPrimitive.BOX
-        block_shape.dimensions = [0.30, 0.25, 0.08]  # 30cm x 25cm x 8cm
-
-        block_pose = Pose()
-        block_pose.position.x = 0.365       # same x as robot
-        block_pose.position.y = 0.355 - 0.30  # 30cm in front of robot
-        block_pose.position.z = 1.04        # on table surface
-        block_pose.orientation.w = 1.0
-
-        chopping_block.primitives.append(block_shape)
-        chopping_block.primitive_poses.append(block_pose)
-        chopping_block.operation = CollisionObject.ADD
-
-        # Add all objects
-        planning_scene.world.collision_objects.append(table)
-        planning_scene.world.collision_objects.append(table_body)
-        planning_scene.world.collision_objects.append(robot_base)
-        planning_scene.world.collision_objects.append(chopping_block)
+        planning_scene.world.collision_objects.append(trolley)
 
         self.scene_pub.publish(planning_scene)
-        self.get_logger().info('Planning scene published: table + robot base + chopping block.')
+        self.get_logger().info('Planning scene published: UR3e trolley mesh.')
 
 
 def main(args=None):
