@@ -50,7 +50,7 @@ def generate_launch_description():
                     'launch_rviz': 'true',
                     'description_package': 'fruitninja',
                     'description_file': 'ur3e_workcell.urdf.xacro',
-                    'use_sim_time': 'true',
+                    'use_sim_time': 'false',
                 }.items()
             )
         ]

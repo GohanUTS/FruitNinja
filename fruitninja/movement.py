@@ -194,5 +194,16 @@ def main(args=None):
     rclpy.shutdown()
 
 
+def reset_main(args=None):
+    """Move robot to ready position only — used by GUI reset button."""
+    rclpy.init(args=args)
+    node = MovementNode()
+    print('=== FruitNinja Reset → Ready Position ===')
+    node.move_to_ready()
+    print('=== Done ===')
+    node.destroy_node()
+    rclpy.shutdown()
+
+
 if __name__ == '__main__':
     main()

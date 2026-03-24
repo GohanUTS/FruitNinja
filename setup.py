@@ -24,6 +24,8 @@ setup(
         'console_scripts': [
             'planning_scene = fruitninja.planning_scene:main',
             'movement = fruitninja.movement:main',
+            'reset = fruitninja.movement:reset_main',
+            'gui = fruitninja.gui:main',
         ],
     },
 )
