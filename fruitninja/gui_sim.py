@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QGroupBox, QTextEdit,
-    QSpinBox, QDoubleSpinBox, QLineEdit,
+    QSpinBox, QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QFont
@@ -157,18 +157,8 @@ class ArmWidget(QWidget):
 
 # ── OpenCV camera widget ───────────────────────────────────────────────────────
 
-try:
-    import pyrealsense2 as rs
-    _HAS_RS = True
-except ImportError:
-    _HAS_RS = False
-
-
 class CameraWidget(QLabel):
-    """
-    Grabs colour frames from an Intel RealSense D435i (preferred)
-    or falls back to the first webcam via cv2.VideoCapture.
-    """
+    """Grabs frames from the first webcam, applies HSV fruit-colour detection."""
 
     def __init__(self):
         super().__init__()
@@ -176,70 +166,33 @@ class CameraWidget(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setText('No camera connected')
         self.setStyleSheet('color: #888; background: #111; font-size: 13px;')
-        self._pipeline = None
-        self._cap      = None
-        self._timer    = QTimer(self)
+        self._cap = None
+        self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
     def start(self):
-        if _HAS_RS:
-            try:
-                self._pipeline = rs.pipeline()
-                cfg = rs.config()
-                cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-                self._pipeline.start(cfg)
-                self._timer.start(33)
-                print('[camera] RealSense D435i started')
-                return
-            except Exception as e:
-                self._pipeline = None
-                print(f'[camera] RealSense error: {e}')
-                self.setText(f'RealSense error:\n{e}')
-                return  # don't fall back — show the error clearly
-        else:
-            print('[camera] pyrealsense2 not found, falling back to webcam')
-
-        # fallback to webcam only if no RealSense
         self._cap = cv2.VideoCapture(0)
         if self._cap.isOpened():
-            self._timer.start(33)
-            print('[camera] Webcam started')
+            self._timer.start(33)          # ~30 fps
         else:
-            self.setText('No camera found')
+            self.setText('Camera not found (index 0)')
 
     def stop(self):
         self._timer.stop()
-        if self._pipeline:
-            self._pipeline.stop()
-            self._pipeline = None
         if self._cap:
             self._cap.release()
             self._cap = None
 
     def _tick(self):
-        frame = None
-
-        if self._pipeline:
-            try:
-                frames      = self._pipeline.wait_for_frames(timeout_ms=100)
-                colour_frame = frames.get_color_frame()
-                if colour_frame:
-                    frame = np.asanyarray(colour_frame.get_data())
-            except Exception:
-                return
-
-        elif self._cap and self._cap.isOpened():
-            ok, frame = self._cap.read()
-            if not ok:
-                return
-
-        if frame is None:
+        if not self._cap or not self._cap.isOpened():
             return
-
+        ok, frame = self._cap.read()
+        if not ok:
+            return
         frame = detect_fruits(frame)
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, _ = rgb.shape
-        qimg  = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
         self.setPixmap(
             QPixmap.fromImage(qimg).scaled(
                 self.width(), self.height(),
@@ -307,29 +260,16 @@ class MainWindow(QMainWindow):
         top.addWidget(arm_group, stretch=2)
 
         ctrl_group = self._group('Controls')
-        ctrl_group.setFixedWidth(240)
+        ctrl_group.setFixedWidth(230)
         cl = ctrl_group.layout()
-        cl.setSpacing(8)
+        cl.setSpacing(10)
 
-        # ── robot IP field ────────────────────────────────────────────────────
-        ip_group = self._group('Robot IP')
-        ip_layout = ip_group.layout()
-        ip_layout.setContentsMargins(4, 4, 4, 4)
-        self._ip_field = QLineEdit('192.168.0.150')
-        self._ip_field.setStyleSheet(
-            'background:#333; color:white; font-family:monospace; padding:4px;'
-        )
-        self._ip_field.setPlaceholderText('e.g. 192.168.1.100')
-        ip_layout.addWidget(self._ip_field)
-        cl.addWidget(ip_group)
-
-        self._btn_build      = self._btn('🔨  Rebuild',          '#1e4a7a', self._rebuild)
-        self._btn_launch_sim = self._btn('🖥   Launch Sim',       '#1e5c1e', self._launch_sim)
-        self._btn_launch_real= self._btn('🤖  Connect Real UR3e','#5c3a1e', self._launch_real)
-        self._btn_run        = self._btn('▶   Start Cuts',        '#6a1e1e', self._run)
-        self._btn_stop       = self._btn('■   Stop All',          '#444444', self._stop)
-        self._btn_reset      = self._btn('↺   Reset',             '#4a3a00', self._reset)
-        self._btn_shutdown   = self._btn('⏻   Quit All',          '#5a1a1a', self._shutdown)
+        self._btn_build    = self._btn('🔨  Rebuild',       '#1e4a7a', self._rebuild)
+        self._btn_launch   = self._btn('🚀  Launch MoveIt', '#1e5c1e', self._launch)
+        self._btn_run      = self._btn('▶   Start Cuts',    '#6a1e1e', self._run)
+        self._btn_stop     = self._btn('■   Stop All',      '#444444', self._stop)
+        self._btn_reset    = self._btn('↺   Reset',         '#4a3a00', self._reset)
+        self._btn_shutdown = self._btn('⏻   Quit All',      '#5a1a1a', self._shutdown)
 
         self._status = QLabel('● Idle')
         self._status.setAlignment(Qt.AlignCenter)
@@ -368,8 +308,7 @@ class MainWindow(QMainWindow):
         self._spin_range.setStyleSheet('background:#333; color:white;')
         _row('± Range:', self._spin_range)
 
-        for w in (self._btn_build,
-                  self._btn_launch_sim, self._btn_launch_real,
+        for w in (self._btn_build, self._btn_launch,
                   self._btn_run,   self._btn_stop,
                   self._btn_reset, self._btn_shutdown,
                   param_group):
@@ -422,36 +361,14 @@ class MainWindow(QMainWindow):
             done_msg='✓ Built',
         )
 
-    def _launch_sim(self):
-        self._status_set('🖥 Launching sim…', '#3a7aff')
+    def _launch(self):
+        self._status_set('🚀 Launching…', '#3a7aff')
         self._shell(
             'launch',
-            f'{self._ROS} && ros2 launch fruitninja fruitninja.launch.py'
-            f' use_fake_hardware:=true robot_ip:=192.168.56.101',
+            f'{self._ROS} && ros2 launch fruitninja fruitninja.launch.py',
             persistent=True,
         )
-        self._status_set('🖥 Sim running', '#3a7aff')
-
-    def _launch_real(self):
-        # Kill any previous launch to free port 50002
-        if 'launch' in self._procs:
-            try:
-                self._procs.pop('launch').terminate()
-            except Exception:
-                pass
-        subprocess.call(['pkill', '-f', 'ur_control.launch.py'])
-        subprocess.call(['pkill', '-f', 'ur_ros2_control_node'])
-
-        ip = self._ip_field.text().strip()
-        self._status_set(f'🤖 Connecting {ip}…', '#e07000')
-        self._shell(
-            'launch',
-            f'{self._ROS} && ros2 launch ur_robot_driver ur_control.launch.py'
-            f' ur_type:=ur3e robot_ip:={ip} launch_rviz:=true'
-            f' use_fake_hardware:=false reverse_port:=50002',
-            persistent=True,
-        )
-        self._status_set(f'🤖 Real robot {ip}', '#e07000')
+        self._status_set('🚀 MoveIt running', '#3a7aff')
 
     def _run(self):
         n  = self._spin_cuts.value()
