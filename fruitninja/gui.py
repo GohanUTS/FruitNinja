@@ -168,7 +168,10 @@ class CameraWidget(QLabel):
     """
     Grabs colour frames from an Intel RealSense D435i (preferred)
     or falls back to the first webcam via cv2.VideoCapture.
+    Emits detection_signal with a list of detection dicts on each frame.
     """
+
+    detection_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -236,7 +239,8 @@ class CameraWidget(QLabel):
         if frame is None:
             return
 
-        frame = detect_fruits(frame)
+        frame, detections = detect_fruits(frame)
+        self.detection_signal.emit(detections)
         rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, _ = rgb.shape
         qimg  = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
@@ -383,7 +387,19 @@ class MainWindow(QMainWindow):
         cam_group = self._group('OpenCV — Fruit Colour Detection')
         self._cam = CameraWidget()
         cam_group.layout().addWidget(self._cam)
+        self._cam.detection_signal.connect(self._on_detections)
         root.addWidget(cam_group, stretch=2)
+
+        # ── detection info bar ────────────────────────────────────────────────
+        self._detect_label = QLabel('No fruit detected')
+        self._detect_label.setAlignment(Qt.AlignCenter)
+        self._detect_label.setStyleSheet(
+            'background:#111; color:#eee; font-family:monospace;'
+            'font-size:13px; font-weight:bold; padding:6px;'
+            'border:1px solid #333; border-radius:4px;'
+        )
+        self._detect_label.setMinimumHeight(36)
+        root.addWidget(self._detect_label)
 
         # ── log ───────────────────────────────────────────────────────────────
         self._log = LogWidget()
@@ -491,6 +507,32 @@ class MainWindow(QMainWindow):
         subprocess.Popen(['bash', '-c', 'pkill -f "move_group"'])
         subprocess.Popen(['bash', '-c', 'pkill -f "rviz2"'])
         self.close()
+
+    def _on_detections(self, detections: list):
+        if not detections:
+            self._detect_label.setText('No fruit detected')
+            self._detect_label.setStyleSheet(
+                'background:#111; color:#888; font-family:monospace;'
+                'font-size:13px; font-weight:bold; padding:6px;'
+                'border:1px solid #333; border-radius:4px;'
+            )
+            return
+
+        parts = []
+        for d in detections:
+            label = d['label']
+            dist  = d['distance_m']
+            colour = '#ff4444' if label == 'Apple' else '#44cc44'
+            parts.append(
+                f'<span style="color:{colour}">Detecting {label}</span>'
+                f'  —  distance: <b>{dist:.2f} m</b>'
+            )
+        self._detect_label.setText('    |    '.join(parts))
+        self._detect_label.setStyleSheet(
+            'background:#111; color:#eee; font-family:monospace;'
+            'font-size:13px; font-weight:bold; padding:6px;'
+            'border:1px solid #333; border-radius:4px;'
+        )
 
     def _status_set(self, text: str, colour: str = 'white'):
         self._status.setText(text)
