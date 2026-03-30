@@ -521,11 +521,11 @@ class MainWindow(QMainWindow):
         parts = []
         for d in detections:
             label = d['label']
-            dist  = d['distance_m']
+            dist  = d['distance_mm']
             colour = '#ff4444' if label == 'Apple' else '#44cc44'
             parts.append(
                 f'<span style="color:{colour}">Detecting {label}</span>'
-                f'  —  distance: <b>{dist:.2f} m</b>'
+                f'  —  distance: <b>{dist:.0f} mm</b>'
             )
         self._detect_label.setText('    |    '.join(parts))
         self._detect_label.setStyleSheet(
