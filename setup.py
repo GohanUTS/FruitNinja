@@ -26,6 +26,8 @@ setup(
             'movement = fruitninja.movement:main',
             'reset = fruitninja.movement:reset_main',
             'gui = fruitninja.gui:main',
+            'gui_sim = fruitninja.gui_sim:main',
+            'gui_ur3e = fruitninja.gui_ur3e:main',
         ],
     },
 )
