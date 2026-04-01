@@ -26,7 +26,7 @@ COLOUR_PROFILES = [
 
 # ── Blue corner marker config ─────────────────────────────────────────────────
 BLUE_HSV_RANGES = [
-    (np.array([100, 80, 60]),  np.array([130, 255, 255])),
+    (np.array([100, 120, 60]),  np.array([120, 255, 255])),
 ]
 BLUE_BGR        = (220, 80, 0)     # colour for marker dots / corner labels
 GRID_BGR        = (200, 200, 0)    # cyan grid lines
@@ -38,7 +38,7 @@ MIN_W = 60
 MIN_H = 45
 
 # Tune FOCAL_LENGTH_PX: if distance reads too HIGH → lower it, too LOW → raise it
-FOCAL_LENGTH_PX = 150.0
+FOCAL_LENGTH_PX = 100.0
 
 _KERNEL      = np.ones((5, 5), np.uint8)
 _KERNEL_SM   = np.ones((3, 3), np.uint8)
@@ -190,7 +190,7 @@ def detect_fruits(frame):
             if w < MIN_W or h < MIN_H:
                 continue
             distance_mm = (real_width_m * FOCAL_LENGTH_PX / w) * 1000.0
-            text = f'{label}  {distance_mm:.0f} mm'
+            text = f'{label}  {distance_mm:.0f} mm  [{w}px]'
             cv2.rectangle(frame, (x, y), (x + w, y + h), bgr, 2)
             cv2.putText(frame, text, (x, y - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, bgr, 2)

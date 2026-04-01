@@ -311,7 +311,7 @@ class MainWindow(QMainWindow):
         top.addWidget(arm_group, stretch=2)
 
         ctrl_group = self._group('Controls')
-        ctrl_group.setFixedWidth(240)
+        ctrl_group.setFixedWidth(260)
         cl = ctrl_group.layout()
         cl.setSpacing(8)
 
@@ -344,32 +344,40 @@ class MainWindow(QMainWindow):
         pl = param_group.layout()
         pl.setSpacing(6)
 
+        SPIN_STYLE = 'background:#333; color:white; font-size:12px; padding:2px;'
+
         def _row(label, widget):
             row = QHBoxLayout()
+            row.setSpacing(6)
             lbl = QLabel(label)
+            lbl.setFixedWidth(78)
             lbl.setStyleSheet('color:#ccc; font-size:11px;')
+            widget.setFixedWidth(90)
             row.addWidget(lbl)
             row.addWidget(widget)
+            row.addStretch()
             pl.addLayout(row)
 
         self._spin_cuts = QSpinBox()
         self._spin_cuts.setRange(1, 30)
         self._spin_cuts.setValue(5)
-        self._spin_cuts.setStyleSheet('background:#333; color:white;')
+        self._spin_cuts.setStyleSheet(SPIN_STYLE)
         _row('Num cuts:', self._spin_cuts)
 
         self._spin_centre = QDoubleSpinBox()
         self._spin_centre.setRange(-90, 90)
         self._spin_centre.setValue(-13.0)
         self._spin_centre.setSuffix('°')
-        self._spin_centre.setStyleSheet('background:#333; color:white;')
+        self._spin_centre.setDecimals(1)
+        self._spin_centre.setStyleSheet(SPIN_STYLE)
         _row('Centre pan:', self._spin_centre)
 
         self._spin_range = QDoubleSpinBox()
         self._spin_range.setRange(1, 90)
         self._spin_range.setValue(28.0)
         self._spin_range.setSuffix('°')
-        self._spin_range.setStyleSheet('background:#333; color:white;')
+        self._spin_range.setDecimals(1)
+        self._spin_range.setStyleSheet(SPIN_STYLE)
         _row('± Range:', self._spin_range)
 
         for w in (self._btn_build,
@@ -449,7 +457,7 @@ class MainWindow(QMainWindow):
         self._status_set('🖥 Sim running', '#3a7aff')
 
     def _launch_real(self):
-        # Kill any previous launch to free port 50002
+        # Kill any previous launch before starting real robot session
         if 'launch' in self._procs:
             try:
                 self._procs.pop('launch').terminate()
@@ -460,11 +468,14 @@ class MainWindow(QMainWindow):
 
         ip = self._ip_field.text().strip()
         self._status_set(f'🤖 Connecting {ip}…', '#e07000')
+        # Use the full fruitninja launch so MoveIt + RViz start alongside
+        # the real robot driver (use_fake_hardware:=false)
         self._shell(
             'launch',
-            f'{self._ROS} && ros2 launch ur_robot_driver ur_control.launch.py'
-            f' ur_type:=ur3e robot_ip:={ip} launch_rviz:=true'
-            f' use_fake_hardware:=false reverse_port:=50002',
+            f'{self._ROS} && ros2 launch fruitninja fruitninja.launch.py'
+            f' use_fake_hardware:=false'
+            f' robot_ip:={ip}'
+            f' reverse_port:=50001',
             persistent=True,
         )
         self._status_set(f'🤖 Real robot {ip}', '#e07000')
