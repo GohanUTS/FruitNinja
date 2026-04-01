@@ -28,9 +28,9 @@ from fruitninja.colour_detection import detect_fruits
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QHBoxLayout, QVBoxLayout,
+    QHBoxLayout, QVBoxLayout, QGridLayout,
     QPushButton, QLabel, QGroupBox, QTextEdit,
-    QSpinBox, QDoubleSpinBox, QLineEdit,
+    QSpinBox, QDoubleSpinBox, QLineEdit, QComboBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QFont
@@ -77,7 +77,13 @@ class ArmWidget(QWidget):
         self._joints = {n: 0.0 for n in JOINT_NAMES}
 
     def set_joints(self, joints: dict):
-        self._joints.update(joints)
+        for name, val in joints.items():
+            cur = self._joints.get(name, 0.0)
+            # Reject spurious zero-resets from the hardware broadcaster:
+            # real joint movement can't change more than ~0.1 rad between messages.
+            if abs(cur) > 0.05 and abs(val - cur) > 0.5:
+                continue
+            self._joints[name] = val
         self.update()
 
     def paintEvent(self, _event):
@@ -168,8 +174,8 @@ except ImportError:
 
 class CameraWidget(QLabel):
     """
-    Grabs colour frames from an Intel RealSense D435i (preferred)
-    or falls back to the first webcam via cv2.VideoCapture.
+    Grabs colour frames from either a webcam (cv2.VideoCapture) or an Intel
+    RealSense D435i. Source is selected via switch_source('webcam'|'realsense').
     Emits detection_signal with a list of detection dicts on each frame.
     """
 
@@ -181,13 +187,25 @@ class CameraWidget(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setText('No camera connected')
         self.setStyleSheet('color: #888; background: #111; font-size: 13px;')
-        self._pipeline = None
         self._cap      = None
+        self._pipeline = None
         self._timer    = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
-    def start(self):
-        if _HAS_RS:
+    def start(self, source: str = 'webcam'):
+        self._start_source(source)
+
+    def switch_source(self, source: str):
+        """Stop current stream and restart with the chosen source."""
+        self.stop()
+        self._start_source(source)
+
+    def _start_source(self, source: str):
+        if source == 'realsense':
+            if not _HAS_RS:
+                self.setText('pyrealsense2 not installed')
+                print('[camera] pyrealsense2 not available')
+                return
             try:
                 self._pipeline = rs.pipeline()
                 cfg = rs.config()
@@ -195,22 +213,18 @@ class CameraWidget(QLabel):
                 self._pipeline.start(cfg)
                 self._timer.start(33)
                 print('[camera] RealSense D435i started')
-                return
             except Exception as e:
                 self._pipeline = None
-                print(f'[camera] RealSense error: {e}')
                 self.setText(f'RealSense error:\n{e}')
-                return  # don't fall back — show the error clearly
+                print(f'[camera] RealSense error: {e}')
         else:
-            print('[camera] pyrealsense2 not found, falling back to webcam')
-
-        # fallback to webcam only if no RealSense
-        self._cap = cv2.VideoCapture(0)
-        if self._cap.isOpened():
-            self._timer.start(33)
-            print('[camera] Webcam started')
-        else:
-            self.setText('No camera found')
+            self._cap = cv2.VideoCapture(0)
+            if self._cap.isOpened():
+                self._timer.start(33)
+                print('[camera] Webcam started')
+            else:
+                self._cap = None
+                self.setText('No webcam found')
 
     def stop(self):
         self._timer.stop()
@@ -223,16 +237,14 @@ class CameraWidget(QLabel):
 
     def _tick(self):
         frame = None
-
         if self._pipeline:
             try:
-                frames      = self._pipeline.wait_for_frames(timeout_ms=100)
-                colour_frame = frames.get_color_frame()
-                if colour_frame:
-                    frame = np.asanyarray(colour_frame.get_data())
+                frames = self._pipeline.wait_for_frames(timeout_ms=100)
+                cf = frames.get_color_frame()
+                if cf:
+                    frame = np.asanyarray(cf.get_data())
             except Exception:
                 return
-
         elif self._cap and self._cap.isOpened():
             ok, frame = self._cap.read()
             if not ok:
@@ -302,6 +314,63 @@ class LogWidget(QTextEdit):
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
 
+# ── Grid selector widget ──────────────────────────────────────────────────────
+
+GRID_COLS = ['A', 'B', 'C', 'D']
+GRID_ROWS = ['1', '2', '3', '4']
+
+
+class GridSelectorWidget(QWidget):
+    """4×4 clickable grid matching the vision grid. Highlights the selected cell."""
+
+    cell_selected = pyqtSignal(str)   # emits e.g. 'B3' on click
+
+    _BTN_BASE  = 'background:#2a2a3a; color:#ccc; border:1px solid #555; border-radius:3px; font-size:12px; font-weight:bold;'
+    _BTN_SEL   = 'background:#3a7aff; color:white; border:1px solid #88aaff; border-radius:3px; font-size:12px; font-weight:bold;'
+
+    def __init__(self):
+        super().__init__()
+        self._selected: str | None = None
+        self._buttons: dict[str, QPushButton] = {}
+
+        layout = QGridLayout(self)
+        layout.setSpacing(4)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Column headers (A B C D)
+        for c, col in enumerate(GRID_COLS):
+            hdr = QLabel(col)
+            hdr.setAlignment(Qt.AlignCenter)
+            hdr.setStyleSheet('color:#888; font-size:11px;')
+            layout.addWidget(hdr, 0, c + 1)
+
+        # Row headers + cell buttons
+        for r, row in enumerate(GRID_ROWS):
+            hdr = QLabel(row)
+            hdr.setAlignment(Qt.AlignCenter)
+            hdr.setStyleSheet('color:#888; font-size:11px;')
+            layout.addWidget(hdr, r + 1, 0)
+
+            for c, col in enumerate(GRID_COLS):
+                cell = col + row
+                btn = QPushButton(cell)
+                btn.setFixedSize(46, 36)
+                btn.setStyleSheet(self._BTN_BASE)
+                btn.clicked.connect(lambda checked, ce=cell: self._on_click(ce))
+                self._buttons[cell] = btn
+                layout.addWidget(btn, r + 1, c + 1)
+
+    def _on_click(self, cell: str):
+        if self._selected:
+            self._buttons[self._selected].setStyleSheet(self._BTN_BASE)
+        self._selected = cell
+        self._buttons[cell].setStyleSheet(self._BTN_SEL)
+        self.cell_selected.emit(cell)
+
+    def selected_cell(self) -> str | None:
+        return self._selected
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -358,6 +427,7 @@ class MainWindow(QMainWindow):
         self._btn_launch_sim = self._btn('🖥   Launch Sim',       '#1e5c1e', self._launch_sim)
         self._btn_launch_real= self._btn('🤖  Connect Real UR3e','#5c3a1e', self._launch_real)
         self._btn_run        = self._btn('▶   Start Cuts',        '#6a1e1e', self._run)
+        self._btn_move_point = self._btn('⊕   Move to Point',     '#1a4a5a', self._move_to_point)
         self._btn_stop       = self._btn('■   Stop All',          '#444444', self._stop)
         self._btn_reset      = self._btn('↺   Reset',             '#4a3a00', self._reset)
         self._btn_shutdown   = self._btn('⏻   Quit All',          '#5a1a1a', self._shutdown)
@@ -409,7 +479,7 @@ class MainWindow(QMainWindow):
 
         for w in (self._btn_build,
                   self._btn_launch_sim, self._btn_launch_real,
-                  self._btn_run,   self._btn_stop,
+                  self._btn_run, self._btn_move_point, self._btn_stop,
                   self._btn_reset, self._btn_shutdown,
                   param_group):
             cl.addWidget(w)
@@ -420,10 +490,46 @@ class MainWindow(QMainWindow):
 
         # ── camera ────────────────────────────────────────────────────────────
         cam_group = self._group('OpenCV — Fruit Colour Detection')
+        cam_header = QHBoxLayout()
+        cam_source_label = QLabel('Camera:')
+        cam_source_label.setStyleSheet('color:#aaa; font-size:12px;')
+        self._cam_source_combo = QComboBox()
+        self._cam_source_combo.addItems(['Webcam', 'RealSense D435i'])
+        self._cam_source_combo.setStyleSheet(
+            'background:#333; color:white; font-size:12px; padding:2px;'
+        )
+        self._cam_source_combo.setFixedWidth(150)
+        if not _HAS_RS:
+            self._cam_source_combo.model().item(1).setEnabled(False)
+        cam_header.addWidget(cam_source_label)
+        cam_header.addWidget(self._cam_source_combo)
+        cam_header.addStretch()
+        cam_group.layout().addLayout(cam_header)
         self._cam = CameraWidget()
         cam_group.layout().addWidget(self._cam)
         self._cam.detection_signal.connect(self._on_detections)
+        self._cam_source_combo.currentTextChanged.connect(
+            lambda t: self._cam.switch_source('realsense' if 'RealSense' in t else 'webcam')
+        )
         root.addWidget(cam_group, stretch=2)
+
+        # ── grid navigation ───────────────────────────────────────────────────
+        grid_group = self._group('Grid Navigation — Select Target Cell')
+        grid_inner = QHBoxLayout()
+        self._grid_selector = GridSelectorWidget()
+        self._grid_cell_label = QLabel('No cell selected')
+        self._grid_cell_label.setAlignment(Qt.AlignCenter)
+        self._grid_cell_label.setStyleSheet(
+            'color:#aaa; font-family:monospace; font-size:12px;'
+        )
+        self._grid_selector.cell_selected.connect(
+            lambda c: self._grid_cell_label.setText(f'Selected: {c}')
+        )
+        grid_inner.addWidget(self._grid_selector)
+        grid_inner.addWidget(self._grid_cell_label)
+        grid_inner.addStretch()
+        grid_group.layout().addLayout(grid_inner)
+        root.addWidget(grid_group)
 
         # ── detection info bar ────────────────────────────────────────────────
         self._detect_label = QLabel('No fruit detected')
@@ -525,6 +631,18 @@ class MainWindow(QMainWindow):
             f' --pan-centre {c}'
             f' --pan-half-range {hr}',
             done_msg='✓ Sequence complete',
+        )
+
+    def _move_to_point(self):
+        cell = self._grid_selector.selected_cell()
+        if not cell:
+            self._status_set('⊕ Select a cell first', '#e0a000')
+            return
+        self._status_set(f'⊕ Moving to {cell}…', '#1a9aaa')
+        self._shell(
+            'grid_move',
+            f'{self._ROS} && ros2 run fruitninja grid_mover --cell {cell}',
+            done_msg=f'✓ Reached {cell}',
         )
 
     def _stop(self):
