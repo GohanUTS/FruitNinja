@@ -15,6 +15,8 @@ import sys
 import subprocess
 import threading
 import math
+import time
+from datetime import datetime
 
 import rclpy
 from rclpy.node import Node
@@ -253,7 +255,31 @@ class CameraWidget(QLabel):
 
 
 
-# ── Log output ────────────────────────────────────────────────────────────────
+# ── Detection log ─────────────────────────────────────────────────────────────
+
+class DetectionLogWidget(QTextEdit):
+    """Timestamped log of every fruit detection event."""
+    _sig = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+        self.setMaximumHeight(140)
+        self.setStyleSheet(
+            'background:#0d0d1a; color:#00ddff;'
+            'font-family:monospace; font-size:11px;'
+        )
+        self._sig.connect(self._append)
+
+    def push(self, text: str):
+        self._sig.emit(text)
+
+    def _append(self, text: str):
+        self.append(text)
+        self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+
+
+# ── ROS log output ─────────────────────────────────────────────────────────────
 
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
@@ -288,6 +314,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet('background:#1e1e1e; color:white;')
 
         self._procs: dict[str, subprocess.Popen] = {}
+        self._last_log_time: dict[str, float] = {}   # throttle detection log
         self._build_ui()
         self._start_ros()
         self._cam.start()
@@ -409,7 +436,13 @@ class MainWindow(QMainWindow):
         self._detect_label.setMinimumHeight(36)
         root.addWidget(self._detect_label)
 
-        # ── log ───────────────────────────────────────────────────────────────
+        # ── detection log ─────────────────────────────────────────────────────
+        det_log_group = self._group('Detection Log')
+        self._det_log = DetectionLogWidget()
+        det_log_group.layout().addWidget(self._det_log)
+        root.addWidget(det_log_group)
+
+        # ── ROS log ───────────────────────────────────────────────────────────
         self._log = LogWidget()
         root.addWidget(self._log)
 
@@ -478,7 +511,7 @@ class MainWindow(QMainWindow):
             f' reverse_port:=50001',
             persistent=True,
         )
-        self._status_set(f'🤖 Real robot {ip}', '#e07000')
+        self._status_set(f' Real robot {ip}', '#e07000')
 
     def _run(self):
         n  = self._spin_cuts.value()
@@ -530,14 +563,27 @@ class MainWindow(QMainWindow):
             return
 
         parts = []
+        now = time.time()
         for d in detections:
-            label = d['label']
-            dist  = d['distance_mm']
+            label  = d['label']
+            dist   = d['distance_mm']
+            cell   = d.get('cell')
             colour = '#ff4444' if label == 'Apple' else '#44cc44'
+            cell_part = f'  —  cell: <b style="color:#ffdd44">{cell}</b>' if cell else ''
             parts.append(
                 f'<span style="color:{colour}">Detecting {label}</span>'
-                f'  —  distance: <b>{dist:.0f} mm</b>'
+                f'  —  <b>{dist:.0f} mm</b>'
+                f'{cell_part}'
             )
+            # Log at most once per second per label
+            key = f'{label}:{cell}'
+            if now - self._last_log_time.get(key, 0) >= 1.0:
+                self._last_log_time[key] = now
+                ts       = datetime.now().strftime('%H:%M:%S')
+                cell_str = f'cell {cell}' if cell else 'outside grid'
+                self._det_log.push(
+                    f'[{ts}]  {label:<8}  |  {dist:>6.0f} mm  |  {cell_str}'
+                )
         self._detect_label.setText('    |    '.join(parts))
         self._detect_label.setStyleSheet(
             'background:#111; color:#eee; font-family:monospace;'
