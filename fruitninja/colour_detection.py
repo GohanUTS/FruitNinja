@@ -2,9 +2,11 @@
 """
 Fruit colour detection + whiteboard grid overlay.
 
-  Apple   (red)  : bounding box + distance in mm + grid cell (if grid active)
-  Lettuce (green): bounding box + distance in mm + grid cell (if grid active)
-  Blue corners   : 4 blue markers → labelled A1-E5 grid drawn inside
+  Apple   (red)   : bounding box + distance in mm + grid cell (if grid active)
+  Lettuce (green) : bounding box + distance in mm + grid cell (if grid active)
+  Banana  (yellow): bounding box + distance in mm + grid cell (if grid active)
+  Orange  (orange): bounding box + distance in mm + grid cell (if grid active)
+  Blue corners    : 4 blue markers → labelled A1-E5 grid drawn inside
 
 Returns: (annotated_frame, detections)
   detections = [{'label': str, 'distance_mm': float, 'cell': str|None}, ...]
@@ -13,7 +15,7 @@ Returns: (annotated_frame, detections)
 import cv2
 import numpy as np
 
-# ── Apple / Lettuce profiles (label, bgr, hsv_ranges, real_width_m) ──────────
+# ── Fruit profiles (label, bgr, hsv_ranges, real_width_m) ────────────────────
 COLOUR_PROFILES = [
     ('Apple',   (0, 50, 255),  [
         (np.array([0,   60, 40]),  np.array([10,  255, 255])),
@@ -22,6 +24,12 @@ COLOUR_PROFILES = [
     ('Lettuce', (0, 200, 50),  [
         (np.array([36,  45, 40]),   np.array([85,  255, 255])),
     ], 0.25),
+    ('Banana',  (0, 220, 255), [
+        (np.array([20,  80, 80]),  np.array([35, 255, 255])),
+    ], 0.18),
+    ('Orange',  (0, 130, 255), [
+        (np.array([10, 120, 80]),  np.array([20, 255, 255])),
+    ], 0.07),
 ]
 
 # ── Blue corner marker config ─────────────────────────────────────────────────

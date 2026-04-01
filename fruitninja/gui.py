@@ -686,7 +686,8 @@ class MainWindow(QMainWindow):
             label  = d['label']
             dist   = d['distance_mm']
             cell   = d.get('cell')
-            colour = '#ff4444' if label == 'Apple' else '#44cc44'
+            colour = {'Apple': '#ff4444', 'Lettuce': '#44cc44',
+                      'Banana': '#ffdd00', 'Orange': '#ff8800'}.get(label, '#ffffff')
             cell_part = f'  —  cell: <b style="color:#ffdd44">{cell}</b>' if cell else ''
             parts.append(
                 f'<span style="color:{colour}">Detecting {label}</span>'
