@@ -12,6 +12,8 @@ FruitNinja Control Panel
 """
 
 import sys
+import os
+import signal
 import subprocess
 import threading
 import math
@@ -316,17 +318,17 @@ class LogWidget(QTextEdit):
 
 # ── Grid selector widget ──────────────────────────────────────────────────────
 
-GRID_COLS = ['A', 'B', 'C', 'D']
+GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']
 GRID_ROWS = ['1', '2', '3', '4']
 
 
 class GridSelectorWidget(QWidget):
-    """4×4 clickable grid matching the vision grid. Highlights the selected cell."""
+    """14×4 clickable grid matching the vision grid. Highlights the selected cell."""
 
     cell_selected = pyqtSignal(str)   # emits e.g. 'B3' on click
 
-    _BTN_BASE  = 'background:#2a2a3a; color:#ccc; border:1px solid #555; border-radius:3px; font-size:12px; font-weight:bold;'
-    _BTN_SEL   = 'background:#3a7aff; color:white; border:1px solid #88aaff; border-radius:3px; font-size:12px; font-weight:bold;'
+    _BTN_BASE  = 'background:#2a2a3a; color:#ccc; border:1px solid #555; border-radius:3px; font-size:11px; font-weight:bold;'
+    _BTN_SEL   = 'background:#3a7aff; color:white; border:1px solid #88aaff; border-radius:3px; font-size:11px; font-weight:bold;'
 
     def __init__(self):
         super().__init__()
@@ -354,7 +356,7 @@ class GridSelectorWidget(QWidget):
             for c, col in enumerate(GRID_COLS):
                 cell = col + row
                 btn = QPushButton(cell)
-                btn.setFixedSize(46, 36)
+                btn.setFixedSize(36, 30)
                 btn.setStyleSheet(self._BTN_BASE)
                 btn.clicked.connect(lambda checked, ce=cell: self._on_click(ce))
                 self._buttons[cell] = btn
@@ -645,12 +647,19 @@ class MainWindow(QMainWindow):
             done_msg=f'✓ Reached {cell}',
         )
 
-    def _stop(self):
-        for proc in self._procs.values():
+    def _kill_proc(self, proc):
+        """Kill a process and its entire child group."""
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
             try:
-                proc.terminate()
+                proc.kill()
             except Exception:
                 pass
+
+    def _stop(self):
+        for proc in list(self._procs.values()):
+            self._kill_proc(proc)
         self._procs.clear()
         self._status_set('■ Stopped', '#aaaaaa')
 
@@ -716,16 +725,21 @@ class MainWindow(QMainWindow):
 
     def _shell(self, key: str, cmd: str,
                persistent: bool = False, done_msg: str = ''):
+        # Kill any existing process with this key before starting a new one
+        if key in self._procs:
+            self._kill_proc(self._procs.pop(key))
+
         def _run():
             proc = subprocess.Popen(
                 ['bash', '-c', cmd],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                preexec_fn=os.setsid,   # new process group so killpg reaches all children
             )
-            if persistent:
-                self._procs[key] = proc
+            self._procs[key] = proc
             for line in proc.stdout:
                 self._log.push(line.rstrip())
             proc.wait()
+            self._procs.pop(key, None)  # clean up after completion
             if done_msg:
                 self._status_set(done_msg, '#00cc00')
                 self._log.push(f'[{key}] {done_msg}')

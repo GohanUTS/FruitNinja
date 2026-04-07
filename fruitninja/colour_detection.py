@@ -39,7 +39,8 @@ BLUE_HSV_RANGES = [
 BLUE_BGR        = (220, 80,  0)
 GRID_BGR        = (200, 200, 0)
 CELL_LABEL_BGR  = (255, 255, 255)
-GRID_N          = 4
+GRID_COLS       = 14   # 73 cm wide
+GRID_ROWS       = 4    # 22 cm long
 MIN_MARKER_AREA = 300
 
 # ── Detection size thresholds — small for drawn marker dots ──────────────────
@@ -88,13 +89,13 @@ def _cell_name(col, row):
     return f"{chr(ord('A') + col)}{row + 1}"
 
 
-def _draw_grid(frame, tl, tr, br, bl, n):
-    """Draw bilinear n×n grid and label every cell center."""
-    steps = max(n * 6, 24)
+def _draw_grid(frame, tl, tr, br, bl, n_cols, n_rows):
+    """Draw bilinear n_cols×n_rows grid and label every cell center."""
+    steps = max(n_cols * 6, 24)
 
-    for i in range(n + 1):
-        t = i / n
-        # vertical lines
+    # Row dividers (horizontal lines across the frame)
+    for i in range(n_rows + 1):
+        t    = i / n_rows
         left  = _lerp(tl, bl, t)
         right = _lerp(tr, br, t)
         prev  = _ipt(_lerp(left, right, 0))
@@ -102,9 +103,12 @@ def _draw_grid(frame, tl, tr, br, bl, n):
             cur = _ipt(_lerp(left, right, j / steps))
             cv2.line(frame, prev, cur, GRID_BGR, 1, cv2.LINE_AA)
             prev = cur
-        # horizontal lines
-        top  = _lerp(tl, tr, t)
-        bot  = _lerp(bl, br, t)
+
+    # Column dividers (vertical lines down the frame)
+    for i in range(n_cols + 1):
+        t   = i / n_cols
+        top = _lerp(tl, tr, t)
+        bot = _lerp(bl, br, t)
         prev = _ipt(_lerp(top, bot, 0))
         for j in range(1, steps + 1):
             cur = _ipt(_lerp(top, bot, j / steps))
@@ -112,10 +116,10 @@ def _draw_grid(frame, tl, tr, br, bl, n):
             prev = cur
 
     # Label each cell at its centre
-    for row in range(n):
-        for col in range(n):
-            u   = (col + 0.5) / n
-            v   = (row + 0.5) / n
+    for row in range(n_rows):
+        for col in range(n_cols):
+            u   = (col + 0.5) / n_cols
+            v   = (row + 0.5) / n_rows
             top = _lerp(tl, tr, u)
             bot = _lerp(bl, br, u)
             ctr = _ipt(_lerp(top, bot, v))
@@ -127,20 +131,20 @@ def _draw_grid(frame, tl, tr, br, bl, n):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.30, CELL_LABEL_BGR, 1)
 
 
-def _build_transform(tl, tr, br, bl, n):
-    """Return perspective transform H mapping image→grid coords (0..n)."""
+def _build_transform(tl, tr, br, bl, n_cols, n_rows):
+    """Return perspective transform H mapping image→grid coords (0..n_cols, 0..n_rows)."""
     src = np.float32([tl, tr, br, bl])
-    dst = np.float32([[0, 0], [n, 0], [n, n], [0, n]])
+    dst = np.float32([[0, 0], [n_cols, 0], [n_cols, n_rows], [0, n_rows]])
     return cv2.getPerspectiveTransform(src, dst)
 
 
-def _point_to_cell(H, px, py, n):
+def _point_to_cell(H, px, py, n_cols, n_rows):
     """Return cell name for image point (px,py), or None if outside grid."""
     pt  = np.float32([[[px, py]]])
     uv  = cv2.perspectiveTransform(pt, H)[0][0]
     col = int(uv[0])
     row = int(uv[1])
-    if 0 <= col < n and 0 <= row < n:
+    if 0 <= col < n_cols and 0 <= row < n_rows:
         return _cell_name(col, row)
     return None
 
@@ -207,7 +211,7 @@ def _detect_grid(frame, hsv):
 
     tl, tr, br, bl = _smooth_corners
 
-    _draw_grid(frame, tl, tr, br, bl, GRID_N)
+    _draw_grid(frame, tl, tr, br, bl, GRID_COLS, GRID_ROWS)
 
     quad = np.array([_ipt(tl), _ipt(tr), _ipt(br), _ipt(bl)], np.int32)
     cv2.polylines(frame, [quad], isClosed=True,
@@ -219,7 +223,7 @@ def _detect_grid(frame, hsv):
         cv2.putText(frame, name, (_ipt(pt)[0] + 13, _ipt(pt)[1] - 7),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, BLUE_BGR, 1)
 
-    return _build_transform(tl, tr, br, bl, GRID_N)
+    return _build_transform(tl, tr, br, bl, GRID_COLS, GRID_ROWS)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -257,7 +261,7 @@ def detect_fruits(frame):
             cy = y + h // 2
             distance_mm = (real_width_m * FOCAL_LENGTH_PX / w) * 1000.0 
 
-            cell = _point_to_cell(H, cx, cy, GRID_N) if H is not None else None
+            cell = _point_to_cell(H, cx, cy, GRID_COLS, GRID_ROWS) if H is not None else None
 
             # When grid is active, ignore anything outside it
             if H is not None and cell is None:
