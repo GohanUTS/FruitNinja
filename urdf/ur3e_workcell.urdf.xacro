@@ -20,7 +20,7 @@
   <!-- Trolley visual (shows in RViz; collision handled by planning_scene node) -->
   <link name="trolley_link">
     <visual>
-      <origin xyz="0 0 -0.041" rpy="0 0 0"/>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
       <geometry>
         <mesh filename="package://fruitninja/meshes/UR3eTrolley.dae" scale="0.01 0.01 0.01"/>
       </geometry>
@@ -29,7 +29,7 @@
   <joint name="world_to_trolley" type="fixed">
     <parent link="world"/>
     <child link="trolley_link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="0.199 -0.13 0" rpy="1.5708 0 3.14159"/>
   </joint>
 
   <!-- UR3e mounted on table -->

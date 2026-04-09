@@ -126,16 +126,22 @@ class PlanningSceneSetup(Node):
         trolley.meshes.append(load_dae_mesh(mesh_path, scale=0.01))
 
         mesh_pose = Pose()
-        mesh_pose.position.x = 0.0
-        mesh_pose.position.y = 0.0
-        # Shift trolley down so its top surface (0.765 m) aligns with robot
-        # base (table_mount at z=0.724 m in URDF).  Offset = 0.724 - 0.765.
-        mesh_pose.position.z = -0.041
-        # DAE is Z-up — no rotation needed
+        # Robot base (table_mount) is at world (0.23, -0.03, 0.724).
+        # Rotation: 90° around X (Y-up → Z-up) + 180° around Z (flip working
+        # surface to face toward the arm's reach direction, +Y from robot).
+        # After both rotations: mesh X centre = +0.031, near-Y edge = +0.053.
+        # Robot at near-Y edge, plate extends in +Y:
+        #   x_offset = 0.23 - 0.031 = 0.199
+        #   y_offset = -0.03 - 0.053 = -0.083
+        mesh_pose.position.x = 0.199
+        mesh_pose.position.y = -0.13
+        mesh_pose.position.z = 0.0
+        # Combined quaternion for Rz(180°)*Rx(90°): (x=0, y=0.7071, z=0.7071, w=0)
+        import math as _math
         mesh_pose.orientation.x = 0.0
-        mesh_pose.orientation.y = 0.0
-        mesh_pose.orientation.z = 0.0
-        mesh_pose.orientation.w = 1.0
+        mesh_pose.orientation.y = _math.sin(_math.pi / 4)   # 0.7071
+        mesh_pose.orientation.z = _math.sin(_math.pi / 4)   # 0.7071
+        mesh_pose.orientation.w = 0.0
         trolley.mesh_poses.append(mesh_pose)
         trolley.operation = CollisionObject.ADD
 
@@ -157,7 +163,7 @@ class PlanningSceneSetup(Node):
         floor_pose = Pose()
         floor_pose.position.x = 0.0
         floor_pose.position.y = 0.0
-        floor_pose.position.z = -0.094   # bottom of trolley (~0.053 m) - 0.041 - 0.01
+        floor_pose.position.z = -0.01    # just below the trolley base
         floor_pose.orientation.w = 1.0
         floor.primitive_poses.append(floor_pose)
         floor.operation = CollisionObject.ADD
