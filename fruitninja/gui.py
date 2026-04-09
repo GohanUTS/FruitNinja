@@ -219,6 +219,14 @@ class CameraWidget(QLabel):
                 self._pipeline = None
                 self.setText(f'RealSense error:\n{e}')
                 print(f'[camera] RealSense error: {e}')
+        elif source == 'fisheye':
+            self._cap = cv2.VideoCapture(2)
+            if self._cap.isOpened():
+                self._timer.start(33)
+                print('[camera] Fisheye lens started (index 2)')
+            else:
+                self._cap = None
+                self.setText('No fisheye camera found at index 2')
         else:
             self._cap = cv2.VideoCapture(0)
             if self._cap.isOpened():
@@ -496,7 +504,7 @@ class MainWindow(QMainWindow):
         cam_source_label = QLabel('Camera:')
         cam_source_label.setStyleSheet('color:#aaa; font-size:12px;')
         self._cam_source_combo = QComboBox()
-        self._cam_source_combo.addItems(['Webcam', 'RealSense D435i'])
+        self._cam_source_combo.addItems(['Webcam', 'RealSense D435i', 'Fisheye (USB)'])
         self._cam_source_combo.setStyleSheet(
             'background:#333; color:white; font-size:12px; padding:2px;'
         )
@@ -510,9 +518,14 @@ class MainWindow(QMainWindow):
         self._cam = CameraWidget()
         cam_group.layout().addWidget(self._cam)
         self._cam.detection_signal.connect(self._on_detections)
-        self._cam_source_combo.currentTextChanged.connect(
-            lambda t: self._cam.switch_source('realsense' if 'RealSense' in t else 'webcam')
-        )
+        def _on_cam_source(t):
+            if 'RealSense' in t:
+                self._cam.switch_source('realsense')
+            elif 'Fisheye' in t:
+                self._cam.switch_source('fisheye')
+            else:
+                self._cam.switch_source('webcam')
+        self._cam_source_combo.currentTextChanged.connect(_on_cam_source)
         root.addWidget(cam_group, stretch=2)
 
         # ── grid navigation ───────────────────────────────────────────────────

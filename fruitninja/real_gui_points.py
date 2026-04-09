@@ -38,6 +38,10 @@ JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 
 
 HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 0.0]
 
+# Cutting motion: dip the end-effector down by offsetting shoulder lift + elbow
+CUT_DIP_LIFT  =  8.0   # degrees added to shoulder_lift_joint (index 1)
+CUT_DIP_ELBOW = -8.0   # degrees added to elbow_joint (index 2)
+
 MOVE_GROUP = 'ur_manipulator'
 
 
@@ -142,7 +146,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(820, 620)
         self.setStyleSheet('background:#1e1e1e; color:white;')
 
-        self._selected_cell = None
+        self._selected_cells = []   # ordered list, sorted left-to-right
         self._moving = False
         self._cell_btns = {}
 
@@ -192,7 +196,7 @@ class MainWindow(QMainWindow):
         root.addWidget(js_group)
 
         # ── grid selector ─────────────────────────────────────────────────────
-        grid_group = self._group('Grid — Select Target Cell  (A1=far-left  N4=near-right)')
+        grid_group = self._group('Grid — Toggle Cells  (A1=far-left  N4=near-right  |  moves left→right)')
         grid_layout = QGridLayout()
         grid_layout.setSpacing(4)
         grid_layout.setContentsMargins(4, 4, 4, 4)
@@ -228,11 +232,13 @@ class MainWindow(QMainWindow):
         act_layout = QHBoxLayout()
         act_layout.setSpacing(8)
 
-        self._btn_go    = self._action_btn('▶  Move to Cell', '#1a5c1a', self._go)
+        self._btn_go    = self._action_btn('▶  Move to Selected', '#1a5c1a', self._go)
+        self._btn_clear = self._action_btn('✕  Clear', '#3a3a3a', self._clear_selection)
         self._btn_stop  = self._action_btn('■  Stop',         '#5a1a1a', self._stop)
         self._btn_reset = self._action_btn('↺  Reset (Home)', '#4a3a00', self._reset)
 
         act_layout.addWidget(self._btn_go)
+        act_layout.addWidget(self._btn_clear)
         act_layout.addWidget(self._btn_stop)
         act_layout.addWidget(self._btn_reset)
         root.addLayout(act_layout)
@@ -292,41 +298,85 @@ class MainWindow(QMainWindow):
 
     # ── slots ─────────────────────────────────────────────────────────────────
 
+    def _cell_sort_key(self, cell: str):
+        """Sort key: left-to-right (A→N), then top-to-bottom (1→4)."""
+        return (GRID_COLS.index(cell[0]), GRID_ROWS.index(cell[1]))
+
     def _select_cell(self, cell: str):
-        if self._selected_cell:
-            self._cell_btns[self._selected_cell].setChecked(False)
-        self._selected_cell = cell
-        self._cell_btns[cell].setChecked(True)
-        degs = cell_to_joints_deg(cell)
-        labels = ['pan', 'lift', 'elbow', 'w1', 'w2', 'w3']
-        info = '  '.join(f'{l}={d:+.1f}°' for l, d in zip(labels, degs))
-        self._set_status(f'Selected: {cell}  |  {info}', '#aaaaaa')
+        if cell in self._selected_cells:
+            self._selected_cells.remove(cell)
+            self._cell_btns[cell].setChecked(False)
+        else:
+            self._selected_cells.append(cell)
+            self._cell_btns[cell].setChecked(True)
+        self._selected_cells.sort(key=self._cell_sort_key)
+        count = len(self._selected_cells)
+        if count == 0:
+            self._set_status('No cells selected', '#aaaaaa')
+        else:
+            seq = ' → '.join(self._selected_cells)
+            self._set_status(f'{count} cell(s): {seq}', '#aaaaaa')
+
+    def _clear_selection(self):
+        for cell in list(self._selected_cells):
+            self._cell_btns[cell].setChecked(False)
+        self._selected_cells.clear()
+        self._set_status('Selection cleared', '#aaaaaa')
 
     def _go(self):
-        if not self._selected_cell:
-            self._set_status('Select a cell first', '#e0a000')
+        if not self._selected_cells:
+            self._set_status('Toggle at least one cell first', '#e0a000')
             return
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
         self._moving = True
-        cell = self._selected_cell
+        queue = list(self._selected_cells)   # already sorted left-to-right
+        self._log(f'Queue: {" → ".join(queue)}')
+        self._move_next(queue)
+
+    def _move_next(self, queue: list):
+        if not queue or self._mover_node._cancel_flag:
+            self._moving = False
+            if not queue:
+                self._status_sig.emit('All cells reached', '#00cc00')
+                self._log_sig.emit('Sequence complete')
+            return
+        cell = queue[0]
+        remaining = queue[1:]
         degrees = cell_to_joints_deg(cell)
-        self._set_status(f'Moving to {cell}…', '#3a7aff')
-        self._log(f'Moving to cell {cell}')
-        self._mover_node.move_to(
-            degrees,
-            done_cb=lambda: (
-                self._status_sig.emit(f'Reached {cell}', '#00cc00'),
-                self._log_sig.emit(f'Reached {cell}'),
-                setattr(self, '_moving', False),
-            ),
-            fail_cb=lambda msg: (
-                self._status_sig.emit(f'Failed: {msg}', '#ff4444'),
-                self._log_sig.emit(f'FAIL: {msg}'),
-                setattr(self, '_moving', False),
-            ),
-        )
+
+        # Dip position: slightly lower the end-effector for cutting motion
+        dip_degrees = list(degrees)
+        dip_degrees[1] += CUT_DIP_LIFT
+        dip_degrees[2] += CUT_DIP_ELBOW
+
+        self._status_sig.emit(f'Moving to {cell}…  ({len(remaining)} remaining)', '#3a7aff')
+        self._log(f'Moving to {cell}')
+
+        def _on_arrive():
+            self._log_sig.emit(f'Reached {cell} — cutting')
+            self._status_sig.emit(f'Cutting at {cell}…', '#e0a000')
+            self._mover_node.move_to(
+                dip_degrees,
+                done_cb=_on_dip,
+                fail_cb=_on_fail,
+            )
+
+        def _on_dip():
+            self._log_sig.emit(f'Cut at {cell} — recovering')
+            self._mover_node.move_to(
+                degrees,
+                done_cb=lambda: self._move_next(remaining),
+                fail_cb=_on_fail,
+            )
+
+        def _on_fail(msg):
+            self._status_sig.emit(f'Failed at {cell}: {msg}', '#ff4444')
+            self._log_sig.emit(f'FAIL at {cell}: {msg}')
+            setattr(self, '_moving', False)
+
+        self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
 
     def _stop(self):
         self._mover_node.cancel()
