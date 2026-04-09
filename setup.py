@@ -29,6 +29,7 @@ setup(
             'gui_sim = fruitninja.gui_sim:main',
             'gui_ur3e = fruitninja.gui_ur3e:main',
             'grid_mover = fruitninja.grid_mover:main',
+            'real_gui_points = fruitninja.real_gui_points:main',
         ],
     },
 )

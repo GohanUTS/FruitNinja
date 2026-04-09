@@ -128,19 +128,43 @@ class PlanningSceneSetup(Node):
         mesh_pose = Pose()
         mesh_pose.position.x = 0.0
         mesh_pose.position.y = 0.0
-        mesh_pose.position.z = 0.0
-        # 90° around X (Y-up → Z-up) + 90° CCW around Z
-        mesh_pose.orientation.x = 0.5
-        mesh_pose.orientation.y = 0.5
-        mesh_pose.orientation.z = 0.5
-        mesh_pose.orientation.w = 0.5
+        # Shift trolley down so its top surface (0.765 m) aligns with robot
+        # base (table_mount at z=0.724 m in URDF).  Offset = 0.724 - 0.765.
+        mesh_pose.position.z = -0.041
+        # DAE is Z-up — no rotation needed
+        mesh_pose.orientation.x = 0.0
+        mesh_pose.orientation.y = 0.0
+        mesh_pose.orientation.z = 0.0
+        mesh_pose.orientation.w = 1.0
         trolley.mesh_poses.append(mesh_pose)
         trolley.operation = CollisionObject.ADD
 
         planning_scene.world.collision_objects.append(trolley)
 
+        # -------------------------------------------------------
+        # WORKSPACE BOUNDARY — thin box below the trolley (floor)
+        # keeps the planner from trying to reach under the table.
+        # -------------------------------------------------------
+        from shape_msgs.msg import SolidPrimitive
+
+        floor = CollisionObject()
+        floor.id = 'floor'
+        floor.header.frame_id = 'world'
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [3.0, 3.0, 0.02]   # 3 m × 3 m × 2 cm slab
+        floor.primitives.append(box)
+        floor_pose = Pose()
+        floor_pose.position.x = 0.0
+        floor_pose.position.y = 0.0
+        floor_pose.position.z = -0.094   # bottom of trolley (~0.053 m) - 0.041 - 0.01
+        floor_pose.orientation.w = 1.0
+        floor.primitive_poses.append(floor_pose)
+        floor.operation = CollisionObject.ADD
+        planning_scene.world.collision_objects.append(floor)
+
         self.scene_pub.publish(planning_scene)
-        self.get_logger().info('Planning scene published: UR3e trolley mesh.')
+        self.get_logger().info('Planning scene published: trolley mesh + floor boundary.')
 
 
 def main(args=None):
