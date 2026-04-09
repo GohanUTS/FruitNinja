@@ -38,9 +38,9 @@ JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 
 
 HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 0.0]
 
-# Cutting motion: dip the end-effector down by offsetting shoulder lift + elbow
-CUT_DIP_LIFT  =  8.0   # degrees added to shoulder_lift_joint (index 1)
-CUT_DIP_ELBOW = -8.0   # degrees added to elbow_joint (index 2)
+# Cutting motion: drive end-effector down close to the trolley surface
+CUT_DIP_LIFT  =  30.0   # degrees added to shoulder_lift_joint (index 1)
+CUT_DIP_ELBOW = -30.0   # degrees added to elbow_joint (index 2)
 
 MOVE_GROUP = 'ur_manipulator'
 
