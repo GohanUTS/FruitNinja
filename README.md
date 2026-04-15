@@ -62,3 +62,4 @@ ros2 run fruitninja real_gui_points
 Terminal 5 — Fix Controller (once after Terminal 1 is fully connected)
 source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
 ros2 service call /controller_manager/switch_controller controller_manager_msgs/srv/SwitchController "{activate_controllers: ['scaled_joint_trajectory_controller'], deactivate_controllers: ['joint_trajectory_controller'], strictness: 2}"
+
