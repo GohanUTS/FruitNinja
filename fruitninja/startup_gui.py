@@ -318,6 +318,17 @@ class StartupWindow(QMainWindow):
         apply_btn.clicked.connect(self._apply_ip)
         ip_layout.addWidget(apply_btn)
 
+        ping_btn = QPushButton('Ping')
+        ping_btn.setFixedWidth(70)
+        ping_btn.setStyleSheet(
+            'QPushButton{background:#2a2a3a;color:#ccc;border:1px solid #555;border-radius:4px;'
+            'padding:6px 10px;font-size:12px;font-weight:bold;}'
+            'QPushButton:hover{background:#3a3a5acc;}'
+        )
+        ping_btn.setToolTip('Ping the robot IP to check connectivity.')
+        ping_btn.clicked.connect(self._ping_ip)
+        ip_layout.addWidget(ping_btn)
+
         self._ip_status = QLabel('')
         self._ip_status.setStyleSheet('color:#888; font-size:11px; padding-left:8px;')
         ip_layout.addWidget(self._ip_status)
@@ -387,6 +398,45 @@ class StartupWindow(QMainWindow):
         self._ip_status.setText(f'Applied — using {ip}')
         self._ip_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:8px;')
         self._append_log(f'[Config] Robot IP set to {ip}')
+
+    def _ping_ip(self):
+        ip = self._ip_input.text().strip()
+        if not ip:
+            self._ip_status.setText('Enter an IP to ping.')
+            self._ip_status.setStyleSheet('color:#ff4444; font-size:11px; padding-left:8px;')
+            return
+        self._ip_status.setText(f'Pinging {ip}…')
+        self._ip_status.setStyleSheet('color:#aaa; font-size:11px; padding-left:8px;')
+        self._append_log(f'[Ping] Pinging {ip}…')
+        threading.Thread(target=self._do_ping, args=(ip,), daemon=True).start()
+
+    def _do_ping(self, ip: str):
+        try:
+            result = subprocess.run(
+                ['ping', '-c', '3', '-W', '2', ip],
+                capture_output=True, text=True,
+            )
+            for line in result.stdout.splitlines():
+                self._log_sig.emit(f'[Ping] {line}')
+            if result.returncode == 0:
+                # Extract round-trip time from the summary line
+                rtt = ''
+                for line in result.stdout.splitlines():
+                    if 'rtt' in line or 'round-trip' in line:
+                        rtt = line.split('=')[-1].strip()
+                        break
+                msg   = f'Reachable  {("— " + rtt) if rtt else ""}'.strip()
+                style = 'color:#00cc88; font-size:11px; padding-left:8px;'
+            else:
+                msg   = f'{ip} unreachable'
+                style = 'color:#ff4444; font-size:11px; padding-left:8px;'
+        except Exception as e:
+            msg   = f'Ping error: {e}'
+            style = 'color:#ff4444; font-size:11px; padding-left:8px;'
+
+        # Update status label from the main thread
+        self._ip_status.setText(msg)
+        self._ip_status.setStyleSheet(style)
 
     def _populate_steps(self, robot_ip: str):
         # Clear existing rows
