@@ -9,10 +9,10 @@ import threading
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QTextEdit, QGroupBox, QLineEdit,
+    QPushButton, QTextEdit, QGroupBox, QLineEdit, QTabWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QProcess
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 
 # ── Step definitions ──────────────────────────────────────────────────────────
@@ -81,6 +81,7 @@ def make_steps(robot_ip: str) -> list:
         },
     ]
 
+
 # ── Status colours ────────────────────────────────────────────────────────────
 
 STATUS_IDLE    = ('● Idle',    '#666666')
@@ -89,31 +90,62 @@ STATUS_DONE    = ('✔ Done',    '#00ddff')
 STATUS_FAILED  = ('✖ Failed',  '#ff4444')
 STATUS_STOPPED = ('■ Stopped', '#e0a000')
 
+TAB_STYLE = """
+QTabWidget::pane {
+    border: 1px solid #444;
+    background: #0a0a0a;
+}
+QTabBar::tab {
+    background: #2a2a2a;
+    color: #aaa;
+    padding: 6px 14px;
+    border: 1px solid #444;
+    border-bottom: none;
+    font-size: 11px;
+}
+QTabBar::tab:selected {
+    background: #1e1e1e;
+    color: white;
+    font-weight: bold;
+}
+QTabBar::tab:hover {
+    background: #3a3a3a;
+}
+"""
+
 
 # ── Step row widget ───────────────────────────────────────────────────────────
 
 class StepRow(QObject):
-    """Manages one step: process, status label, start/stop buttons."""
+    """Manages one step: QProcess, status label, start/stop buttons, output widget."""
 
-    log_signal    = pyqtSignal(str)
     status_signal = pyqtSignal(str, str)   # text, colour
 
-    def __init__(self, step: dict, parent_log_signal):
+    def __init__(self, step: dict, on_output):
         super().__init__()
-        self._step    = step
-        self._proc    = None
-        self._thread  = None
+        self._step     = step
+        self._on_output = on_output   # callable(label, text)
 
-        # Forward log lines to the main window's log
-        self.log_signal.connect(parent_log_signal)
+        # ── QProcess ──────────────────────────────────────────────────────────
+        self._proc = QProcess()
+        self._proc.setProcessChannelMode(QProcess.MergedChannels)
+        self._proc.readyReadStandardOutput.connect(self._read_output)
+        self._proc.finished.connect(self._on_finished)
 
-        # ── widgets ───────────────────────────────────────────────────────────
+        # ── output tab widget ─────────────────────────────────────────────────
+        self.output_widget = QTextEdit()
+        self.output_widget.setReadOnly(True)
+        self.output_widget.setStyleSheet(
+            'background:#0a0a0a; color:#00ee00;'
+            'font-family:monospace; font-size:11px;'
+        )
+
+        # ── row container ─────────────────────────────────────────────────────
         self.container = QWidget()
         layout = QHBoxLayout(self.container)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(10)
 
-        # Label column
         label_col = QVBoxLayout()
         label_col.setSpacing(1)
 
@@ -132,21 +164,18 @@ class StepRow(QObject):
 
         layout.addLayout(label_col, stretch=1)
 
-        # Status dot
         self._status_lbl = QLabel(STATUS_IDLE[0])
         self._status_lbl.setFixedWidth(90)
         self._status_lbl.setAlignment(Qt.AlignCenter)
         self._apply_status(*STATUS_IDLE)
         layout.addWidget(self._status_lbl)
 
-        # Start button
         self._btn_start = QPushButton('▶  Start')
         self._btn_start.setFixedWidth(90)
         self._btn_start.setStyleSheet(self._btn_style('#1a5c1a'))
         self._btn_start.clicked.connect(self.start)
         layout.addWidget(self._btn_start)
 
-        # Stop button
         self._btn_stop = QPushButton('■  Stop')
         self._btn_stop.setFixedWidth(90)
         self._btn_stop.setEnabled(False)
@@ -154,78 +183,63 @@ class StepRow(QObject):
         self._btn_stop.clicked.connect(self.stop)
         layout.addWidget(self._btn_stop)
 
-        # Connect status signal
         self.status_signal.connect(self._apply_status)
 
     # ── process control ───────────────────────────────────────────────────────
 
     def start(self):
-        if self._proc and self._proc.poll() is None:
-            return   # already running
+        if self._proc.state() != QProcess.NotRunning:
+            return
 
+        self.output_widget.clear()
         self._btn_start.setEnabled(False)
         self._btn_stop.setEnabled(not self._step['oneshot'])
-        self.status_signal.emit(*STATUS_RUNNING)
-        self.log_signal.emit(f'[{self._step["label"]}] Starting in new terminal…')
+        self._apply_status(*STATUS_RUNNING)
+        self._write_output(f'Starting: {self._step["label"]}\n')
 
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        try:
-            label = self._step['label']
-            cmd   = self._step['cmd']
-
-            # Wrap the command so the terminal stays open on failure
-            # (for one-shot steps the window closes automatically on success)
-            if self._step['oneshot']:
-                inner = f'bash -c {repr(cmd)}'
-            else:
-                inner = (
-                    f'bash -c {repr(cmd + "; echo; echo --- Process ended, press Enter to close ---; read")}'
-                )
-
-            # Try gnome-terminal first, fall back to xterm
-            terminal_cmd = (
-                f'gnome-terminal --title={repr(label)} -- bash -c {repr(inner)} '
-                f'|| xterm -title {repr(label)} -e bash -c {repr(inner)}'
-            )
-
-            self._proc = subprocess.Popen(
-                terminal_cmd,
-                shell=True,
-                executable='/bin/bash',
-            )
-            self._proc.wait()   # waits for the terminal process itself to exit
-            rc = self._proc.returncode
-
-            if rc == 0:
-                if self._step['oneshot']:
-                    self.status_signal.emit(*STATUS_DONE)
-                    self.log_signal.emit(f'[{label}] Terminal closed.')
-                else:
-                    self.status_signal.emit(*STATUS_STOPPED)
-                    self.log_signal.emit(f'[{label}] Terminal closed.')
-            else:
-                self.status_signal.emit(*STATUS_FAILED)
-                self.log_signal.emit(f'[{label}] Terminal exited with code {rc}')
-        except Exception as e:
-            self.status_signal.emit(*STATUS_FAILED)
-            self.log_signal.emit(f'[{self._step["label"]}] Error: {e}')
-        finally:
-            self._reset_buttons()
+        self._proc.start('/bin/bash', ['-c', self._step['cmd']])
 
     def stop(self):
-        if self._proc and self._proc.poll() is None:
-            self.log_signal.emit(f'[{self._step["label"]}] Closing terminal…')
+        if self._proc.state() != QProcess.NotRunning:
+            self._write_output('Stopping process…\n')
             self._proc.terminate()
-            self.status_signal.emit(*STATUS_STOPPED)
+            self._apply_status(*STATUS_STOPPED)
 
-    def _reset_buttons(self):
+    def is_running(self) -> bool:
+        return self._proc.state() != QProcess.NotRunning
+
+    def kill(self):
+        if self._proc.state() != QProcess.NotRunning:
+            self._proc.kill()
+
+    # ── QProcess slots ────────────────────────────────────────────────────────
+
+    def _read_output(self):
+        raw = self._proc.readAllStandardOutput().data().decode(errors='replace')
+        self._write_output(raw)
+
+    def _on_finished(self, exit_code, exit_status):
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
+        if exit_status == QProcess.CrashExit or exit_code not in (0, 15, -15):
+            self._apply_status(*STATUS_FAILED)
+            self._write_output(f'\nProcess exited with code {exit_code}\n')
+        elif self._step['oneshot']:
+            self._apply_status(*STATUS_DONE)
+            self._write_output('\nCompleted.\n')
+        else:
+            # Only update to STOPPED if not already marked stopped by user
+            if self._status_lbl.text() not in (STATUS_STOPPED[0],):
+                self._apply_status(*STATUS_STOPPED)
+            self._write_output('\nProcess ended.\n')
 
-    # ── style helpers ─────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _write_output(self, text: str):
+        self.output_widget.moveCursor(QTextCursor.End)
+        self.output_widget.insertPlainText(text)
+        self.output_widget.moveCursor(QTextCursor.End)
+        self._on_output(self._step['label'], text)
 
     @staticmethod
     def _btn_style(colour):
@@ -252,12 +266,12 @@ class StartupWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('FruitNinja — Startup Launcher')
-        self.setMinimumSize(760, 640)
+        self.setMinimumSize(820, 700)
         self.setStyleSheet('background:#1e1e1e; color:white;')
 
-        self._log_sig.connect(self._append_log)
-        self._step_rows = []
-        self._steps_layout = None   # filled in _build_ui
+        self._step_rows    = []
+        self._steps_layout = None
+        self._tab_widget   = None
         self._build_ui()
 
     def _build_ui(self):
@@ -283,11 +297,7 @@ class StartupWindow(QMainWindow):
 
         # ── Robot IP config ───────────────────────────────────────────────────
         ip_group = QGroupBox('Robot IP Address')
-        ip_group.setStyleSheet(
-            'QGroupBox{color:white;font-weight:bold;'
-            'border:1px solid #444;border-radius:4px;margin-top:8px;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:8px;}'
-        )
+        ip_group.setStyleSheet(self._group_style())
         ip_layout = QHBoxLayout(ip_group)
         ip_layout.setContentsMargins(10, 8, 10, 8)
 
@@ -338,14 +348,9 @@ class StartupWindow(QMainWindow):
 
         # ── Steps group ───────────────────────────────────────────────────────
         self._steps_group = QGroupBox('Steps')
-        self._steps_group.setStyleSheet(
-            'QGroupBox{color:white;font-weight:bold;'
-            'border:1px solid #444;border-radius:4px;margin-top:8px;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:8px;}'
-        )
+        self._steps_group.setStyleSheet(self._group_style())
         self._steps_layout = QVBoxLayout(self._steps_group)
         self._steps_layout.setSpacing(4)
-        self._populate_steps(DEFAULT_ROBOT_IP)
         root.addWidget(self._steps_group)
 
         # Stop-all button
@@ -358,56 +363,34 @@ class StartupWindow(QMainWindow):
         stop_all_btn.clicked.connect(self._stop_all)
         root.addWidget(stop_all_btn)
 
-        # Log area
-        log_group = QGroupBox('Output Log')
-        log_group.setStyleSheet(
-            'QGroupBox{color:white;font-weight:bold;'
-            'border:1px solid #444;border-radius:4px;margin-top:8px;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:8px;}'
-        )
-        log_layout = QVBoxLayout(log_group)
+        # ── Output tabs ───────────────────────────────────────────────────────
+        self._tab_widget = QTabWidget()
+        self._tab_widget.setStyleSheet(TAB_STYLE)
+        self._tab_widget.setMinimumHeight(220)
+        root.addWidget(self._tab_widget, stretch=1)
 
-        self._log_widget = QTextEdit()
-        self._log_widget.setReadOnly(True)
-        self._log_widget.setStyleSheet(
-            'background:#0a0a0a; color:#00ee00;'
-            'font-family:monospace; font-size:11px;'
-        )
-        log_layout.addWidget(self._log_widget)
-        root.addWidget(log_group)
+        # Populate steps + tabs with default IP
+        self._populate_steps(DEFAULT_ROBOT_IP)
 
     # ── IP helpers ────────────────────────────────────────────────────────────
 
     def _apply_ip(self):
         ip = self._ip_input.text().strip()
         if not ip:
-            self._ip_status.setText('Enter a valid IP.')
-            self._ip_status.setStyleSheet('color:#ff4444; font-size:11px; padding-left:8px;')
+            self._set_ip_status('Enter a valid IP.', '#ff4444')
             return
-
-        any_running = any(
-            row._proc and row._proc.poll() is None
-            for row in self._step_rows
-        )
-        if any_running:
-            self._ip_status.setText('Stop all processes first.')
-            self._ip_status.setStyleSheet('color:#e0a000; font-size:11px; padding-left:8px;')
+        if any(row.is_running() for row in self._step_rows):
+            self._set_ip_status('Stop all processes first.', '#e0a000')
             return
-
         self._populate_steps(ip)
-        self._ip_status.setText(f'Applied — using {ip}')
-        self._ip_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:8px;')
-        self._append_log(f'[Config] Robot IP set to {ip}')
+        self._set_ip_status(f'Applied — using {ip}', '#00cc88')
 
     def _ping_ip(self):
         ip = self._ip_input.text().strip()
         if not ip:
-            self._ip_status.setText('Enter an IP to ping.')
-            self._ip_status.setStyleSheet('color:#ff4444; font-size:11px; padding-left:8px;')
+            self._set_ip_status('Enter an IP to ping.', '#ff4444')
             return
-        self._ip_status.setText(f'Pinging {ip}…')
-        self._ip_status.setStyleSheet('color:#aaa; font-size:11px; padding-left:8px;')
-        self._append_log(f'[Ping] Pinging {ip}…')
+        self._set_ip_status(f'Pinging {ip}…', '#aaa')
         threading.Thread(target=self._do_ping, args=(ip,), daemon=True).start()
 
     def _do_ping(self, ip: str):
@@ -416,43 +399,50 @@ class StartupWindow(QMainWindow):
                 ['ping', '-c', '3', '-W', '2', ip],
                 capture_output=True, text=True,
             )
+            # Emit ping output to the first tab
             for line in result.stdout.splitlines():
-                self._log_sig.emit(f'[Ping] {line}')
+                self._append_to_tab('Step 1 — UR Driver', f'[Ping] {line}\n')
             if result.returncode == 0:
-                # Extract round-trip time from the summary line
                 rtt = ''
                 for line in result.stdout.splitlines():
                     if 'rtt' in line or 'round-trip' in line:
                         rtt = line.split('=')[-1].strip()
                         break
                 msg   = f'Reachable  {("— " + rtt) if rtt else ""}'.strip()
-                style = 'color:#00cc88; font-size:11px; padding-left:8px;'
+                color = '#00cc88'
             else:
                 msg   = f'{ip} unreachable'
-                style = 'color:#ff4444; font-size:11px; padding-left:8px;'
+                color = '#ff4444'
         except Exception as e:
             msg   = f'Ping error: {e}'
-            style = 'color:#ff4444; font-size:11px; padding-left:8px;'
+            color = '#ff4444'
+        self._set_ip_status(msg, color)
 
-        # Update status label from the main thread
-        self._ip_status.setText(msg)
-        self._ip_status.setStyleSheet(style)
+    def _set_ip_status(self, text: str, colour: str):
+        self._ip_status.setText(text)
+        self._ip_status.setStyleSheet(
+            f'color:{colour}; font-size:11px; padding-left:8px;'
+        )
+
+    # ── Step population ───────────────────────────────────────────────────────
 
     def _populate_steps(self, robot_ip: str):
-        # Clear existing rows
+        # Kill + clear old rows
         for row in self._step_rows:
+            row.kill()
             row.container.setParent(None)
         self._step_rows.clear()
 
-        # Remove all widgets from the layout cleanly
         while self._steps_layout.count():
             item = self._steps_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
+        self._tab_widget.clear()
+
         steps = make_steps(robot_ip)
         for i, step in enumerate(steps):
-            row = StepRow(step, self._log_sig)
+            row = StepRow(step, self._append_to_tab)
             self._step_rows.append(row)
             self._steps_layout.addWidget(row.container)
 
@@ -462,17 +452,36 @@ class StartupWindow(QMainWindow):
                 sep.setStyleSheet('background:#333;')
                 self._steps_layout.addWidget(sep)
 
+            # Add a tab for this step's output
+            self._tab_widget.addTab(row.output_widget, step['label'])
+
+    def _append_to_tab(self, label: str, text: str):
+        """Called from StepRow (main thread via QProcess signals) to write to a tab."""
+        for i in range(self._tab_widget.count()):
+            if self._tab_widget.tabText(i) == label:
+                widget = self._tab_widget.widget(i)
+                widget.moveCursor(QTextCursor.End)
+                widget.insertPlainText(text)
+                widget.moveCursor(QTextCursor.End)
+                break
+
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _append_log(self, text: str):
-        self._log_widget.append(text)
+    @staticmethod
+    def _group_style():
+        return (
+            'QGroupBox{color:white;font-weight:bold;'
+            'border:1px solid #444;border-radius:4px;margin-top:8px;}'
+            'QGroupBox::title{subcontrol-origin:margin;left:8px;}'
+        )
 
     def _stop_all(self):
         for row in self._step_rows:
             row.stop()
 
     def closeEvent(self, event):
-        self._stop_all()
+        for row in self._step_rows:
+            row.kill()
         event.accept()
 
 

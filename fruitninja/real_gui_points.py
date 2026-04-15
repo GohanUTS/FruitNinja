@@ -21,6 +21,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QGroupBox, QTextEdit,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import QShortcut
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -234,7 +236,13 @@ class MainWindow(QMainWindow):
 
         self._btn_go    = self._action_btn('▶  Move to Selected', '#1a5c1a', self._go)
         self._btn_clear = self._action_btn('✕  Clear', '#3a3a3a', self._clear_selection)
-        self._btn_stop  = self._action_btn('■  Stop',         '#5a1a1a', self._stop)
+        self._btn_stop  = self._action_btn('⚠  E-STOP  [SPACE]', '#cc0000', self._stop)
+        self._btn_stop.setStyleSheet(
+            'QPushButton{background:#cc0000;color:white;border:2px solid #ff4444;'
+            'border-radius:6px;padding:12px;font-size:14px;font-weight:bold;}'
+            'QPushButton:hover{background:#ee2222;}'
+            'QPushButton:pressed{background:#991111;}'
+        )
         self._btn_reset = self._action_btn('↺  Reset (Home)', '#4a3a00', self._reset)
 
         act_layout.addWidget(self._btn_go)
@@ -261,6 +269,10 @@ class MainWindow(QMainWindow):
             'font-family:monospace; font-size:11px;'
         )
         root.addWidget(self._log_widget)
+
+        # ── spacebar E-STOP shortcut ──────────────────────────────────────────
+        shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
+        shortcut.activated.connect(self._stop)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -381,8 +393,8 @@ class MainWindow(QMainWindow):
     def _stop(self):
         self._mover_node.cancel()
         self._moving = False
-        self._set_status('Stopped', '#aaaaaa')
-        self._log('Stop requested')
+        self._set_status('⚠ EMERGENCY STOP', '#ff4444')
+        self._log('EMERGENCY STOP triggered')
 
     def _reset(self):
         if self._moving:
