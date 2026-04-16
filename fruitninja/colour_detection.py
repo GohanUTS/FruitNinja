@@ -18,23 +18,23 @@ import numpy as np
 # ── Fruit profiles (label, bgr, hsv_ranges, real_width_m) ────────────────────
 COLOUR_PROFILES = [
     ('Apple',   (0, 50, 255),  [
-        (np.array([0,   60, 40]),  np.array([10,  255, 255])),
-        (np.array([160, 60, 40]),  np.array([180, 255, 255])),
+        (np.array([0,   120, 80]),  np.array([8,   255, 220])),   # red low
+        (np.array([172, 120, 80]),  np.array([180, 255, 220])),   # red high
     ], 0.08),
     ('Lettuce', (0, 200, 50),  [
-        (np.array([36,  45, 40]),   np.array([85,  255, 255])),
+        (np.array([40,  100, 50]),  np.array([80,  255, 180])),   # deep green only
     ], 0.25),
     ('Banana',  (0, 220, 255), [
-        (np.array([20,  80, 80]),  np.array([35, 255, 255])),
+        (np.array([22,  140, 100]), np.array([32,  255, 220])),   # saturated yellow
     ], 0.18),
     ('Orange',  (0, 130, 255), [
-        (np.array([10, 120, 80]),  np.array([20, 255, 255])),
+        (np.array([11,  180, 100]), np.array([18,  255, 220])),   # deep orange only
     ], 0.07),
 ]
 
 # ── Blue corner marker config ─────────────────────────────────────────────────
 BLUE_HSV_RANGES = [
-    (np.array([100, 120, 60]),  np.array([120, 255, 255])),
+    (np.array([100, 150, 80]),  np.array([120, 255, 220])),       # deeper blue
 ]
 BLUE_BGR        = (220, 80,  0)
 GRID_BGR        = (200, 200, 0)
