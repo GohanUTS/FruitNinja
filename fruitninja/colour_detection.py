@@ -18,17 +18,17 @@ import numpy as np
 # ── Fruit profiles (label, bgr, hsv_ranges, real_width_m) ────────────────────
 COLOUR_PROFILES = [
     ('Apple',   (0, 50, 255),  [
-        (np.array([0,   120, 80]),  np.array([8,   255, 220])),   # red low
-        (np.array([172, 120, 80]),  np.array([180, 255, 220])),   # red high
+        (np.array([0,   180, 120]),  np.array([5,   255, 255])),   # vivid red low
+        (np.array([175, 180, 120]),  np.array([180, 255, 255])),   # vivid red high
     ], 0.08),
     ('Lettuce', (0, 200, 50),  [
-        (np.array([40,  100, 50]),  np.array([80,  255, 180])),   # deep green only
+        (np.array([42,  120, 80]),   np.array([75,  255, 200])),   # true green
     ], 0.25),
     ('Banana',  (0, 220, 255), [
-        (np.array([22,  140, 100]), np.array([32,  255, 220])),   # saturated yellow
+        (np.array([24,  180, 150]),  np.array([30,  255, 255])),   # bright yellow only
     ], 0.18),
     ('Orange',  (0, 130, 255), [
-        (np.array([11,  180, 100]), np.array([18,  255, 220])),   # deep orange only
+        (np.array([12,  200, 150]),  np.array([20,  255, 255])),   # vivid orange only
     ], 0.07),
 ]
 
