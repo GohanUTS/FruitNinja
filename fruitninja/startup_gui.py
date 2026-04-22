@@ -18,6 +18,8 @@ from PyQt5.QtGui import QFont, QColor, QTextCursor
 # ── Step definitions ──────────────────────────────────────────────────────────
 
 DEFAULT_ROBOT_IP = '192.168.0.194'
+SIM_ROBOT_IP    = '192.168.56.101'
+SIM_VNC_URL     = 'http://192.168.56.101:6080/vnc.html'
 
 SOURCE = (
     'source /opt/ros/humble/setup.bash && '
@@ -25,14 +27,26 @@ SOURCE = (
 )
 
 
-def make_steps(robot_ip: str) -> list:
-    return [
+def make_steps(robot_ip: str, sim: bool = False) -> list:
+    ip = SIM_ROBOT_IP if sim else robot_ip
+    steps = []
+
+    if sim:
+        steps.append({
+            'label':   'Step 0 — Start URSim',
+            'desc':    'Launch the UR3e Polyscope simulator via Docker',
+            'cmd':     SOURCE + 'ros2 run ur_client_library start_ursim.sh -m ur3e',
+            'oneshot': False,
+            'note':    f'Then open Polyscope at {SIM_VNC_URL} and press Play on "External Control".',
+        })
+
+    steps += [
         {
             'label':   'Step 1 — UR Driver',
-            'desc':    f'Launch the UR3e robot driver  (robot_ip: {robot_ip})',
+            'desc':    f'Launch the UR3e robot driver  (robot_ip: {ip})',
             'cmd':     SOURCE + (
                 'ros2 launch ur_robot_driver ur_control.launch.py '
-                f'ur_type:=ur3e robot_ip:={robot_ip} '
+                f'ur_type:=ur3e robot_ip:={ip} '
                 'launch_rviz:=false '
                 'initial_joint_controller:=scaled_joint_trajectory_controller'
             ),
@@ -80,6 +94,7 @@ def make_steps(robot_ip: str) -> list:
             'note':    'One-shot command — completes on its own.',
         },
     ]
+    return steps
 
 
 # ── Status colours ────────────────────────────────────────────────────────────
@@ -272,6 +287,7 @@ class StartupWindow(QMainWindow):
         self._step_rows    = []
         self._steps_layout = None
         self._tab_widget   = None
+        self._sim_mode     = False
         self._build_ui()
 
     def _build_ui(self):
@@ -281,19 +297,37 @@ class StartupWindow(QMainWindow):
         root.setSpacing(8)
         root.setContentsMargins(14, 14, 14, 14)
 
-        # Title
-        title = QLabel('UR3e Startup Sequence')
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(
-            'color:white; font-size:18px; font-weight:bold;'
-            'padding:8px; border-bottom:1px solid #444;'
-        )
-        root.addWidget(title)
+        # ── Title row with Real/Sim toggle ───────────────────────────────────
+        title_row = QHBoxLayout()
 
-        subtitle = QLabel('Run each step in order. Steps 1 and 2 must be fully ready before continuing.')
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet('color:#888; font-size:11px; padding-bottom:4px;')
-        root.addWidget(subtitle)
+        title = QLabel('UR3e Startup Sequence')
+        title.setStyleSheet(
+            'color:white; font-size:18px; font-weight:bold; padding:8px;'
+        )
+        title_row.addWidget(title)
+        title_row.addStretch()
+
+        self._mode_label = QLabel('REAL')
+        self._mode_label.setStyleSheet(
+            'color:#00cc88; font-size:12px; font-weight:bold; padding-right:6px;'
+        )
+        title_row.addWidget(self._mode_label)
+
+        self._sim_toggle = QPushButton('Switch to Sim')
+        self._sim_toggle.setFixedWidth(130)
+        self._sim_toggle.setStyleSheet(self._sim_btn_style(active=False))
+        self._sim_toggle.clicked.connect(self._toggle_sim)
+        title_row.addWidget(self._sim_toggle)
+
+        title_bar = QWidget()
+        title_bar.setStyleSheet('border-bottom:1px solid #444;')
+        title_bar.setLayout(title_row)
+        root.addWidget(title_bar)
+
+        self._subtitle = QLabel('Run each step in order. Steps 1 and 2 must be fully ready before continuing.')
+        self._subtitle.setAlignment(Qt.AlignCenter)
+        self._subtitle.setStyleSheet('color:#888; font-size:11px; padding-bottom:4px;')
+        root.addWidget(self._subtitle)
 
         # ── Robot IP config ───────────────────────────────────────────────────
         ip_group = QGroupBox('Robot IP Address')
@@ -370,7 +404,7 @@ class StartupWindow(QMainWindow):
         root.addWidget(self._tab_widget, stretch=1)
 
         # Populate steps + tabs with default IP
-        self._populate_steps(DEFAULT_ROBOT_IP)
+        self._populate_steps(DEFAULT_ROBOT_IP, sim=False)
 
     # ── IP helpers ────────────────────────────────────────────────────────────
 
@@ -382,7 +416,7 @@ class StartupWindow(QMainWindow):
         if any(row.is_running() for row in self._step_rows):
             self._set_ip_status('Stop all processes first.', '#e0a000')
             return
-        self._populate_steps(ip)
+        self._populate_steps(ip, sim=self._sim_mode)
         self._set_ip_status(f'Applied — using {ip}', '#00cc88')
 
     def _ping_ip(self):
@@ -426,21 +460,23 @@ class StartupWindow(QMainWindow):
 
     # ── Step population ───────────────────────────────────────────────────────
 
-    def _populate_steps(self, robot_ip: str):
-        # Kill + clear old rows
+    def _populate_steps(self, robot_ip: str, sim: bool = False):
+        # Kill processes and hide containers immediately so Qt doesn't
+        # turn detached widgets into floating top-level windows
         for row in self._step_rows:
             row.kill()
-            row.container.setParent(None)
+            row.container.hide()
         self._step_rows.clear()
 
         while self._steps_layout.count():
             item = self._steps_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
 
         self._tab_widget.clear()
 
-        steps = make_steps(robot_ip)
+        steps = make_steps(robot_ip, sim=sim)
         for i, step in enumerate(steps):
             row = StepRow(step, self._append_to_tab)
             self._step_rows.append(row)
@@ -464,6 +500,63 @@ class StartupWindow(QMainWindow):
                 widget.insertPlainText(text)
                 widget.moveCursor(QTextCursor.End)
                 break
+
+    # ── Real / Sim toggle ─────────────────────────────────────────────────────
+
+    def _toggle_sim(self):
+        if any(row.is_running() for row in self._step_rows):
+            self._set_ip_status('Stop all processes before switching modes.', '#e0a000')
+            return
+
+        self._sim_mode = not self._sim_mode
+
+        if self._sim_mode:
+            # Lock IP field to sim IP
+            self._ip_input.setText(SIM_ROBOT_IP)
+            self._ip_input.setEnabled(False)
+            self._mode_label.setText('SIM')
+            self._mode_label.setStyleSheet(
+                'color:#e0a000; font-size:12px; font-weight:bold; padding-right:6px;'
+            )
+            self._sim_toggle.setText('Switch to Real')
+            self._sim_toggle.setStyleSheet(self._sim_btn_style(active=True))
+            self._subtitle.setText(
+                f'SIM MODE — URSim Polyscope at  {SIM_VNC_URL}  |  '
+                'Press Play on "External Control" before Step 1.'
+            )
+            self._subtitle.setStyleSheet('color:#e0a000; font-size:11px; padding-bottom:4px;')
+            self._populate_steps(SIM_ROBOT_IP, sim=True)
+            self._set_ip_status(f'Sim IP: {SIM_ROBOT_IP}', '#e0a000')
+        else:
+            # Restore real IP field
+            self._ip_input.setEnabled(True)
+            ip = self._ip_input.text().strip() or DEFAULT_ROBOT_IP
+            self._mode_label.setText('REAL')
+            self._mode_label.setStyleSheet(
+                'color:#00cc88; font-size:12px; font-weight:bold; padding-right:6px;'
+            )
+            self._sim_toggle.setText('Switch to Sim')
+            self._sim_toggle.setStyleSheet(self._sim_btn_style(active=False))
+            self._subtitle.setText(
+                'Run each step in order. Steps 1 and 2 must be fully ready before continuing.'
+            )
+            self._subtitle.setStyleSheet('color:#888; font-size:11px; padding-bottom:4px;')
+            self._populate_steps(ip, sim=False)
+            self._set_ip_status('', '#888')
+
+    @staticmethod
+    def _sim_btn_style(active: bool) -> str:
+        if active:
+            return (
+                'QPushButton{background:#4a3a00;color:#ffcc00;border:1px solid #e0a000;'
+                'border-radius:4px;padding:6px 10px;font-size:12px;font-weight:bold;}'
+                'QPushButton:hover{background:#6a5a00cc;}'
+            )
+        return (
+            'QPushButton{background:#1a3a1a;color:#00cc88;border:1px solid #00aa66;'
+            'border-radius:4px;padding:6px 10px;font-size:12px;font-weight:bold;}'
+            'QPushButton:hover{background:#2a5a2acc;}'
+        )
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

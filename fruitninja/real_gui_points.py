@@ -15,14 +15,19 @@ from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
 
 from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
+import cv2
+import numpy as np
+
+from fruitninja.colour_detection import detect_fruits
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout, QGridLayout,
     QPushButton, QLabel, QGroupBox, QTextEdit,
+    QShortcut, QComboBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import QShortcut
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt5.QtGui import QKeySequence, QImage, QPixmap
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -135,22 +140,62 @@ class MoverNode(Node):
         self._cancel_flag = True
 
 
+# ── Camera worker ─────────────────────────────────────────────────────────────
+
+class CameraWorker(QObject):
+    """Grabs frames from a webcam, runs detect_fruits(), emits the result."""
+    frame_ready = pyqtSignal(object)   # numpy BGR array
+
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self._cap     = None
+        self._thread  = None
+
+    def start(self, cam_index: int = 0):
+        if self._running:
+            return
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._run, args=(cam_index,), daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self, cam_index: int):
+        self._cap = cv2.VideoCapture(cam_index)
+        if not self._cap.isOpened():
+            self._running = False
+            return
+        while self._running:
+            ret, frame = self._cap.read()
+            if ret:
+                annotated, _ = detect_fruits(frame)
+                self.frame_ready.emit(annotated)
+        self._cap.release()
+        self._cap = None
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     _joints_sig = pyqtSignal(dict)
     _status_sig = pyqtSignal(str, str)
     _log_sig    = pyqtSignal(str)
+    _cam_sig    = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle('RealGuiPoints — UR3e Grid Control')
-        self.setMinimumSize(820, 620)
+        self.setMinimumSize(1200, 660)
         self.setStyleSheet('background:#1e1e1e; color:white;')
 
-        self._selected_cells = []   # ordered list, sorted left-to-right
+        self._selected_cells = []
         self._moving = False
         self._cell_btns = {}
+        self._camera = CameraWorker()
 
         self._build_ui()
         self._start_ros()
@@ -158,15 +203,29 @@ class MainWindow(QMainWindow):
         self._joints_sig.connect(self._update_joint_display)
         self._status_sig.connect(lambda t, c: self._set_status(t, c))
         self._log_sig.connect(self._log_widget.append)
+        self._cam_sig.connect(self._update_camera_frame)
+        self._camera.frame_ready.connect(
+            lambda f: self._cam_sig.emit(f)
+        )
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         root_w = QWidget()
         self.setCentralWidget(root_w)
-        root = QVBoxLayout(root_w)
+        outer = QHBoxLayout(root_w)
+        outer.setSpacing(10)
+        outer.setContentsMargins(12, 12, 12, 12)
+
+        # Left panel — all existing controls
+        left_w = QWidget()
+        root = QVBoxLayout(left_w)
         root.setSpacing(10)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(left_w, stretch=3)
+
+        # Right panel — camera
+        outer.addWidget(self._build_camera_panel(), stretch=2)
 
         # ── joint state display ───────────────────────────────────────────────
         js_group = self._group('Live Joint States')
@@ -431,6 +490,86 @@ class MainWindow(QMainWindow):
     def _log(self, text: str):
         self._log_sig.emit(text)
 
+    # ── Camera panel ─────────────────────────────────────────────────────────
+
+    def _build_camera_panel(self) -> QGroupBox:
+        group = self._group('Camera Feed')
+        layout = group.layout()
+
+        # Video display
+        self._cam_label = QLabel()
+        self._cam_label.setAlignment(Qt.AlignCenter)
+        self._cam_label.setMinimumSize(400, 300)
+        self._cam_label.setStyleSheet(
+            'background:#000; border:1px solid #333; border-radius:4px;'
+        )
+        self._cam_label.setText('Camera off')
+        layout.addWidget(self._cam_label)
+
+        # Controls row
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(6)
+
+        self._cam_combo = QComboBox()
+        self._cam_combo.addItem('Webcam',            0)
+        self._cam_combo.addItem('RealSense D435i',   1)
+        self._cam_combo.addItem('Fisheye',           2)
+        self._cam_combo.setFixedWidth(160)
+        self._cam_combo.setStyleSheet(
+            'QComboBox{background:#2a2a3a;color:#ccc;border:1px solid #555;'
+            'border-radius:3px;padding:4px 8px;font-size:12px;}'
+            'QComboBox::drop-down{border:none;}'
+            'QComboBox QAbstractItemView{background:#2a2a3a;color:#ccc;'
+            'selection-background-color:#3a7aff;}'
+        )
+        ctrl.addWidget(self._cam_combo)
+
+        self._btn_cam = QPushButton('▶  Start Camera')
+        self._btn_cam.setStyleSheet(
+            'QPushButton{background:#1a3a5c;color:white;border-radius:5px;'
+            'padding:7px 12px;font-size:12px;font-weight:bold;}'
+            'QPushButton:hover{background:#2a5a8ccc;}'
+        )
+        self._btn_cam.clicked.connect(self._toggle_camera)
+        ctrl.addWidget(self._btn_cam)
+
+        self._cam_status = QLabel('Off')
+        self._cam_status.setStyleSheet('color:#666; font-size:11px; padding-left:4px;')
+        ctrl.addWidget(self._cam_status)
+        ctrl.addStretch()
+
+        layout.addLayout(ctrl)
+        return group
+
+    def _toggle_camera(self):
+        if self._camera._running:
+            self._camera.stop()
+            self._btn_cam.setText('▶  Start Camera')
+            self._cam_status.setText('Off')
+            self._cam_status.setStyleSheet('color:#666; font-size:11px; padding-left:4px;')
+            self._cam_label.setPixmap(QPixmap())
+            self._cam_label.setText('Camera off')
+        else:
+            idx  = self._cam_combo.currentData()
+            name = self._cam_combo.currentText()
+            self._camera.start(idx)
+            self._btn_cam.setText('■  Stop Camera')
+            self._cam_status.setText(f'Running — {name}')
+            self._cam_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:4px;')
+
+    def _update_camera_frame(self, frame: np.ndarray):
+        """Convert BGR numpy frame to QPixmap and display it."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(img).scaled(
+            self._cam_label.width(),
+            self._cam_label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._cam_label.setPixmap(pix)
+
     # ── ROS ───────────────────────────────────────────────────────────────────
 
     def _start_ros(self):
@@ -448,6 +587,7 @@ class MainWindow(QMainWindow):
             self._log(f'ROS2 init failed: {e}')
 
     def closeEvent(self, event):
+        self._camera.stop()
         try:
             self._js_node.destroy_node()
             self._mover_node.destroy_node()
