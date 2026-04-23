@@ -14,16 +14,14 @@ Observation space (dim=21):
 Action space (dim=6):
   Joint velocity commands (rad/s), clipped to [-1, 1].
 
-Board geometry — derived from FK of the 4 measured corner joint angles
-in grid_mover.py.  The board is NOT axis-aligned and NOT flat in the
-robot base frame, so targets are computed via bilinear interpolation of
-the 4 measured Cartesian corners (matching grid_mover's joint-space
-interpolation approach).
+Board geometry — derived from measured corner positions in the robot base
+frame.  The board is flat (z=0.0875 m) and symmetric in x.  Targets are
+computed via bilinear interpolation of the 4 measured Cartesian corners.
 
-  P_A1 = ( 0.2697, -0.4846,  0.0968)  — far-left
-  P_A4 = ( 0.3114, -0.3503,  0.1501)  — near-left
+  P_A1 = (+0.3124, -0.4549,  0.0875)  — far-left
+  P_A4 = (+0.3130, -0.3493,  0.0875)  — near-left
   P_N1 = (-0.3124, -0.4549,  0.0875)  — far-right
-  P_N4 = (-0.3130, -0.3493,  0.1022)  — near-right
+  P_N4 = (-0.3130, -0.3493,  0.0875)  — near-right
 
 Home = board centre (u=0.5, v=0.5 bilinear interpolation of corner
 joint angles from grid_mover.py).
@@ -39,10 +37,10 @@ from gymnasium import spaces
 # u = col / 13  (0 → A, 1 → N)
 # v = row / 3   (0 → row-1, 1 → row-4)
 
-_P_A1 = np.array([ 0.2697, -0.4846,  0.0968], dtype=np.float64)  # u=0, v=0
-_P_A4 = np.array([ 0.3114, -0.3503,  0.1501], dtype=np.float64)  # u=0, v=1
+_P_A1 = np.array([ 0.3124, -0.4549,  0.0875], dtype=np.float64)  # u=0, v=0
+_P_A4 = np.array([ 0.3130, -0.3493,  0.0875], dtype=np.float64)  # u=0, v=1
 _P_N1 = np.array([-0.3124, -0.4549,  0.0875], dtype=np.float64)  # u=1, v=0
-_P_N4 = np.array([-0.3130, -0.3493,  0.1022], dtype=np.float64)  # u=1, v=1
+_P_N4 = np.array([-0.3130, -0.3493,  0.0875], dtype=np.float64)  # u=1, v=1
 
 NUM_COLS = 14
 NUM_ROWS = 4

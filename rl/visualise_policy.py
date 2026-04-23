@@ -3,9 +3,10 @@
 visualise_policy.py — watch the trained SAC policy drive the UR3e arm.
 
 Usage:
-  python visualise_policy.py                        # random targets
-  python visualise_policy.py --cell A1              # specific grid cell
-  python visualise_policy.py --episodes 5 --delay 0.02
+  python visualise_policy.py --situation 1          # corners A1→N1→A4→N4
+  python visualise_policy.py --situation 2          # 6 random grid points
+  python visualise_policy.py --situation 3          # chop sequence
+  python visualise_policy.py --situation 1 --delay 0.02
 
 Controls (matplotlib window):
   Close the window to stop.
@@ -15,12 +16,9 @@ import argparse
 import math
 import sys
 import os
-import time
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 _RL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,134 +26,219 @@ sys.path.insert(0, _RL_DIR)
 sys.path.insert(0, os.path.join(_RL_DIR, '..', 'fruitninja'))
 
 from envs.ur3e_grid_env import (
-    UR3eGridEnv, forward_kinematics, _dh_transform, _UR3E_DH,
+    UR3eGridEnv, _dh_transform, _UR3E_DH,
     cell_centre, _P_A1, _P_A4, _P_N1, _P_N4, NUM_COLS, NUM_ROWS,
 )
-from envs.domain_rand_wrapper import DomainRandWrapper
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+_UPRIGHT_Q = np.zeros(6, dtype=np.float32)   # all joints at 0 rad = upright
 
 
-# ── FK: positions of each joint frame origin ──────────────────────────────────
+# ── FK: 7-point joint chain ───────────────────────────────────────────────────
 
-def joint_positions(q: np.ndarray) -> np.ndarray:
+def _joint_positions(q: np.ndarray) -> np.ndarray:
     """Return (7, 3) array: base origin + 6 joint-frame origins."""
     T = np.eye(4)
     pts = [T[:3, 3].copy()]
     for i, (a, d, alpha, offset) in enumerate(_UR3E_DH):
-        T = T @ _dh_transform(a, d, alpha, q[i] + offset)
+        T = T @ _dh_transform(a, d, alpha, float(q[i]) + offset)
         pts.append(T[:3, 3].copy())
     return np.array(pts)
 
 
-# ── Board outline from measured corners ───────────────────────────────────────
+# ── Figure factory ────────────────────────────────────────────────────────────
 
-def board_corners():
-    """Return the 4 measured corners of the board (closed loop for plotting)."""
-    return np.array([
-        _P_A1, _P_N1, _P_N4, _P_A4, _P_A1,
-    ])
-
-
-# ── Cell name → target ────────────────────────────────────────────────────────
-
-GRID_COLS = list('ABCDEFGHIJKLMN')
-GRID_ROWS = ['1', '2', '3', '4']
-
-def cell_to_target(cell: str) -> np.ndarray:
-    col = GRID_COLS.index(cell[0].upper())
-    row = GRID_ROWS.index(cell[1])
-    return cell_centre(col, row)
-
-
-# ── Visualiser ────────────────────────────────────────────────────────────────
-
-def run(model, env_base: UR3eGridEnv, n_episodes: int, step_delay: float,
-        fixed_cell: str = None):
-
+def _make_figure():
     fig = plt.figure(figsize=(10, 8))
     ax  = fig.add_subplot(111, projection='3d')
     fig.patch.set_facecolor('#1a1a2e')
     ax.set_facecolor('#16213e')
 
-    # Fixed board
-    corners = board_corners()
+    # Board outline
+    corners = np.array([_P_A1, _P_N1, _P_N4, _P_A4, _P_A1])
     ax.plot(corners[:, 0], corners[:, 1], corners[:, 2],
             color='#00b4d8', linewidth=1.5, label='Cutting board')
 
-    # Arm segments (7 points = base + 6 joints)
-    arm_line,  = ax.plot([], [], [], 'o-', color='#e0e0e0', linewidth=3,
-                         markersize=6, label='UR3e arm')
-    ee_trail,  = ax.plot([], [], [], '-', color='#06d6a0', linewidth=1,
-                         alpha=0.6, label='EE path')
-    target_pt  = ax.scatter([], [], [], color='#ef233c', s=120, zorder=5,
-                            label='Target', marker='*')
-    dist_text  = ax.text2D(0.02, 0.95, '', transform=ax.transAxes,
-                           color='white', fontsize=10)
+    arm_line, = ax.plot([], [], [], 'o-', color='#e0e0e0', linewidth=3,
+                        markersize=6, label='UR3e arm')
+    ee_trail, = ax.plot([], [], [], '-', color='#06d6a0', linewidth=1,
+                        alpha=0.6, label='EE path')
+    tgt_pt    = ax.scatter([], [], [], color='#ef233c', s=120, zorder=5,
+                           label='Target', marker='*')
+    info_txt  = ax.text2D(0.02, 0.95, '', transform=ax.transAxes,
+                          color='white', fontsize=10)
 
     ax.set_xlabel('X (m)', color='#aaaaaa')
     ax.set_ylabel('Y (m)', color='#aaaaaa')
     ax.set_zlabel('Z (m)', color='#aaaaaa')
     ax.tick_params(colors='#aaaaaa')
-    ax.set_xlim(-0.6, 0.6)
-    ax.set_ylim(-0.1, 0.8)
-    ax.set_zlim(-0.1, 0.8)
+    ax.set_xlim(-0.5,  0.5)
+    ax.set_ylim(-0.6,  0.2)
+    ax.set_zlim(-0.1,  0.7)
     ax.set_title('FruitNinja — SAC Policy Rollout', color='white', pad=10)
     ax.legend(loc='upper right', facecolor='#1a1a2e', labelcolor='white',
               framealpha=0.7)
     ax.view_init(elev=25, azim=-60)
 
-    trail_x, trail_y, trail_z = [], [], []
+    return fig, ax, arm_line, ee_trail, tgt_pt, info_txt
 
-    for ep in range(1, n_episodes + 1):
-        obs, _ = env_base.reset()
 
-        # Override target if a fixed cell was requested
-        if fixed_cell is not None:
-            env_base._target = cell_to_target(fixed_cell)
-            obs = env_base._get_obs()
+# ── Core step loop ────────────────────────────────────────────────────────────
 
-        trail_x.clear(); trail_y.clear(); trail_z.clear()
-        target = env_base._target
+def _step_to_target(model, env, target, fig, ax, arm_line, ee_trail,
+                    tgt_pt, info_txt, trail, delay, label,
+                    success_m=0.005, reset_arm=False):
+    """
+    Drive the arm to `target` using the policy.
 
-        ax.set_title(
-            f'FruitNinja — SAC Policy  |  Episode {ep}/{n_episodes}  '
-            f'|  Target ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})',
-            color='white', pad=10
+    If reset_arm=True, env.reset() is called and then _q is overridden to
+    the upright position (all zeros) before beginning the episode.
+
+    Returns False if the matplotlib window was closed, True otherwise.
+    """
+    if reset_arm:
+        obs, _ = env.reset()
+        env._q    = _UPRIGHT_Q.copy()
+        env._q_dot = np.zeros(6, dtype=np.float32)
+        env._prev_q_dot = np.zeros(6, dtype=np.float32)
+        env._step_n = 0
+
+    env._target  = target.astype(np.float32)
+    env._step_n  = 0
+    obs = env._get_obs()
+
+    trail[0].clear(); trail[1].clear(); trail[2].clear()
+
+    tgt_pt._offsets3d = ([target[0]], [target[1]], [target[2]])
+    ax.set_title(
+        f'FruitNinja — SAC  |  {label}  |  '
+        f'target ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})',
+        color='white', pad=10
+    )
+
+    while True:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        pts = _joint_positions(env._q.astype(np.float64))
+        arm_line.set_data(pts[:, 0], pts[:, 1])
+        arm_line.set_3d_properties(pts[:, 2])
+
+        trail[0].append(pts[-1, 0])
+        trail[1].append(pts[-1, 1])
+        trail[2].append(pts[-1, 2])
+        ee_trail.set_data(trail[0], trail[1])
+        ee_trail.set_3d_properties(trail[2])
+
+        dist_mm = info['distance_m'] * 1000
+        info_txt.set_text(
+            f'Step: {env._step_n:4d}   Dist: {dist_mm:6.1f} mm   '
+            f'Reward: {reward:+.3f}'
         )
-        target_pt._offsets3d = ([target[0]], [target[1]], [target[2]])
 
-        done = False
-        step = 0
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env_base.step(action)
-            done = terminated or truncated
-            step += 1
+        plt.pause(delay)
 
-            # Joint positions for drawing
-            pts = joint_positions(env_base._q.astype(np.float64))
+        if not plt.fignum_exists(fig.number):
+            return False
 
-            arm_line.set_data(pts[:, 0], pts[:, 1])
-            arm_line.set_3d_properties(pts[:, 2])
+        if info['distance_m'] < success_m or truncated:
+            print(f'  [{label}] done — dist {dist_mm:.1f} mm  '
+                  f'({"reached" if info["distance_m"] < success_m else "truncated"})')
+            return True
 
-            # EE trail
-            trail_x.append(pts[-1, 0])
-            trail_y.append(pts[-1, 1])
-            trail_z.append(pts[-1, 2])
-            ee_trail.set_data(trail_x, trail_y)
-            ee_trail.set_3d_properties(trail_z)
 
-            dist_mm = info['distance_m'] * 1000
-            dist_text.set_text(
-                f'Step: {step:4d}   Dist: {dist_mm:6.1f} mm   '
-                f'Reward: {reward:+.3f}'
-            )
+# ── Situation 1: corners A1 → N1 → A4 → N4 ──────────────────────────────────
 
-            plt.pause(step_delay)
+def situation_1(model, env, delay):
+    fig, ax, arm_line, ee_trail, tgt_pt, info_txt = _make_figure()
+    trail = [[], [], []]
 
-            if not plt.fignum_exists(fig.number):
-                return   # window closed
+    waypoints = [
+        (_P_A1.astype(np.float32), 'Sit-1  A1', True),
+        (_P_N1.astype(np.float32), 'Sit-1  N1', False),
+        (_P_A4.astype(np.float32), 'Sit-1  A4', False),
+        (_P_N4.astype(np.float32), 'Sit-1  N4', False),
+    ]
 
-        print(f'Episode {ep:3d} done — final dist: {info["distance_m"]*1000:.1f} mm')
+    for target, label, reset in waypoints:
+        ok = _step_to_target(model, env, target, fig, ax, arm_line, ee_trail,
+                             tgt_pt, info_txt, trail, delay, label,
+                             reset_arm=reset)
+        if not ok:
+            return
+
+    plt.show()
+
+
+# ── Situation 2: 6 random grid points ────────────────────────────────────────
+
+def situation_2(model, env, delay, n_points=6):
+    fig, ax, arm_line, ee_trail, tgt_pt, info_txt = _make_figure()
+    trail = [[], [], []]
+
+    rng = np.random.default_rng()
+    cols = rng.integers(0, NUM_COLS, size=n_points)
+    rows = rng.integers(0, NUM_ROWS, size=n_points)
+
+    for i, (col, row) in enumerate(zip(cols, rows)):
+        target = cell_centre(int(col), int(row))
+        label  = f'Sit-2  pt {i+1}/{n_points}  ({chr(65+col)}{row+1})'
+        ok = _step_to_target(model, env, target, fig, ax, arm_line, ee_trail,
+                             tgt_pt, info_txt, trail, delay, label,
+                             reset_arm=(i == 0))
+        if not ok:
+            return
+
+    plt.show()
+
+
+# ── Situation 3: chop sequence ────────────────────────────────────────────────
+
+def situation_3(model, env, delay, n_chops=4):
+    """
+    1. Move arm (from upright) to a random grid cell.
+    2. Repeat n_chops times:
+       a. Move to target_z − 1.5 mm (chop down).
+       b. Move back to target_z (return).
+    """
+    fig, ax, arm_line, ee_trail, tgt_pt, info_txt = _make_figure()
+    trail = [[], [], []]
+
+    rng    = np.random.default_rng()
+    col    = int(rng.integers(0, NUM_COLS))
+    row    = int(rng.integers(0, NUM_ROWS))
+    target = cell_centre(col, row)
+    cell_name = f'{chr(65+col)}{row+1}'
+
+    # ── phase 0: reach the cell ──
+    ok = _step_to_target(model, env, target, fig, ax, arm_line, ee_trail,
+                         tgt_pt, info_txt, trail, delay,
+                         label=f'Sit-3  reach {cell_name}',
+                         success_m=0.005, reset_arm=True)
+    if not ok:
+        return
+
+    # ── chop cycles ──
+    chop_target   = target.copy();  chop_target[2] -= 0.0015
+    return_target = target.copy()
+
+    for i in range(n_chops):
+        # chop down
+        ok = _step_to_target(model, env, chop_target, fig, ax, arm_line,
+                             ee_trail, tgt_pt, info_txt, trail, delay,
+                             label=f'Sit-3  chop {i+1}/{n_chops} ↓',
+                             success_m=0.001, reset_arm=False)
+        if not ok:
+            return
+
+        # return up
+        ok = _step_to_target(model, env, return_target, fig, ax, arm_line,
+                             ee_trail, tgt_pt, info_txt, trail, delay,
+                             label=f'Sit-3  chop {i+1}/{n_chops} ↑',
+                             success_m=0.001, reset_arm=False)
+        if not ok:
+            return
 
     plt.show()
 
@@ -164,14 +247,12 @@ def run(model, env_base: UR3eGridEnv, n_episodes: int, step_delay: float,
 
 def main():
     parser = argparse.ArgumentParser(description='Visualise SAC policy on UR3e')
-    parser.add_argument('--model',    default='sac_fruitninja',
+    parser.add_argument('--model',     default='sac_fruitninja',
                         help='Path to model zip (without .zip)')
-    parser.add_argument('--episodes', type=int, default=3,
-                        help='Number of episodes to render')
-    parser.add_argument('--delay',    type=float, default=0.03,
+    parser.add_argument('--situation', type=int, choices=[1, 2, 3], default=1,
+                        help='Which demo situation to run (1, 2, or 3)')
+    parser.add_argument('--delay',     type=float, default=0.03,
                         help='Pause between steps (seconds) — lower = faster')
-    parser.add_argument('--cell',     type=str, default=None,
-                        help='Fixed target cell, e.g. A1, G2, N4')
     args = parser.parse_args()
 
     try:
@@ -184,9 +265,10 @@ def main():
     model = SAC.load(args.model)
 
     env = UR3eGridEnv()
-    print(f'Running {args.episodes} episode(s) — close the window to stop.')
-    run(model, env, n_episodes=args.episodes, step_delay=args.delay,
-        fixed_cell=args.cell)
+
+    sit_fn = {1: situation_1, 2: situation_2, 3: situation_3}[args.situation]
+    print(f'Running situation {args.situation} — close the window to stop.')
+    sit_fn(model, env, delay=args.delay)
 
 
 if __name__ == '__main__':
