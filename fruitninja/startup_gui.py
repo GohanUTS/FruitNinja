@@ -87,8 +87,7 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'cmd':     SOURCE + (
                 'ros2 launch ur_robot_driver ur_control.launch.py '
                 f'ur_type:=ur3e robot_ip:={ip} '
-                'launch_rviz:=false '
-                'initial_joint_controller:=scaled_joint_trajectory_controller'
+                'launch_rviz:=false'
             ),
             'oneshot': False,
             'note':    'Wait until "Robot ready to receive control commands" appears in the log.',
