@@ -18,6 +18,12 @@ from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 import cv2
 import numpy as np
 
+try:
+    import pyrealsense2 as rs
+    _HAS_RS = True
+except Exception:
+    _HAS_RS = False
+
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -108,10 +114,10 @@ class MoverNode(Node):
             if not goal_handle.accepted:
                 fail_cb('Goal rejected by MoveIt')
                 return
-
+ 
             result_future = goal_handle.get_result_async()
             executor.spin_until_future_complete(result_future)
-            if self._cancel_flag:
+            if self._cancel_flag: 
                 fail_cb('Cancelled')
                 return
 
@@ -142,38 +148,85 @@ class MoverNode(Node):
 # ── Camera worker ─────────────────────────────────────────────────────────────
 
 class CameraWorker(QObject):
-    """Grabs frames from a webcam and emits raw frames."""
+    """Grabs frames from a webcam or RealSense device and emits raw frames."""
     frame_ready = pyqtSignal(object)   # numpy BGR array
+    stopped     = pyqtSignal(str)      # reason (empty if user-requested)
 
     def __init__(self):
         super().__init__()
         self._running = False
         self._cap     = None
+        self._pipe    = None
         self._thread  = None
 
-    def start(self, cam_index: int = 0):
+    def start(self, source: int):
         if self._running:
             return
         self._running = True
         self._thread  = threading.Thread(
-            target=self._run, args=(cam_index,), daemon=True
+            target=self._run, args=(source,), daemon=True
         )
         self._thread.start()
 
     def stop(self):
         self._running = False
 
-    def _run(self, cam_index: int):
-        self._cap = cv2.VideoCapture(cam_index)
-        if not self._cap.isOpened():
+    def _run(self, source: int):
+        # source: 0=Webcam, 1=RealSense, 2=Fisheye, 3=DJI Osmo
+        try:
+            if source == 1:
+                self._run_realsense()
+            else:
+                self._run_v4l2(source)
+        finally:
             self._running = False
+
+    def _run_realsense(self):
+        if not _HAS_RS:
+            self.stopped.emit('pyrealsense2 not installed — pip install pyrealsense2')
             return
-        while self._running:
-            ret, frame = self._cap.read()
-            if ret:
-                self.frame_ready.emit(frame)
-        self._cap.release()
-        self._cap = None
+        try:
+            self._pipe = rs.pipeline()
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            self._pipe.start(cfg)
+        except Exception as e:
+            self._pipe = None
+            self.stopped.emit(f'RealSense start failed: {e}')
+            return
+        try:
+            while self._running:
+                frames = self._pipe.wait_for_frames(1000)
+                cf = frames.get_color_frame()
+                if cf:
+                    self.frame_ready.emit(np.asanyarray(cf.get_data()))
+        except Exception as e:
+            self.stopped.emit(f'RealSense error: {e}')
+        finally:
+            try:
+                self._pipe.stop()
+            except Exception:
+                pass
+            self._pipe = None
+            self.stopped.emit('')
+
+    def _run_v4l2(self, source: int):
+        # Webcam=0, Fisheye=2 (try /dev/video2), DJI=3 (try /dev/video3)
+        dev_index = {0: 0, 2: 2, 3: 3}.get(source, 0)
+        self._cap = cv2.VideoCapture(dev_index)
+        if not self._cap.isOpened():
+            self._cap = None
+            self.stopped.emit(f'Could not open /dev/video{dev_index}')
+            return
+        try:
+            while self._running:
+                ret, frame = self._cap.read()
+                if ret:
+                    self.frame_ready.emit(frame)
+        finally:
+            self._cap.release()
+            self._cap = None
+            self.stopped.emit('')
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -200,6 +253,9 @@ class MainWindow(QMainWindow):
         self._selecting_grid = False
         self._last_frame_wh  = None  # (w, h) of last received frame
 
+        # Latest fruit detections: list of {'label', 'origin', 'covered': [cells]}
+        self._detected_fruits = []
+
         self._build_ui()
         self._start_ros()
 
@@ -210,6 +266,8 @@ class MainWindow(QMainWindow):
         self._camera.frame_ready.connect(
             lambda f: self._cam_sig.emit(f)
         )
+        self._camera.stopped.connect(self._on_camera_stopped)
+        self._cam_ui_on = False
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -452,6 +510,38 @@ class MainWindow(QMainWindow):
 
         self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
 
+    def _cut_detected_fruit(self):
+        """Send detected fruit cells through the same cut pipeline as manual selection."""
+        if self._moving:
+            self._set_status('Already moving — press Stop first', '#e0a000')
+            return
+        if not self._detected_fruits:
+            self._set_status('No fruit detected — aim camera at fruit first', '#e0a000')
+            return
+        if len(self._grid_pts) != 4:
+            self._set_status('Define the grid before cutting detected fruit', '#e0a000')
+            return
+
+        # Build queue: origin first, then remaining covered cells (no duplicates)
+        queue = []
+        seen  = set()
+        for fruit in self._detected_fruits:
+            ordered = [fruit['origin']] + [c for c in fruit['covered']
+                                           if c != fruit['origin']]
+            for c in ordered:
+                if c not in seen:
+                    seen.add(c)
+                    queue.append(c)
+
+        if not queue:
+            self._set_status('No valid cells from detection', '#e0a000')
+            return
+
+        self._moving = True
+        self._log(f'Cut (detected): {" → ".join(queue)}')
+        self._status_sig.emit(f'Cutting {len(queue)} detected cell(s)…', '#3a7aff')
+        self._move_next(queue)
+
     def _stop(self):
         self._mover_node.cancel()
         self._moving = False
@@ -558,6 +648,16 @@ class MainWindow(QMainWindow):
         btn_clear_grid.clicked.connect(self._clear_grid)
         grid_row.addWidget(btn_clear_grid)
 
+        self._btn_cut_detected = QPushButton('✂  Cut Detected Fruit')
+        self._btn_cut_detected.setStyleSheet(
+            'QPushButton{background:#3a1a5c;color:#d0b0ff;border:1px solid #6a44aa;'
+            'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
+            'QPushButton:hover{background:#4a2a7ccc;}'
+            'QPushButton:disabled{background:#2a2a2a;color:#555;border-color:#333;}'
+        )
+        self._btn_cut_detected.clicked.connect(self._cut_detected_fruit)
+        grid_row.addWidget(self._btn_cut_detected)
+
         self._grid_status = QLabel('No grid defined')
         self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
         grid_row.addWidget(self._grid_status)
@@ -576,23 +676,46 @@ class MainWindow(QMainWindow):
         self._cam_label.mousePressEvent = self._cam_label_clicked
         layout.addWidget(self._cam_label)
 
+        # ── Detection info panel ──────────────────────────────────────────────
+        self._detect_info = QTextEdit()
+        self._detect_info.setReadOnly(True)
+        self._detect_info.setMaximumHeight(110)
+        self._detect_info.setPlaceholderText('Detections will appear here…')
+        self._detect_info.setStyleSheet(
+            'QTextEdit{background:#1a1a22;color:#ddd;border:1px solid #333;'
+            'border-radius:4px;padding:6px;font-family:monospace;font-size:11px;}'
+        )
+        layout.addWidget(self._detect_info)
+
         return group
 
     def _toggle_camera(self):
-        if self._camera._running:
+        if self._cam_ui_on:
             self._camera.stop()
-            self._btn_cam.setText('▶  Start Camera')
-            self._cam_status.setText('Off')
-            self._cam_status.setStyleSheet('color:#666; font-size:11px; padding-left:4px;')
-            self._cam_label.setPixmap(QPixmap())
-            self._cam_label.setText('Camera off')
+            self._set_cam_ui_off('Off', '#666')
         else:
             idx  = self._cam_combo.currentData()
             name = self._cam_combo.currentText()
-            self._camera.start(idx)
+            self._cam_ui_on = True
             self._btn_cam.setText('■  Stop Camera')
             self._cam_status.setText(f'Running — {name}')
             self._cam_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:4px;')
+            self._camera.start(idx)
+
+    def _set_cam_ui_off(self, status: str, colour: str):
+        self._cam_ui_on = False
+        self._btn_cam.setText('▶  Start Camera')
+        self._cam_status.setText(status)
+        self._cam_status.setStyleSheet(f'color:{colour}; font-size:11px; padding-left:4px;')
+        self._cam_label.setPixmap(QPixmap())
+        self._cam_label.setText('Camera off')
+
+    def _on_camera_stopped(self, reason: str):
+        if reason:
+            self._set_cam_ui_off(reason, '#ff6666')
+            self._log(f'Camera: {reason}')
+        else:
+            self._set_cam_ui_off('Off', '#666')
 
     def _update_camera_frame(self, frame: np.ndarray):
         """Convert BGR numpy frame to QPixmap and display it."""
@@ -620,7 +743,7 @@ class MainWindow(QMainWindow):
     # ── Detection ─────────────────────────────────────────────────────────────
 
     def _detect_in_grid(self, frame: np.ndarray):
-        """Detect red and blue objects inside the manual grid only."""
+        """Detect red objects inside the manual grid, report origin + covered cells."""
         tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in self._grid_pts]
         n_cols, n_rows = 14, 4
 
@@ -633,13 +756,16 @@ class MainWindow(QMainWindow):
 
         profiles = [
             ('Red',  (0, 80, 255), [
-                (np.array([0,   60, 40]),  np.array([10,  255, 255])),
-                (np.array([160, 60, 40]),  np.array([180, 255, 255])),
-            ]),
-            ('Blue', (255, 100, 0), [
-                (np.array([100, 80, 40]),  np.array([130, 255, 255])),
+                (np.array([0,   100, 80]),   np.array([10,  255, 255])),
+                (np.array([170, 100, 80]),   np.array([180, 255, 255])),
             ]),
         ]
+
+        def cell_name(c, r):
+            return f"{chr(ord('A') + c)}{r + 1}"
+
+        info_lines = []
+        fruits = []
 
         for label, bgr, ranges in profiles:
             mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -656,20 +782,56 @@ class MainWindow(QMainWindow):
                     continue
                 cx, cy = x + w // 2, y + h // 2
 
-                # Check centroid is inside the manual grid
+                # Origin cell from centroid
                 uv = cv2.perspectiveTransform(
                     np.float32([[[cx, cy]]]), H
                 )[0][0]
                 col_i, row_i = int(uv[0]), int(uv[1])
                 if not (0 <= col_i < n_cols and 0 <= row_i < n_rows):
                     continue
+                origin_cell = cell_name(col_i, row_i)
 
-                cell = f"{chr(ord('A') + col_i)}{row_i + 1}"
+                # All cells covered by bounding box (transform 4 corners)
+                corners = np.float32([[
+                    [x,     y],
+                    [x + w, y],
+                    [x + w, y + h],
+                    [x,     y + h],
+                ]])
+                uvs = cv2.perspectiveTransform(corners, H)[0]
+                cmin = max(0, int(np.floor(min(p[0] for p in uvs))))
+                cmax = min(n_cols - 1, int(np.floor(max(p[0] for p in uvs))))
+                rmin = max(0, int(np.floor(min(p[1] for p in uvs))))
+                rmax = min(n_rows - 1, int(np.floor(max(p[1] for p in uvs))))
+                covered = [cell_name(c, r)
+                           for r in range(rmin, rmax + 1)
+                           for c in range(cmin, cmax + 1)]
+
+                # Draw bbox, origin marker, label
                 cv2.rectangle(frame, (x, y), (x + w, y + h), bgr, 2)
-                cv2.putText(frame, f'{label} [{cell}]', (x, y - 8),
+                if len(covered) > 1:
+                    tag = f'{label} origin:{origin_cell} spans:{",".join(covered)}'
+                else:
+                    tag = f'{label} [{origin_cell}]'
+                cv2.putText(frame, tag, (x, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
                 cv2.drawMarker(frame, (cx, cy), bgr,
-                               cv2.MARKER_CROSS, 12, 2, cv2.LINE_AA)
+                               cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+
+                info_lines.append(
+                    f'{label}  origin: {origin_cell}  '
+                    f'cells ({len(covered)}): {", ".join(covered)}'
+                )
+                fruits.append({'label': label,
+                                'origin': origin_cell,
+                                'covered': covered})
+
+        self._detected_fruits = fruits
+        if hasattr(self, '_detect_info'):
+            if info_lines:
+                self._detect_info.setPlainText('\n'.join(info_lines))
+            else:
+                self._detect_info.setPlainText('No fruit detected in grid')
 
     # ── Manual grid ──────────────────────────────────────────────────────────
 
@@ -771,7 +933,7 @@ class MainWindow(QMainWindow):
         def ipt(p):
             return (int(round(p[0])), int(round(p[1])))
 
-        grid_col = (0, 220, 180)
+        grid_col = (255, 100, 0)  # blue (BGR)
 
         # Row lines
         for i in range(n_rows + 1):
