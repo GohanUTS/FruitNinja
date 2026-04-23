@@ -18,7 +18,6 @@ from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 import cv2
 import numpy as np
 
-from fruitninja.colour_detection import detect_fruits
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -143,7 +142,7 @@ class MoverNode(Node):
 # ── Camera worker ─────────────────────────────────────────────────────────────
 
 class CameraWorker(QObject):
-    """Grabs frames from a webcam, runs detect_fruits(), emits the result."""
+    """Grabs frames from a webcam and emits raw frames."""
     frame_ready = pyqtSignal(object)   # numpy BGR array
 
     def __init__(self):
@@ -172,8 +171,7 @@ class CameraWorker(QObject):
         while self._running:
             ret, frame = self._cap.read()
             if ret:
-                annotated, _ = detect_fruits(frame)
-                self.frame_ready.emit(annotated)
+                self.frame_ready.emit(frame)
         self._cap.release()
         self._cap = None
 
@@ -196,6 +194,11 @@ class MainWindow(QMainWindow):
         self._moving = False
         self._cell_btns = {}
         self._camera = CameraWorker()
+
+        # Manual grid state
+        self._grid_pts       = []    # up to 4 (x, y) in frame coords
+        self._selecting_grid = False
+        self._last_frame_wh  = None  # (w, h) of last received frame
 
         self._build_ui()
         self._start_ros()
@@ -496,17 +499,7 @@ class MainWindow(QMainWindow):
         group = self._group('Camera Feed')
         layout = group.layout()
 
-        # Video display
-        self._cam_label = QLabel()
-        self._cam_label.setAlignment(Qt.AlignCenter)
-        self._cam_label.setMinimumSize(400, 300)
-        self._cam_label.setStyleSheet(
-            'background:#000; border:1px solid #333; border-radius:4px;'
-        )
-        self._cam_label.setText('Camera off')
-        layout.addWidget(self._cam_label)
-
-        # Controls row
+        # ── Controls row (camera select + start) ──────────────────────────────
         ctrl = QHBoxLayout()
         ctrl.setSpacing(6)
 
@@ -514,6 +507,7 @@ class MainWindow(QMainWindow):
         self._cam_combo.addItem('Webcam',            0)
         self._cam_combo.addItem('RealSense D435i',   1)
         self._cam_combo.addItem('Fisheye',           2)
+        self._cam_combo.addItem('Osmo DJI Pocket 3', 3)
         self._cam_combo.setFixedWidth(160)
         self._cam_combo.setStyleSheet(
             'QComboBox{background:#2a2a3a;color:#ccc;border:1px solid #555;'
@@ -539,6 +533,49 @@ class MainWindow(QMainWindow):
         ctrl.addStretch()
 
         layout.addLayout(ctrl)
+
+        # ── Grid selection row ────────────────────────────────────────────────
+        grid_row = QHBoxLayout()
+        grid_row.setSpacing(6)
+
+        self._btn_define_grid = QPushButton('✛  Define Grid')
+        self._btn_define_grid.setStyleSheet(
+            'QPushButton{background:#2a3a2a;color:#88cc88;border:1px solid #446644;'
+            'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
+            'QPushButton:hover{background:#3a4a3acc;}'
+            'QPushButton:checked{background:#1a5c1a;color:white;border-color:#00cc44;}'
+        )
+        self._btn_define_grid.setCheckable(True)
+        self._btn_define_grid.clicked.connect(self._toggle_grid_select)
+        grid_row.addWidget(self._btn_define_grid)
+
+        btn_clear_grid = QPushButton('✕  Clear Grid')
+        btn_clear_grid.setStyleSheet(
+            'QPushButton{background:#2a2a2a;color:#888;border:1px solid #444;'
+            'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
+            'QPushButton:hover{background:#3a2a2acc;}'
+        )
+        btn_clear_grid.clicked.connect(self._clear_grid)
+        grid_row.addWidget(btn_clear_grid)
+
+        self._grid_status = QLabel('No grid defined')
+        self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
+        grid_row.addWidget(self._grid_status)
+        grid_row.addStretch()
+
+        layout.addLayout(grid_row)
+
+        # ── Video display ─────────────────────────────────────────────────────
+        self._cam_label = QLabel()
+        self._cam_label.setAlignment(Qt.AlignCenter)
+        self._cam_label.setMinimumSize(400, 300)
+        self._cam_label.setStyleSheet(
+            'background:#000; border:1px solid #333; border-radius:4px;'
+        )
+        self._cam_label.setText('Camera off')
+        self._cam_label.mousePressEvent = self._cam_label_clicked
+        layout.addWidget(self._cam_label)
+
         return group
 
     def _toggle_camera(self):
@@ -559,6 +596,16 @@ class MainWindow(QMainWindow):
 
     def _update_camera_frame(self, frame: np.ndarray):
         """Convert BGR numpy frame to QPixmap and display it."""
+        h, w = frame.shape[:2]
+        self._last_frame_wh = (w, h)
+
+        # Only run detection once the grid is fully defined
+        if len(self._grid_pts) == 4:
+            self._detect_in_grid(frame)
+
+        # Draw grid overlay / in-progress dots on top
+        self._draw_grid_overlay(frame)
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -569,6 +616,203 @@ class MainWindow(QMainWindow):
             Qt.SmoothTransformation,
         )
         self._cam_label.setPixmap(pix)
+
+    # ── Detection ─────────────────────────────────────────────────────────────
+
+    def _detect_in_grid(self, frame: np.ndarray):
+        """Detect red and blue objects inside the manual grid only."""
+        tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in self._grid_pts]
+        n_cols, n_rows = 14, 4
+
+        src = np.float32([tl, tr, br, bl])
+        dst = np.float32([[0, 0], [n_cols, 0], [n_cols, n_rows], [0, n_rows]])
+        H = cv2.getPerspectiveTransform(src, dst)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((5, 5), np.uint8)
+
+        profiles = [
+            ('Red',  (0, 80, 255), [
+                (np.array([0,   60, 40]),  np.array([10,  255, 255])),
+                (np.array([160, 60, 40]),  np.array([180, 255, 255])),
+            ]),
+            ('Blue', (255, 100, 0), [
+                (np.array([100, 80, 40]),  np.array([130, 255, 255])),
+            ]),
+        ]
+
+        for label, bgr, ranges in profiles:
+            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            for lo, hi in ranges:
+                mask |= cv2.inRange(hsv, lo, hi)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w < 12 or h < 12:
+                    continue
+                cx, cy = x + w // 2, y + h // 2
+
+                # Check centroid is inside the manual grid
+                uv = cv2.perspectiveTransform(
+                    np.float32([[[cx, cy]]]), H
+                )[0][0]
+                col_i, row_i = int(uv[0]), int(uv[1])
+                if not (0 <= col_i < n_cols and 0 <= row_i < n_rows):
+                    continue
+
+                cell = f"{chr(ord('A') + col_i)}{row_i + 1}"
+                cv2.rectangle(frame, (x, y), (x + w, y + h), bgr, 2)
+                cv2.putText(frame, f'{label} [{cell}]', (x, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
+                cv2.drawMarker(frame, (cx, cy), bgr,
+                               cv2.MARKER_CROSS, 12, 2, cv2.LINE_AA)
+
+    # ── Manual grid ──────────────────────────────────────────────────────────
+
+    def _toggle_grid_select(self, checked: bool):
+        self._selecting_grid = checked
+        if checked:
+            self._grid_pts = []
+            self._grid_status.setText('Click point 1 of 4 on the camera feed')
+            self._grid_status.setStyleSheet('color:#ffcc00; font-size:11px; padding-left:6px;')
+            self._cam_label.setCursor(Qt.CrossCursor)
+        else:
+            self._cam_label.setCursor(Qt.ArrowCursor)
+            if len(self._grid_pts) < 4:
+                self._grid_status.setText('Selection cancelled')
+                self._grid_status.setStyleSheet('color:#888; font-size:11px; padding-left:6px;')
+
+    def _clear_grid(self):
+        self._grid_pts = []
+        self._selecting_grid = False
+        self._btn_define_grid.setChecked(False)
+        self._cam_label.setCursor(Qt.ArrowCursor)
+        self._grid_status.setText('No grid defined')
+        self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
+
+    def _cam_label_clicked(self, event):
+        if not self._selecting_grid:
+            return
+        if len(self._grid_pts) >= 4:
+            return
+        pt = self._label_to_frame(event.pos())
+        if pt is None:
+            return
+        self._grid_pts.append(pt)
+        n = len(self._grid_pts)
+        if n < 4:
+            self._grid_status.setText(f'Click point {n + 1} of 4')
+        else:
+            # Sort into TL, TR, BR, BL and lock the grid
+            self._grid_pts = list(self._sort_corners(self._grid_pts))
+            self._selecting_grid = False
+            self._btn_define_grid.setChecked(False)
+            self._cam_label.setCursor(Qt.ArrowCursor)
+            self._grid_status.setText('Grid locked — 4 points set')
+            self._grid_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:6px;')
+
+    def _label_to_frame(self, pos):
+        """Map a QLabel pixel position to frame pixel coordinates."""
+        if self._last_frame_wh is None:
+            return None
+        fw, fh = self._last_frame_wh
+        lw, lh = self._cam_label.width(), self._cam_label.height()
+        scale  = min(lw / fw, lh / fh)
+        ox     = (lw - fw * scale) / 2
+        oy     = (lh - fh * scale) / 2
+        fx     = (pos.x() - ox) / scale
+        fy     = (pos.y() - oy) / scale
+        if 0 <= fx < fw and 0 <= fy < fh:
+            return (int(fx), int(fy))
+        return None
+
+    @staticmethod
+    def _sort_corners(pts):
+        """Sort 4 points into (TL, TR, BR, BL) order."""
+        pts = np.array(pts, dtype=np.float32)
+        s   = pts.sum(axis=1)
+        d   = np.diff(pts, axis=1).ravel()
+        tl  = pts[np.argmin(s)]
+        br  = pts[np.argmax(s)]
+        tr  = pts[np.argmin(d)]
+        bl  = pts[np.argmax(d)]
+        return [tuple(map(int, p)) for p in (tl, tr, br, bl)]
+
+    def _draw_grid_overlay(self, frame):
+        """Draw in-progress dots or the full static grid onto the frame."""
+        pts = self._grid_pts
+
+        # Draw dots for points selected so far
+        colours = [(0, 200, 255), (0, 255, 150), (255, 200, 0), (255, 80, 80)]
+        labels  = ['TL', 'TR', 'BR', 'BL']
+        for i, pt in enumerate(pts):
+            col = colours[i]
+            cv2.circle(frame, pt, 8,  col,         -1, cv2.LINE_AA)
+            cv2.circle(frame, pt, 10, (255,255,255), 1, cv2.LINE_AA)
+            cv2.putText(frame, labels[i], (pt[0] + 12, pt[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+            cv2.putText(frame, labels[i], (pt[0] + 12, pt[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+
+        if len(pts) != 4:
+            return
+
+        tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in pts]
+        n_cols, n_rows = 14, 4
+        steps = 60
+
+        def lerp(a, b, t):
+            return a + (b - a) * t
+
+        def ipt(p):
+            return (int(round(p[0])), int(round(p[1])))
+
+        grid_col = (0, 220, 180)
+
+        # Row lines
+        for i in range(n_rows + 1):
+            t     = i / n_rows
+            left  = lerp(tl, bl, t)
+            right = lerp(tr, br, t)
+            prev  = ipt(lerp(left, right, 0))
+            for j in range(1, steps + 1):
+                cur = ipt(lerp(left, right, j / steps))
+                cv2.line(frame, prev, cur, grid_col, 1, cv2.LINE_AA)
+                prev = cur
+
+        # Column lines
+        for i in range(n_cols + 1):
+            t   = i / n_cols
+            top = lerp(tl, tr, t)
+            bot = lerp(bl, br, t)
+            prev = ipt(lerp(top, bot, 0))
+            for j in range(1, steps + 1):
+                cur = ipt(lerp(top, bot, j / steps))
+                cv2.line(frame, prev, cur, grid_col, 1, cv2.LINE_AA)
+                prev = cur
+
+        # Cell labels
+        for row in range(n_rows):
+            for col in range(n_cols):
+                u   = (col + 0.5) / n_cols
+                v   = (row + 0.5) / n_rows
+                top = lerp(tl, tr, u)
+                bot = lerp(bl, br, u)
+                ctr = ipt(lerp(top, bot, v))
+                lbl = f"{chr(ord('A') + col)}{row + 1}"
+                cv2.putText(frame, lbl, (ctr[0] - 8, ctr[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 2)
+                cv2.putText(frame, lbl, (ctr[0] - 8, ctr[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1)
+
+        # Border quad
+        quad = np.array([ipt(tl), ipt(tr), ipt(br), ipt(bl)], np.int32)
+        cv2.polylines(frame, [quad], isClosed=True,
+                      color=grid_col, thickness=2, lineType=cv2.LINE_AA)
 
     # ── ROS ───────────────────────────────────────────────────────────────────
 
