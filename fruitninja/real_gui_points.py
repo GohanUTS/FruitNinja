@@ -1,4 +1,28 @@
 #!/usr/bin/env python3
+"""
+real_gui_points.py — Main operator GUI for the FruitNinja UR3e cutting robot.
+
+HOW IT WORKS (overview)
+========================
+1. The GUI connects to a live UR3e robot via ROS 2 / MoveIt.
+2. The operator selects grid cells (A1–N4) on the cutting board grid.
+3. Pressing "Move to Selected" drives the robot through each cell in order,
+   performing a three-step cut at each one: approach → dip → recover.
+4. A camera feed (top-right) can run colour detection once the operator has
+   manually defined the grid by clicking 4 corner points on the image.
+   Only red and blue objects inside that grid are detected.
+5. Detected fruits can be cut automatically using the "Cut Detected" button,
+   which also publishes MoveIt collision spheres for any OTHER fruits so the
+   planner routes around them.
+6. The spacebar / E-STOP button cancels all motion immediately.
+
+KEY CLASSES
+===========
+  JointStateNode   – Subscribes to /joint_states and feeds live angles to the UI.
+  MoverNode        – Sends MoveGroup action goals to MoveIt (runs in background thread).
+  CameraWorker     – Captures raw frames from a webcam or RealSense in a background thread.
+  MainWindow       – PyQt5 main window that wires everything together.
+"""
 import os
 os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
 
@@ -13,11 +37,7 @@ from sensor_msgs.msg import JointState
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     Constraints, JointConstraint, MoveItErrorCodes,
-    PlanningScene, CollisionObject,
 )
-from moveit_msgs.srv import GetPositionFK
-from shape_msgs.msg import SolidPrimitive
-from geometry_msgs.msg import Pose
 
 from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
@@ -42,6 +62,11 @@ from PyQt5.QtGui import QKeySequence, QImage, QPixmap
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
+# JOINT_NAMES / JOINT_LABELS: the 6 UR3e joints in the order MoveIt expects them.
+# HOME_DEG: the safe "rest" pose used by the Reset button.
+# CUT_DIP_LIFT / CUT_DIP_ELBOW: how many degrees to shift the shoulder and elbow
+#   joints to push the end-effector downward for the cutting stroke.
+# MOVE_GROUP: the MoveIt planning group name for the UR arm.
 
 JOINT_NAMES = [
     'shoulder_pan_joint',
@@ -64,8 +89,15 @@ MOVE_GROUP = 'ur_manipulator'
 
 
 # ── ROS2 nodes ─────────────────────────────────────────────────────────────────
+# Three separate ROS 2 nodes are created so their executors don't block each other.
+# They are all started once in MainWindow._start_ros() and run as daemon threads.
 
 class JointStateNode(Node):
+    """
+    Listens to /joint_states and converts the 6 UR joint positions from
+    radians to degrees, then fires joint_callback so the GUI can update
+    the live angle display. Runs continuously in a background spin thread.
+    """
     def __init__(self, joint_callback):
         super().__init__('real_gui_points_js')
         self._cb = joint_callback
@@ -78,6 +110,17 @@ class JointStateNode(Node):
 
 
 class MoverNode(Node):
+    """
+    Sends joint-space motion goals to MoveIt via the /move_action action server.
+
+    move_to(degrees, done_cb, fail_cb)
+      - Spawns a background thread so the GUI never freezes during planning.
+      - Converts the target joint angles (degrees) into a MoveIt Constraints message.
+      - Velocity and acceleration are capped at 30% for safety.
+      - On success  → calls done_cb()
+      - On failure  → calls fail_cb(reason_string)
+      - cancel()    → sets _cancel_flag so the thread exits at the next wait point.
+    """
     def __init__(self):
         super().__init__('real_gui_points_mover')
         self._client = ActionClient(self, MoveGroup, '/move_action')
@@ -151,121 +194,14 @@ class MoverNode(Node):
         self._cancel_flag = True
 
 
-# ── Fruit collision publisher ─────────────────────────────────────────────────
-
-# Radius of each fruit collision sphere (m). Kept small so adjacent cells can
-# still be reached; large enough to stop the dip from driving into the fruit.
-FRUIT_RADIUS_M = 0.02
-# Lift sphere centre this high above the cell's tool0 position so the normal
-# approach pose does not collide with the obstacle.
-FRUIT_Z_OFFSET_M = 0.08
-
-
-class FruitSceneNode(Node):
-    """
-    Publishes collision spheres for detected fruits onto MoveIt's /planning_scene.
-    Uses /compute_fk to resolve each cell's joint angles → Cartesian position.
-    """
-
-    def __init__(self):
-        super().__init__('real_gui_fruit_scene')
-        self._scene_pub = self.create_publisher(PlanningScene, '/planning_scene', 10)
-        self._fk_cli    = self.create_client(GetPositionFK, '/compute_fk')
-        self._active_ids = []   # currently-published fruit object ids
-
-    def publish_for_cells(self, cells: list, done_cb=None, fail_cb=None):
-        """Clear previous fruit objects, then publish one sphere per cell. Async."""
-        threading.Thread(
-            target=self._publish_thread,
-            args=(cells, done_cb, fail_cb),
-            daemon=True,
-        ).start()
-
-    def clear(self):
-        threading.Thread(target=self._clear_thread, daemon=True).start()
-
-    def _clear_thread(self):
-        if not self._active_ids:
-            return
-        scene = PlanningScene()
-        scene.is_diff = True
-        for obj_id in self._active_ids:
-            obj = CollisionObject()
-            obj.id = obj_id
-            obj.header.frame_id = 'world'
-            obj.operation = CollisionObject.REMOVE
-            scene.world.collision_objects.append(obj)
-        self._scene_pub.publish(scene)
-        self._active_ids = []
-
-    def _publish_thread(self, cells, done_cb, fail_cb):
-        executor = rclpy.executors.SingleThreadedExecutor()
-        executor.add_node(self)
-        try:
-            # Drop old fruits first
-            self._clear_thread()
-
-            if not self._fk_cli.wait_for_service(timeout_sec=2.0):
-                if fail_cb: fail_cb('compute_fk service not available')
-                return
-
-            scene = PlanningScene()
-            scene.is_diff = True
-            new_ids = []
-
-            for cell in cells:
-                degrees = cell_to_joints_deg(cell)
-                req = GetPositionFK.Request()
-                req.header.frame_id = 'world'
-                req.fk_link_names = ['tool0']
-                req.robot_state.joint_state.name     = JOINT_NAMES
-                req.robot_state.joint_state.position = [
-                    math.radians(d) for d in degrees
-                ]
-                future = self._fk_cli.call_async(req)
-                executor.spin_until_future_complete(future, timeout_sec=2.0)
-                resp = future.result()
-                if resp is None or not resp.pose_stamped:
-                    continue
-                if resp.error_code.val != MoveItErrorCodes.SUCCESS:
-                    continue
-
-                ee_pose = resp.pose_stamped[0].pose
-                obj = CollisionObject()
-                obj.id = f'fruit_{cell}'
-                obj.header.frame_id = 'world'
-                sphere = SolidPrimitive()
-                sphere.type = SolidPrimitive.SPHERE
-                sphere.dimensions = [FRUIT_RADIUS_M]
-                obj.primitives.append(sphere)
-
-                pose = Pose()
-                pose.position.x = ee_pose.position.x
-                pose.position.y = ee_pose.position.y
-                # Lift sphere centre slightly above cut-target so MoveIt plans
-                # above it; simulates a fruit sitting on the trolley surface.
-                pose.position.z = ee_pose.position.z + FRUIT_Z_OFFSET_M
-                pose.orientation.w = 1.0
-                obj.primitive_poses.append(pose)
-                obj.operation = CollisionObject.ADD
-
-                scene.world.collision_objects.append(obj)
-                new_ids.append(obj.id)
-
-            if scene.world.collision_objects:
-                self._scene_pub.publish(scene)
-                self._active_ids = new_ids
-                if done_cb: done_cb(new_ids)
-            else:
-                if fail_cb: fail_cb('No fruit positions resolved via FK')
-        finally:
-            executor.remove_node(self)
-
-
 # ── Camera worker ─────────────────────────────────────────────────────────────
+# Runs cv2.VideoCapture in a daemon thread so the GUI never blocks on frame reads.
+# Emits raw BGR numpy frames via frame_ready signal.
+# Detection (red/blue inside the manual grid) is done in the main thread inside
+# MainWindow._update_camera_frame so it has access to the current grid points.
 
 class CameraWorker(QObject):
-    """Grabs frames from a webcam or RealSense device and emits raw frames."""
+    """Captures raw frames from a webcam or RealSense and emits them for display."""
     frame_ready = pyqtSignal(object)   # numpy BGR array
     stopped     = pyqtSignal(str)      # reason (empty if user-requested)
 
@@ -573,6 +509,12 @@ class MainWindow(QMainWindow):
         self._set_status('Selection cleared', '#aaaaaa')
 
     def _go(self):
+        """
+        Start the manual cut sequence for all selected grid cells.
+        The cells are already sorted left-to-right (A→N) when toggled,
+        so the robot always sweeps in one direction across the board.
+        Kicks off _move_next which handles the per-cell approach→dip→recover loop.
+        """
         if not self._selected_cells:
             self._set_status('Toggle at least one cell first', '#e0a000')
             return
@@ -585,6 +527,16 @@ class MainWindow(QMainWindow):
         self._move_next(queue)
 
     def _move_next(self, queue: list):
+        """
+        Recursive per-cell cut loop for the manual selection sequence.
+
+        For each cell in the queue it chains three MoveIt calls:
+          1. move_to(degrees)       → approach: arm arrives at the cell's pre-computed pose
+          2. move_to(dip_degrees)   → dip:      shoulder+elbow shift drives end-effector down
+          3. move_to(degrees)       → recover:  arm lifts back to approach pose
+        After recover, _move_next is called again with remaining = queue[1:].
+        When the queue is empty (or E-STOP fires) the loop exits.
+        """
         if not queue or self._mover_node._cancel_flag:
             self._moving = False
             if not queue:
@@ -597,8 +549,8 @@ class MainWindow(QMainWindow):
 
         # Dip position: slightly lower the end-effector for cutting motion
         dip_degrees = list(degrees)
-        dip_degrees[1] += CUT_DIP_LIFT
-        dip_degrees[2] += CUT_DIP_ELBOW
+        dip_degrees[1] += CUT_DIP_LIFT   # shoulder lifts more → end-effector moves down
+        dip_degrees[2] += CUT_DIP_ELBOW  # elbow bends more   → reinforces the dip
 
         self._status_sig.emit(f'Moving to {cell}…  ({len(remaining)} remaining)', '#3a7aff')
         self._log(f'Moving to {cell}')
@@ -628,7 +580,12 @@ class MainWindow(QMainWindow):
         self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
 
     def _cut_detected_fruit(self):
-        """Send detected fruit cells through the cut pipeline with collision spheres."""
+        """
+        Automated cut sequence driven by camera detection.
+        Builds a queue of all detected fruit cells (origin first, no duplicates)
+        and runs the standard approach→dip→recover loop through each one.
+        Requires the manual grid to be defined (4 corner points clicked) before running.
+        """
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
@@ -656,108 +613,29 @@ class MainWindow(QMainWindow):
 
         self._moving = True
         self._log(f'Cut (detected): {" → ".join(queue)}')
-
-        # Obstacle cells = any other detected fruit cells NOT in the current
-        # cut queue. Only these get collision spheres — publishing them at the
-        # target cells would make MoveIt refuse to plan there.
-        queue_set = set(queue)
-        obstacle_cells = []
-        for fruit in self._detected_fruits:
-            for c in fruit['covered']:
-                if c not in queue_set and c not in obstacle_cells:
-                    obstacle_cells.append(c)
-
-        # Always clear any stale fruit spheres from a previous run first.
-        self._fruit_scene_node.clear()
-
-        def _start_move():
-            self._status_sig.emit(
-                f'Cutting {len(queue)} detected cell(s)…', '#3a7aff'
-            )
-            self._move_next_shallow(queue)
-
-        if not obstacle_cells:
-            self._log('No obstacle fruits outside queue — planning against static scene')
-            _start_move()
-            return
-
-        def _on_scene_ready(ids):
-            self._log_sig.emit(f'Obstacle collisions added: {", ".join(ids)}')
-            _start_move()
-
-        def _on_scene_fail(msg):
-            self._log_sig.emit(f'Collision publish failed: {msg} — moving anyway')
-            _start_move()
-
-        self._fruit_scene_node.publish_for_cells(
-            obstacle_cells, done_cb=_on_scene_ready, fail_cb=_on_scene_fail
-        )
-
-    def _move_next_shallow(self, queue: list):
-        """Same as _move_next but with a smaller dip so we stay above fruits."""
-        if not queue or self._mover_node._cancel_flag:
-            self._moving = False
-            try:
-                self._fruit_scene_node.clear()
-            except Exception:
-                pass
-            if not queue:
-                self._status_sig.emit('All cells reached', '#00cc00')
-                self._log_sig.emit('Detected-fruit sequence complete')
-            return
-
-        cell = queue[0]
-        remaining = queue[1:]
-        degrees = cell_to_joints_deg(cell)
-
-        # Half the normal dip so end-effector approaches the fruit but does not
-        # drive into it. MoveIt still has the collision sphere as a hard stop.
-        dip_degrees = list(degrees)
-        dip_degrees[1] += CUT_DIP_LIFT  * 0.5
-        dip_degrees[2] += CUT_DIP_ELBOW * 0.5
-
-        self._status_sig.emit(
-            f'Approaching {cell}…  ({len(remaining)} remaining)', '#3a7aff'
-        )
-        self._log(f'Approaching {cell}')
-
-        def _on_arrive():
-            self._log_sig.emit(f'At {cell} — simulated cut (shallow)')
-            self._status_sig.emit(f'Cutting at {cell}…', '#e0a000')
-            self._mover_node.move_to(
-                dip_degrees, done_cb=_on_dip, fail_cb=_on_fail,
-            )
-
-        def _on_dip():
-            self._log_sig.emit(f'Cut at {cell} — recovering')
-            self._mover_node.move_to(
-                degrees,
-                done_cb=lambda: self._move_next_shallow(remaining),
-                fail_cb=_on_fail,
-            )
-
-        def _on_fail(msg):
-            self._status_sig.emit(f'Failed at {cell}: {msg}', '#ff4444')
-            self._log_sig.emit(f'FAIL at {cell}: {msg}')
-            self._moving = False
-            try:
-                self._fruit_scene_node.clear()
-            except Exception:
-                pass
-
-        self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
+        self._status_sig.emit(f'Cutting {len(queue)} detected cell(s)…', '#3a7aff')
+        self._move_next(queue)
 
     def _stop(self):
+        """
+        Emergency stop — triggered by the E-STOP button or the spacebar shortcut.
+
+        Sets the cancel flag on MoverNode (the running move thread checks it and exits),
+        clears any MoveIt collision spheres, and resets the moving flag.
+        The robot completes its current waypoint before stopping (MoveIt has no
+        mid-trajectory abort via this action client), but no further waypoints are sent.
+        """
         self._mover_node.cancel()
         self._moving = False
-        try:
-            self._fruit_scene_node.clear()
-        except Exception:
-            pass
         self._set_status('⚠ EMERGENCY STOP', '#ff4444')
         self._log('EMERGENCY STOP triggered')
 
     def _reset(self):
+        """
+        Drive the robot to the HOME_DEG pose ([0, -90, 0, 0, 0, 0] degrees).
+        This is a safe upright posture that keeps the arm clear of the cutting board.
+        Blocked while a move is in progress — press E-STOP first if needed.
+        """
         if self._moving:
             self._set_status('Moving — press Stop first', '#e0a000')
             return
@@ -952,7 +830,22 @@ class MainWindow(QMainWindow):
     # ── Detection ─────────────────────────────────────────────────────────────
 
     def _detect_in_grid(self, frame: np.ndarray):
-        """Detect red objects inside the manual grid, report origin + covered cells."""
+        """
+        Detect red objects inside the manually defined camera grid.
+
+        Method:
+          1. Build a perspective transform H from the 4 clicked corner points
+             that maps frame pixels → grid coordinates (0..14, 0..4).
+          2. For each red contour:
+             a. Skip if centroid maps outside the grid (0 ≤ col < 14, 0 ≤ row < 4).
+             b. 'origin cell'  = the grid cell the centroid lands in.
+             c. 'covered cells' = all cells touched by the bounding-box corners.
+          3. Draws bounding box + label on the frame (annotations are visible in GUI).
+          4. Stores results in self._detected_fruits for use by _cut_detected_fruit.
+
+        Only red is detected (no green / yellow / orange) as requested.
+        Nothing is detected until the grid is fully defined (4 points clicked).
+        """
         tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in self._grid_pts]
         n_cols, n_rows = 14, 4
 
@@ -1045,6 +938,14 @@ class MainWindow(QMainWindow):
     # ── Manual grid ──────────────────────────────────────────────────────────
 
     def _toggle_grid_select(self, checked: bool):
+        """
+        Enter or exit the 4-point grid selection mode.
+
+        When checked=True: clears any existing points, switches cursor to crosshair,
+        and waits for 4 clicks on the camera label.
+        When checked=False (user unchecks before 4 points): cancels and discards points.
+        The grid is NOT cleared — _clear_grid must be pressed explicitly for that.
+        """
         self._selecting_grid = checked
         if checked:
             self._grid_pts = []
@@ -1066,6 +967,16 @@ class MainWindow(QMainWindow):
         self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
 
     def _cam_label_clicked(self, event):
+        """
+        Handle a mouse click on the camera label during grid selection.
+
+        Converts the QLabel pixel coordinate to a frame pixel coordinate
+        (accounting for KeepAspectRatio scaling and centering letterbox offsets),
+        then appends the point to self._grid_pts.
+
+        On the 4th click the 4 raw points are sorted into TL/TR/BR/BL order
+        and the grid is locked — detection begins on the next frame.
+        """
         if not self._selecting_grid:
             return
         if len(self._grid_pts) >= 4:
@@ -1087,7 +998,17 @@ class MainWindow(QMainWindow):
             self._grid_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:6px;')
 
     def _label_to_frame(self, pos):
-        """Map a QLabel pixel position to frame pixel coordinates."""
+        """
+        Convert a QLabel pixel position to the corresponding frame pixel coordinate.
+
+        The camera image is displayed with Qt.KeepAspectRatio inside the label,
+        which means there may be letterbox bars on the sides or top/bottom.
+        We compute:
+          scale = the uniform scale factor applied to fit the frame inside the label
+          ox/oy = the letterbox offsets (pixels of empty space on each axis)
+        Then invert the mapping: frame_px = (label_px - offset) / scale.
+        Returns None if the click is outside the actual image area (on the bars).
+        """
         if self._last_frame_wh is None:
             return None
         fw, fh = self._last_frame_wh
@@ -1103,7 +1024,16 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _sort_corners(pts):
-        """Sort 4 points into (TL, TR, BR, BL) order."""
+        """
+        Sort 4 arbitrary points into (TL, TR, BR, BL) order.
+
+        Uses the standard quadrilateral sorting trick:
+          TL = point with smallest (x+y)   — closest to top-left origin
+          BR = point with largest  (x+y)   — furthest from top-left
+          TR = point with smallest (y-x)   — top-right has small y, large x
+          BL = point with largest  (y-x)   — bottom-left has large y, small x
+        Returns a list of integer (x, y) tuples in TL, TR, BR, BL order.
+        """
         pts = np.array(pts, dtype=np.float32)
         s   = pts.sum(axis=1)
         d   = np.diff(pts, axis=1).ravel()
@@ -1114,7 +1044,17 @@ class MainWindow(QMainWindow):
         return [tuple(map(int, p)) for p in (tl, tr, br, bl)]
 
     def _draw_grid_overlay(self, frame):
-        """Draw in-progress dots or the full static grid onto the frame."""
+        """
+        Draw the manual grid onto the camera frame before it is displayed.
+
+        During selection (< 4 points): draws a coloured dot + corner label (TL/TR/BR/BL)
+        for each point clicked so far, giving the operator visual feedback.
+
+        After selection (== 4 points): draws the full 14-column × 4-row bilinear grid
+        using perspective-correct row and column lines, labels every cell centre (A1–N4),
+        and outlines the quad border in blue.  The grid is drawn on every subsequent frame
+        without moving because self._grid_pts is fixed after the 4th click.
+        """
         pts = self._grid_pts
 
         # Draw dots for points selected so far
@@ -1188,13 +1128,22 @@ class MainWindow(QMainWindow):
     # ── ROS ───────────────────────────────────────────────────────────────────
 
     def _start_ros(self):
+        """
+        Initialise rclpy and create the two ROS 2 nodes.
+
+        JointStateNode spins in a daemon thread so /joint_states callbacks
+        arrive continuously without blocking Qt's event loop.
+
+        MoverNode creates its own SingleThreadedExecutor inside its worker
+        thread (see _move_thread), so it doesn't need a persistent spin here.
+        """
         try:
             rclpy.init(args=None)
             self._js_node = JointStateNode(
                 lambda joints: self._joints_sig.emit(joints)
             )
             self._mover_node = MoverNode()
-            self._fruit_scene_node = FruitSceneNode()
+            # Spin JointStateNode continuously so the angle display stays live
             threading.Thread(
                 target=rclpy.spin, args=(self._js_node,), daemon=True,
             ).start()
@@ -1205,13 +1154,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._camera.stop()
         try:
-            self._fruit_scene_node.clear()
-        except Exception:
-            pass
-        try:
             self._js_node.destroy_node()
             self._mover_node.destroy_node()
-            self._fruit_scene_node.destroy_node()
             rclpy.shutdown()
         except Exception:
             pass

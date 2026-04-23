@@ -1,4 +1,31 @@
 #!/usr/bin/env python3
+"""
+startup_gui.py — Step-by-step launcher GUI for the FruitNinja UR3e system.
+
+HOW IT WORKS (overview)
+========================
+The UR3e robot stack requires several processes to start in order:
+  Step 0 (sim only) — URSim Docker container running the virtual Polyscope
+  Step 1 — ur_robot_driver   : speaks the RTDE protocol to the physical/sim robot
+  Step 2 — ur_moveit.launch  : MoveIt planner + RViz visualisation
+  Step 3 — planning_scene    : publishes workcell collision objects to MoveIt
+  Step 4 — real_gui_points   : the main operator GUI for cell selection + cutting
+  Step 5 — switch_controller : one-shot service call to activate the right controller
+
+Each step runs as an independent QProcess inside its own tab.
+The operator presses Start on each row in order and watches the tab output.
+
+REAL vs SIM mode
+================
+The toggle in the title bar switches between the physical robot (real IP editable
+by the operator) and URSim (fixed IP 192.168.56.101). In sim mode an extra
+Step 0 is prepended to start the simulator, and the IP field is locked.
+
+KEY CLASSES
+===========
+  StepRow       — owns a QProcess + output QTextEdit + Start/Stop buttons for one step.
+  StartupWindow — the main window: IP bar, Real/Sim toggle, step rows, output tabs.
+"""
 import os
 os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
 
@@ -28,6 +55,19 @@ SOURCE = (
 
 
 def make_steps(robot_ip: str, sim: bool = False) -> list:
+    """
+    Build and return the ordered list of step dictionaries.
+
+    Each dict contains:
+      'label'   — short title shown in the UI and as the tab name
+      'desc'    — one-line description shown below the label
+      'cmd'     — the bash command string executed by QProcess
+      'oneshot' — True if the command exits on its own (e.g. a service call);
+                  False if it is a long-running process (driver, planner, GUI)
+      'note'    — optional italic hint shown in the row
+
+    When sim=True the sim robot IP is used and a Step 0 (URSim Docker) is prepended.
+    """
     ip = SIM_ROBOT_IP if sim else robot_ip
     steps = []
 
@@ -132,16 +172,31 @@ QTabBar::tab:hover {
 # ── Step row widget ───────────────────────────────────────────────────────────
 
 class StepRow(QObject):
-    """Manages one step: QProcess, status label, start/stop buttons, output widget."""
+    """
+    Manages one startup step.
+
+    Owns:
+      self._proc          — QProcess running /bin/bash -c <cmd>
+      self.output_widget  — QTextEdit that collects all stdout/stderr output
+      self.container      — the visible QWidget row (label + status + buttons)
+
+    The QProcess uses MergedChannels so both stdout and stderr appear in one stream.
+    Output is written directly to output_widget, which is the same object added as
+    the tab in StartupWindow — so no separate callback is needed.
+
+    For oneshot steps (e.g. switch_controller), the Stop button is disabled because
+    the process exits on its own; status is set to Done when it finishes cleanly.
+    For long-running steps (driver, MoveIt, GUI), the Stop button sends SIGTERM.
+    """
 
     status_signal = pyqtSignal(str, str)   # text, colour
 
-    def __init__(self, step: dict, on_output):
+    def __init__(self, step: dict):
         super().__init__()
-        self._step     = step
-        self._on_output = on_output   # callable(label, text)
+        self._step = step
 
         # ── QProcess ──────────────────────────────────────────────────────────
+        # MergedChannels: stderr is routed into stdout so one readyRead fires for both.
         self._proc = QProcess()
         self._proc.setProcessChannelMode(QProcess.MergedChannels)
         self._proc.readyReadStandardOutput.connect(self._read_output)
@@ -203,15 +258,18 @@ class StepRow(QObject):
     # ── process control ───────────────────────────────────────────────────────
 
     def start(self):
+        """Launch the step's bash command. No-op if the process is already running."""
         if self._proc.state() != QProcess.NotRunning:
             return
 
         self.output_widget.clear()
         self._btn_start.setEnabled(False)
+        # Stop button is only useful for long-running processes
         self._btn_stop.setEnabled(not self._step['oneshot'])
         self._apply_status(*STATUS_RUNNING)
         self._write_output(f'Starting: {self._step["label"]}\n')
 
+        # Run the full bash command so ROS sourcing and chained commands work
         self._proc.start('/bin/bash', ['-c', self._step['cmd']])
 
     def stop(self):
@@ -234,6 +292,11 @@ class StepRow(QObject):
         self._write_output(raw)
 
     def _on_finished(self, exit_code, exit_status):
+        """
+        Called by QProcess when the process exits.
+        Exit codes 0 / 15 / -15 are treated as clean exits (SIGTERM = 15).
+        Anything else is a failure. Oneshot steps that exit cleanly are marked Done.
+        """
         self._btn_start.setEnabled(True)
         self._btn_stop.setEnabled(False)
         if exit_status == QProcess.CrashExit or exit_code not in (0, 15, -15):
@@ -251,10 +314,10 @@ class StepRow(QObject):
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _write_output(self, text: str):
+        # output_widget IS the tab widget, so writing here is sufficient — no callback needed
         self.output_widget.moveCursor(QTextCursor.End)
         self.output_widget.insertPlainText(text)
         self.output_widget.moveCursor(QTextCursor.End)
-        self._on_output(self._step['label'], text)
 
     @staticmethod
     def _btn_style(colour):
@@ -409,6 +472,10 @@ class StartupWindow(QMainWindow):
     # ── IP helpers ────────────────────────────────────────────────────────────
 
     def _apply_ip(self):
+        """
+        Re-build all step commands using the IP currently typed in the input field.
+        Refuses to rebuild while any process is still running to avoid IP/process mismatches.
+        """
         ip = self._ip_input.text().strip()
         if not ip:
             self._set_ip_status('Enter a valid IP.', '#ff4444')
@@ -420,6 +487,7 @@ class StartupWindow(QMainWindow):
         self._set_ip_status(f'Applied — using {ip}', '#00cc88')
 
     def _ping_ip(self):
+        """Send 3 ICMP pings in a daemon thread so the UI stays responsive."""
         ip = self._ip_input.text().strip()
         if not ip:
             self._set_ip_status('Enter an IP to ping.', '#ff4444')
@@ -428,12 +496,13 @@ class StartupWindow(QMainWindow):
         threading.Thread(target=self._do_ping, args=(ip,), daemon=True).start()
 
     def _do_ping(self, ip: str):
+        """Run `ping -c 3` and display result in the IP status label + Step 1 tab."""
         try:
             result = subprocess.run(
                 ['ping', '-c', '3', '-W', '2', ip],
                 capture_output=True, text=True,
             )
-            # Emit ping output to the first tab
+            # Show raw ping lines in Step 1 tab so the operator can see RTT details
             for line in result.stdout.splitlines():
                 self._append_to_tab('Step 1 — UR Driver', f'[Ping] {line}\n')
             if result.returncode == 0:
@@ -461,13 +530,22 @@ class StartupWindow(QMainWindow):
     # ── Step population ───────────────────────────────────────────────────────
 
     def _populate_steps(self, robot_ip: str, sim: bool = False):
-        # Kill processes and hide containers immediately so Qt doesn't
-        # turn detached widgets into floating top-level windows
+        """
+        Tear down all current step rows and rebuild them for the given IP / mode.
+
+        Important Qt detail: if a QWidget is removed from a layout via takeAt()
+        while still visible, Qt re-parents it as a floating top-level window.
+        To avoid ghost windows with live Start buttons, we always call .hide()
+        on each container *before* removing it from the layout and scheduling
+        deleteLater().
+        """
+        # Kill any running processes and hide every container first
         for row in self._step_rows:
             row.kill()
             row.container.hide()
         self._step_rows.clear()
 
+        # Drain the layout — hide before deleteLater to suppress floating windows
         while self._steps_layout.count():
             item = self._steps_layout.takeAt(0)
             if item.widget():
@@ -478,17 +556,18 @@ class StartupWindow(QMainWindow):
 
         steps = make_steps(robot_ip, sim=sim)
         for i, step in enumerate(steps):
-            row = StepRow(step, self._append_to_tab)
+            row = StepRow(step)
             self._step_rows.append(row)
             self._steps_layout.addWidget(row.container)
 
+            # Thin horizontal separator between rows (not after the last one)
             if i < len(steps) - 1:
                 sep = QWidget()
                 sep.setFixedHeight(1)
                 sep.setStyleSheet('background:#333;')
                 self._steps_layout.addWidget(sep)
 
-            # Add a tab for this step's output
+            # Each step gets its own output tab — named the same as the step label
             self._tab_widget.addTab(row.output_widget, step['label'])
 
     def _append_to_tab(self, label: str, text: str):
@@ -504,6 +583,16 @@ class StartupWindow(QMainWindow):
     # ── Real / Sim toggle ─────────────────────────────────────────────────────
 
     def _toggle_sim(self):
+        """
+        Switch between Real and Sim mode.
+
+        Real mode: IP field is editable; commands target the physical UR3e.
+        Sim  mode: IP field is locked to SIM_ROBOT_IP; an extra Step 0 (URSim)
+                   is prepended; subtitle shows the Polyscope VNC URL.
+
+        We refuse to switch if any process is still running to avoid mismatches
+        between the displayed IP and what is actually connected.
+        """
         if any(row.is_running() for row in self._step_rows):
             self._set_ip_status('Stop all processes before switching modes.', '#e0a000')
             return
@@ -569,10 +658,12 @@ class StartupWindow(QMainWindow):
         )
 
     def _stop_all(self):
+        """Send SIGTERM to every running process (graceful shutdown of all steps)."""
         for row in self._step_rows:
             row.stop()
 
     def closeEvent(self, event):
+        """On window close: SIGKILL every process so nothing lingers in the background."""
         for row in self._step_rows:
             row.kill()
         event.accept()
