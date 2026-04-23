@@ -11,7 +11,13 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
+from moveit_msgs.msg import (
+    Constraints, JointConstraint, MoveItErrorCodes,
+    PlanningScene, CollisionObject,
+)
+from moveit_msgs.srv import GetPositionFK
+from shape_msgs.msg import SolidPrimitive
+from geometry_msgs.msg import Pose
 
 from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
@@ -143,6 +149,117 @@ class MoverNode(Node):
 
     def cancel(self):
         self._cancel_flag = True
+
+
+# ── Fruit collision publisher ─────────────────────────────────────────────────
+
+# Radius of each fruit collision sphere (m). Kept small so adjacent cells can
+# still be reached; large enough to stop the dip from driving into the fruit.
+FRUIT_RADIUS_M = 0.02
+# Lift sphere centre this high above the cell's tool0 position so the normal
+# approach pose does not collide with the obstacle.
+FRUIT_Z_OFFSET_M = 0.08
+
+
+class FruitSceneNode(Node):
+    """
+    Publishes collision spheres for detected fruits onto MoveIt's /planning_scene.
+    Uses /compute_fk to resolve each cell's joint angles → Cartesian position.
+    """
+
+    def __init__(self):
+        super().__init__('real_gui_fruit_scene')
+        self._scene_pub = self.create_publisher(PlanningScene, '/planning_scene', 10)
+        self._fk_cli    = self.create_client(GetPositionFK, '/compute_fk')
+        self._active_ids = []   # currently-published fruit object ids
+
+    def publish_for_cells(self, cells: list, done_cb=None, fail_cb=None):
+        """Clear previous fruit objects, then publish one sphere per cell. Async."""
+        threading.Thread(
+            target=self._publish_thread,
+            args=(cells, done_cb, fail_cb),
+            daemon=True,
+        ).start()
+
+    def clear(self):
+        threading.Thread(target=self._clear_thread, daemon=True).start()
+
+    def _clear_thread(self):
+        if not self._active_ids:
+            return
+        scene = PlanningScene()
+        scene.is_diff = True
+        for obj_id in self._active_ids:
+            obj = CollisionObject()
+            obj.id = obj_id
+            obj.header.frame_id = 'world'
+            obj.operation = CollisionObject.REMOVE
+            scene.world.collision_objects.append(obj)
+        self._scene_pub.publish(scene)
+        self._active_ids = []
+
+    def _publish_thread(self, cells, done_cb, fail_cb):
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        try:
+            # Drop old fruits first
+            self._clear_thread()
+
+            if not self._fk_cli.wait_for_service(timeout_sec=2.0):
+                if fail_cb: fail_cb('compute_fk service not available')
+                return
+
+            scene = PlanningScene()
+            scene.is_diff = True
+            new_ids = []
+
+            for cell in cells:
+                degrees = cell_to_joints_deg(cell)
+                req = GetPositionFK.Request()
+                req.header.frame_id = 'world'
+                req.fk_link_names = ['tool0']
+                req.robot_state.joint_state.name     = JOINT_NAMES
+                req.robot_state.joint_state.position = [
+                    math.radians(d) for d in degrees
+                ]
+                future = self._fk_cli.call_async(req)
+                executor.spin_until_future_complete(future, timeout_sec=2.0)
+                resp = future.result()
+                if resp is None or not resp.pose_stamped:
+                    continue
+                if resp.error_code.val != MoveItErrorCodes.SUCCESS:
+                    continue
+
+                ee_pose = resp.pose_stamped[0].pose
+                obj = CollisionObject()
+                obj.id = f'fruit_{cell}'
+                obj.header.frame_id = 'world'
+                sphere = SolidPrimitive()
+                sphere.type = SolidPrimitive.SPHERE
+                sphere.dimensions = [FRUIT_RADIUS_M]
+                obj.primitives.append(sphere)
+
+                pose = Pose()
+                pose.position.x = ee_pose.position.x
+                pose.position.y = ee_pose.position.y
+                # Lift sphere centre slightly above cut-target so MoveIt plans
+                # above it; simulates a fruit sitting on the trolley surface.
+                pose.position.z = ee_pose.position.z + FRUIT_Z_OFFSET_M
+                pose.orientation.w = 1.0
+                obj.primitive_poses.append(pose)
+                obj.operation = CollisionObject.ADD
+
+                scene.world.collision_objects.append(obj)
+                new_ids.append(obj.id)
+
+            if scene.world.collision_objects:
+                self._scene_pub.publish(scene)
+                self._active_ids = new_ids
+                if done_cb: done_cb(new_ids)
+            else:
+                if fail_cb: fail_cb('No fruit positions resolved via FK')
+        finally:
+            executor.remove_node(self)
 
 
 # ── Camera worker ─────────────────────────────────────────────────────────────
@@ -511,7 +628,7 @@ class MainWindow(QMainWindow):
         self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
 
     def _cut_detected_fruit(self):
-        """Send detected fruit cells through the same cut pipeline as manual selection."""
+        """Send detected fruit cells through the cut pipeline with collision spheres."""
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
@@ -522,7 +639,7 @@ class MainWindow(QMainWindow):
             self._set_status('Define the grid before cutting detected fruit', '#e0a000')
             return
 
-        # Build queue: origin first, then remaining covered cells (no duplicates)
+        # Queue: origin first, then remaining covered cells (no duplicates)
         queue = []
         seen  = set()
         for fruit in self._detected_fruits:
@@ -539,12 +656,104 @@ class MainWindow(QMainWindow):
 
         self._moving = True
         self._log(f'Cut (detected): {" → ".join(queue)}')
-        self._status_sig.emit(f'Cutting {len(queue)} detected cell(s)…', '#3a7aff')
-        self._move_next(queue)
+
+        # Obstacle cells = any other detected fruit cells NOT in the current
+        # cut queue. Only these get collision spheres — publishing them at the
+        # target cells would make MoveIt refuse to plan there.
+        queue_set = set(queue)
+        obstacle_cells = []
+        for fruit in self._detected_fruits:
+            for c in fruit['covered']:
+                if c not in queue_set and c not in obstacle_cells:
+                    obstacle_cells.append(c)
+
+        # Always clear any stale fruit spheres from a previous run first.
+        self._fruit_scene_node.clear()
+
+        def _start_move():
+            self._status_sig.emit(
+                f'Cutting {len(queue)} detected cell(s)…', '#3a7aff'
+            )
+            self._move_next_shallow(queue)
+
+        if not obstacle_cells:
+            self._log('No obstacle fruits outside queue — planning against static scene')
+            _start_move()
+            return
+
+        def _on_scene_ready(ids):
+            self._log_sig.emit(f'Obstacle collisions added: {", ".join(ids)}')
+            _start_move()
+
+        def _on_scene_fail(msg):
+            self._log_sig.emit(f'Collision publish failed: {msg} — moving anyway')
+            _start_move()
+
+        self._fruit_scene_node.publish_for_cells(
+            obstacle_cells, done_cb=_on_scene_ready, fail_cb=_on_scene_fail
+        )
+
+    def _move_next_shallow(self, queue: list):
+        """Same as _move_next but with a smaller dip so we stay above fruits."""
+        if not queue or self._mover_node._cancel_flag:
+            self._moving = False
+            try:
+                self._fruit_scene_node.clear()
+            except Exception:
+                pass
+            if not queue:
+                self._status_sig.emit('All cells reached', '#00cc00')
+                self._log_sig.emit('Detected-fruit sequence complete')
+            return
+
+        cell = queue[0]
+        remaining = queue[1:]
+        degrees = cell_to_joints_deg(cell)
+
+        # Half the normal dip so end-effector approaches the fruit but does not
+        # drive into it. MoveIt still has the collision sphere as a hard stop.
+        dip_degrees = list(degrees)
+        dip_degrees[1] += CUT_DIP_LIFT  * 0.5
+        dip_degrees[2] += CUT_DIP_ELBOW * 0.5
+
+        self._status_sig.emit(
+            f'Approaching {cell}…  ({len(remaining)} remaining)', '#3a7aff'
+        )
+        self._log(f'Approaching {cell}')
+
+        def _on_arrive():
+            self._log_sig.emit(f'At {cell} — simulated cut (shallow)')
+            self._status_sig.emit(f'Cutting at {cell}…', '#e0a000')
+            self._mover_node.move_to(
+                dip_degrees, done_cb=_on_dip, fail_cb=_on_fail,
+            )
+
+        def _on_dip():
+            self._log_sig.emit(f'Cut at {cell} — recovering')
+            self._mover_node.move_to(
+                degrees,
+                done_cb=lambda: self._move_next_shallow(remaining),
+                fail_cb=_on_fail,
+            )
+
+        def _on_fail(msg):
+            self._status_sig.emit(f'Failed at {cell}: {msg}', '#ff4444')
+            self._log_sig.emit(f'FAIL at {cell}: {msg}')
+            self._moving = False
+            try:
+                self._fruit_scene_node.clear()
+            except Exception:
+                pass
+
+        self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
 
     def _stop(self):
         self._mover_node.cancel()
         self._moving = False
+        try:
+            self._fruit_scene_node.clear()
+        except Exception:
+            pass
         self._set_status('⚠ EMERGENCY STOP', '#ff4444')
         self._log('EMERGENCY STOP triggered')
 
@@ -985,6 +1194,7 @@ class MainWindow(QMainWindow):
                 lambda joints: self._joints_sig.emit(joints)
             )
             self._mover_node = MoverNode()
+            self._fruit_scene_node = FruitSceneNode()
             threading.Thread(
                 target=rclpy.spin, args=(self._js_node,), daemon=True,
             ).start()
@@ -995,8 +1205,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._camera.stop()
         try:
+            self._fruit_scene_node.clear()
+        except Exception:
+            pass
+        try:
             self._js_node.destroy_node()
             self._mover_node.destroy_node()
+            self._fruit_scene_node.destroy_node()
             rclpy.shutdown()
         except Exception:
             pass
