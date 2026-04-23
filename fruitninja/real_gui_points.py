@@ -18,157 +18,15 @@ from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 import cv2
 import numpy as np
 
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout, QGridLayout,
     QPushButton, QLabel, QGroupBox, QTextEdit,
-    QComboBox, QShortcut,
+    QShortcut, QComboBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QKeySequence
-
-try:
-    import pyrealsense2 as rs
-    _HAS_RS = True
-except ImportError:
-    _HAS_RS = False
-
-try:
-    from fruitninja.colour_detection import detect_fruits
-    _HAS_DETECTION = True
-except ImportError:
-    _HAS_DETECTION = False
-
-
-# ── Camera helpers ────────────────────────────────────────────────────────────
-
-def _find_dji_device_index() -> int:
-    """
-    Scan /sys/class/video4linux to find which /dev/videoN belongs to the
-    DJI Osmo Pocket 3 (USB vendor ID 2ca3).  Returns -1 if not found.
-    """
-    import glob
-    for node in sorted(glob.glob('/sys/class/video4linux/video*')):
-        try:
-            # Walk up the sysfs tree looking for the idVendor file
-            path = os.path.realpath(node)
-            parts = path.split('/')
-            for i in range(len(parts), 0, -1):
-                vendor_file = '/'.join(parts[:i]) + '/idVendor'
-                if os.path.exists(vendor_file):
-                    with open(vendor_file) as f:
-                        if f.read().strip().lower() == '2ca3':   # DJI vendor ID
-                            idx = int(os.path.basename(node).replace('video', ''))
-                            return idx
-                    break
-        except Exception:
-            continue
-    return -1
-
-
-# ── Camera widget ─────────────────────────────────────────────────────────────
-
-class CameraWidget(QLabel):
-    """Live camera feed. Supports webcam, fisheye, and RealSense D435i."""
-
-    def __init__(self):
-        super().__init__()
-        self.setMinimumSize(480, 300)
-        self.setAlignment(Qt.AlignCenter)
-        self.setText('Camera not started')
-        self.setStyleSheet('color:#888; background:#111; font-size:13px;')
-        self._cap      = None
-        self._pipeline = None
-        self._timer    = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-
-    def start(self, source: str = 'webcam'):
-        self._start_source(source)
-
-    def stop(self):
-        self._timer.stop()
-        if self._pipeline:
-            self._pipeline.stop()
-            self._pipeline = None
-        if self._cap:
-            self._cap.release()
-            self._cap = None
-        self.setText('Camera stopped')
-
-    def _start_source(self, source: str):
-        if source == 'realsense':
-            if not _HAS_RS:
-                self.setText('pyrealsense2 not installed')
-                return
-            try:
-                self._pipeline = rs.pipeline()
-                cfg = rs.config()
-                cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-                self._pipeline.start(cfg)
-                self._timer.start(33)
-            except Exception as e:
-                self._pipeline = None
-                self.setText(f'RealSense error:\n{e}')
-        elif source == 'fisheye':
-            self._cap = cv2.VideoCapture(2)
-            if self._cap.isOpened():
-                self._timer.start(33)
-            else:
-                self._cap = None
-                self.setText('No fisheye camera at index 2')
-        elif source == 'dji':
-            idx = _find_dji_device_index()
-            if idx == -1:
-                self.setText(
-                    'DJI Osmo Pocket 3 not found.\n'
-                    'Make sure it is in webcam/UVC mode:\n'
-                    'On the camera: swipe down → USB → "Webcam" mode'
-                )
-                return
-            self._cap = cv2.VideoCapture(idx)
-            if self._cap.isOpened():
-                self._timer.start(33)
-            else:
-                self._cap = None
-                self.setText(f'DJI found at /dev/video{idx} but failed to open')
-        else:
-            self._cap = cv2.VideoCapture(0)
-            if self._cap.isOpened():
-                self._timer.start(33)
-            else:
-                self._cap = None
-                self.setText('No webcam found')
-
-    def _tick(self):
-        frame = None
-        if self._pipeline:
-            try:
-                frames = self._pipeline.wait_for_frames(timeout_ms=100)
-                cf = frames.get_color_frame()
-                if cf:
-                    frame = np.asanyarray(cf.get_data())
-            except Exception:
-                return
-        elif self._cap and self._cap.isOpened():
-            ok, frame = self._cap.read()
-            if not ok:
-                return
-
-        if frame is None:
-            return
-
-        if _HAS_DETECTION:
-            frame, _ = detect_fruits(frame)
-
-        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, _ = rgb.shape
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
-        self.setPixmap(
-            QPixmap.fromImage(qimg).scaled(
-                self.width(), self.height(),
-                Qt.KeepAspectRatio, Qt.SmoothTransformation,
-            )
-        )
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt5.QtGui import QKeySequence, QImage, QPixmap
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -281,22 +139,66 @@ class MoverNode(Node):
         self._cancel_flag = True
 
 
+# ── Camera worker ─────────────────────────────────────────────────────────────
+
+class CameraWorker(QObject):
+    """Grabs frames from a webcam and emits raw frames."""
+    frame_ready = pyqtSignal(object)   # numpy BGR array
+
+    def __init__(self):
+        super().__init__()
+        self._running = False
+        self._cap     = None
+        self._thread  = None
+
+    def start(self, cam_index: int = 0):
+        if self._running:
+            return
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._run, args=(cam_index,), daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self, cam_index: int):
+        self._cap = cv2.VideoCapture(cam_index)
+        if not self._cap.isOpened():
+            self._running = False
+            return
+        while self._running:
+            ret, frame = self._cap.read()
+            if ret:
+                self.frame_ready.emit(frame)
+        self._cap.release()
+        self._cap = None
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     _joints_sig = pyqtSignal(dict)
     _status_sig = pyqtSignal(str, str)
     _log_sig    = pyqtSignal(str)
+    _cam_sig    = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle('RealGuiPoints — UR3e Grid Control')
-        self.setMinimumSize(820, 620)
+        self.setMinimumSize(1200, 660)
         self.setStyleSheet('background:#1e1e1e; color:white;')
 
-        self._selected_cells = []   # ordered list, sorted left-to-right
+        self._selected_cells = []
         self._moving = False
         self._cell_btns = {}
+        self._camera = CameraWorker()
+
+        # Manual grid state
+        self._grid_pts       = []    # up to 4 (x, y) in frame coords
+        self._selecting_grid = False
+        self._last_frame_wh  = None  # (w, h) of last received frame
 
         self._build_ui()
         self._start_ros()
@@ -304,21 +206,31 @@ class MainWindow(QMainWindow):
         self._joints_sig.connect(self._update_joint_display)
         self._status_sig.connect(lambda t, c: self._set_status(t, c))
         self._log_sig.connect(self._log_widget.append)
+        self._cam_sig.connect(self._update_camera_frame)
+        self._camera.frame_ready.connect(
+            lambda f: self._cam_sig.emit(f)
+        )
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         root_w = QWidget()
         self.setCentralWidget(root_w)
-        root = QHBoxLayout(root_w)   # horizontal split: controls left, camera right
+        outer = QHBoxLayout(root_w)
+        outer.setSpacing(10)
+        outer.setContentsMargins(12, 12, 12, 12)
+
+        # Left panel — all existing controls
+        left_w = QWidget()
+        root = QVBoxLayout(left_w)
         root.setSpacing(10)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(left_w, stretch=3)
 
-        # ── LEFT COLUMN ───────────────────────────────────────────────────────
-        left = QVBoxLayout()
-        left.setSpacing(10)
+        # Right panel — camera
+        outer.addWidget(self._build_camera_panel(), stretch=2)
 
-        # joint state display
+        # ── joint state display ───────────────────────────────────────────────
         js_group = self._group('Live Joint States')
         js_layout = QGridLayout()
         js_layout.setSpacing(4)
@@ -345,20 +257,22 @@ class MainWindow(QMainWindow):
             js_layout.addWidget(val_lbl, row + 1, 1)
 
         js_group.layout().addLayout(js_layout)
-        left.addWidget(js_group)
+        root.addWidget(js_group)
 
-        # grid selector
+        # ── grid selector ─────────────────────────────────────────────────────
         grid_group = self._group('Grid — Toggle Cells  (A1=far-left  N4=near-right  |  moves left→right)')
         grid_layout = QGridLayout()
         grid_layout.setSpacing(4)
         grid_layout.setContentsMargins(4, 4, 4, 4)
 
+        # column headers
         for c, col in enumerate(GRID_COLS):
             hdr = QLabel(col)
             hdr.setAlignment(Qt.AlignCenter)
             hdr.setStyleSheet('color:#888; font-size:10px;')
             grid_layout.addWidget(hdr, 0, c + 1)
 
+        # row headers + cell buttons
         for r, row in enumerate(GRID_ROWS):
             hdr = QLabel(row)
             hdr.setAlignment(Qt.AlignCenter)
@@ -376,11 +290,12 @@ class MainWindow(QMainWindow):
                 grid_layout.addWidget(btn, r + 1, c + 1)
 
         grid_group.layout().addLayout(grid_layout)
-        left.addWidget(grid_group)
+        root.addWidget(grid_group)
 
-        # action buttons
+        # ── action buttons ────────────────────────────────────────────────────
         act_layout = QHBoxLayout()
         act_layout.setSpacing(8)
+
         self._btn_go    = self._action_btn('▶  Move to Selected', '#1a5c1a', self._go)
         self._btn_clear = self._action_btn('✕  Clear', '#3a3a3a', self._clear_selection)
         self._btn_stop  = self._action_btn('⚠  E-STOP  [SPACE]', '#cc0000', self._stop)
@@ -391,22 +306,23 @@ class MainWindow(QMainWindow):
             'QPushButton:pressed{background:#991111;}'
         )
         self._btn_reset = self._action_btn('↺  Reset (Home)', '#4a3a00', self._reset)
+
         act_layout.addWidget(self._btn_go)
         act_layout.addWidget(self._btn_clear)
         act_layout.addWidget(self._btn_stop)
         act_layout.addWidget(self._btn_reset)
-        left.addLayout(act_layout)
+        root.addLayout(act_layout)
 
-        # status
+        # ── status ────────────────────────────────────────────────────────────
         self._status_label = QLabel('● Idle — select a cell and press Move')
         self._status_label.setAlignment(Qt.AlignCenter)
         self._status_label.setStyleSheet(
             'background:#111; color:#aaa; font-size:13px; font-weight:bold;'
             'padding:8px; border:1px solid #333; border-radius:4px;'
         )
-        left.addWidget(self._status_label)
+        root.addWidget(self._status_label)
 
-        # log
+        # ── log ───────────────────────────────────────────────────────────────
         self._log_widget = QTextEdit()
         self._log_widget.setReadOnly(True)
         self._log_widget.setMaximumHeight(90)
@@ -414,54 +330,9 @@ class MainWindow(QMainWindow):
             'background:#0a0a0a; color:#00ee00;'
             'font-family:monospace; font-size:11px;'
         )
-        left.addWidget(self._log_widget)
-        left.addStretch()
+        root.addWidget(self._log_widget)
 
-        root.addLayout(left, stretch=3)
-
-        # ── RIGHT COLUMN — camera ─────────────────────────────────────────────
-        cam_group = self._group('Camera — Live Feed')
-        cam_outer = cam_group.layout()
-        cam_outer.setContentsMargins(8, 8, 8, 8)
-        cam_outer.setSpacing(6)
-
-        cam_header = QHBoxLayout()
-
-        cam_src_label = QLabel('Source:')
-        cam_src_label.setStyleSheet('color:#ccc; font-size:12px;')
-        cam_header.addWidget(cam_src_label)
-
-        self._cam_source_combo = QComboBox()
-        self._cam_source_combo.addItems(['Webcam', 'Fisheye (USB)', 'RealSense D435i', 'DJI Osmo Pocket 3'])
-        self._cam_source_combo.setFixedWidth(150)
-        self._cam_source_combo.setStyleSheet(
-            'background:#2a2a3a; color:white; font-size:12px; padding:2px;'
-            'border:1px solid #555; border-radius:4px;'
-        )
-        cam_header.addWidget(self._cam_source_combo)
-        cam_header.addSpacing(8)
-
-        self._btn_cam_start = QPushButton('▶  Start')
-        self._btn_cam_start.setFixedWidth(80)
-        self._btn_cam_start.setStyleSheet(self._cam_btn_style('#1a5c1a'))
-        self._btn_cam_start.clicked.connect(self._cam_start)
-        cam_header.addWidget(self._btn_cam_start)
-
-        self._btn_cam_stop = QPushButton('■  Stop')
-        self._btn_cam_stop.setFixedWidth(80)
-        self._btn_cam_stop.setEnabled(False)
-        self._btn_cam_stop.setStyleSheet(self._cam_btn_style('#5a1a1a'))
-        self._btn_cam_stop.clicked.connect(self._cam_stop)
-        cam_header.addWidget(self._btn_cam_stop)
-        cam_header.addStretch()
-        cam_outer.addLayout(cam_header)
-
-        self._cam = CameraWidget()
-        cam_outer.addWidget(self._cam)
-
-        root.addWidget(cam_group, stretch=2)
-
-        # spacebar E-STOP shortcut
+        # ── spacebar E-STOP shortcut ──────────────────────────────────────────
         shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         shortcut.activated.connect(self._stop)
 
@@ -622,35 +493,326 @@ class MainWindow(QMainWindow):
     def _log(self, text: str):
         self._log_sig.emit(text)
 
-    # ── camera controls ───────────────────────────────────────────────────────
+    # ── Camera panel ─────────────────────────────────────────────────────────
+
+    def _build_camera_panel(self) -> QGroupBox:
+        group = self._group('Camera Feed')
+        layout = group.layout()
+
+        # ── Controls row (camera select + start) ──────────────────────────────
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(6)
+
+        self._cam_combo = QComboBox()
+        self._cam_combo.addItem('Webcam',            0)
+        self._cam_combo.addItem('RealSense D435i',   1)
+        self._cam_combo.addItem('Fisheye',           2)
+        self._cam_combo.addItem('Osmo DJI Pocket 3', 3)
+        self._cam_combo.setFixedWidth(160)
+        self._cam_combo.setStyleSheet(
+            'QComboBox{background:#2a2a3a;color:#ccc;border:1px solid #555;'
+            'border-radius:3px;padding:4px 8px;font-size:12px;}'
+            'QComboBox::drop-down{border:none;}'
+            'QComboBox QAbstractItemView{background:#2a2a3a;color:#ccc;'
+            'selection-background-color:#3a7aff;}'
+        )
+        ctrl.addWidget(self._cam_combo)
+
+        self._btn_cam = QPushButton('▶  Start Camera')
+        self._btn_cam.setStyleSheet(
+            'QPushButton{background:#1a3a5c;color:white;border-radius:5px;'
+            'padding:7px 12px;font-size:12px;font-weight:bold;}'
+            'QPushButton:hover{background:#2a5a8ccc;}'
+        )
+        self._btn_cam.clicked.connect(self._toggle_camera)
+        ctrl.addWidget(self._btn_cam)
+
+        self._cam_status = QLabel('Off')
+        self._cam_status.setStyleSheet('color:#666; font-size:11px; padding-left:4px;')
+        ctrl.addWidget(self._cam_status)
+        ctrl.addStretch()
+
+        layout.addLayout(ctrl)
+
+        # ── Grid selection row ────────────────────────────────────────────────
+        grid_row = QHBoxLayout()
+        grid_row.setSpacing(6)
+
+        self._btn_define_grid = QPushButton('✛  Define Grid')
+        self._btn_define_grid.setStyleSheet(
+            'QPushButton{background:#2a3a2a;color:#88cc88;border:1px solid #446644;'
+            'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
+            'QPushButton:hover{background:#3a4a3acc;}'
+            'QPushButton:checked{background:#1a5c1a;color:white;border-color:#00cc44;}'
+        )
+        self._btn_define_grid.setCheckable(True)
+        self._btn_define_grid.clicked.connect(self._toggle_grid_select)
+        grid_row.addWidget(self._btn_define_grid)
+
+        btn_clear_grid = QPushButton('✕  Clear Grid')
+        btn_clear_grid.setStyleSheet(
+            'QPushButton{background:#2a2a2a;color:#888;border:1px solid #444;'
+            'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
+            'QPushButton:hover{background:#3a2a2acc;}'
+        )
+        btn_clear_grid.clicked.connect(self._clear_grid)
+        grid_row.addWidget(btn_clear_grid)
+
+        self._grid_status = QLabel('No grid defined')
+        self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
+        grid_row.addWidget(self._grid_status)
+        grid_row.addStretch()
+
+        layout.addLayout(grid_row)
+
+        # ── Video display ─────────────────────────────────────────────────────
+        self._cam_label = QLabel()
+        self._cam_label.setAlignment(Qt.AlignCenter)
+        self._cam_label.setMinimumSize(400, 300)
+        self._cam_label.setStyleSheet(
+            'background:#000; border:1px solid #333; border-radius:4px;'
+        )
+        self._cam_label.setText('Camera off')
+        self._cam_label.mousePressEvent = self._cam_label_clicked
+        layout.addWidget(self._cam_label)
+
+        return group
+
+    def _toggle_camera(self):
+        if self._camera._running:
+            self._camera.stop()
+            self._btn_cam.setText('▶  Start Camera')
+            self._cam_status.setText('Off')
+            self._cam_status.setStyleSheet('color:#666; font-size:11px; padding-left:4px;')
+            self._cam_label.setPixmap(QPixmap())
+            self._cam_label.setText('Camera off')
+        else:
+            idx  = self._cam_combo.currentData()
+            name = self._cam_combo.currentText()
+            self._camera.start(idx)
+            self._btn_cam.setText('■  Stop Camera')
+            self._cam_status.setText(f'Running — {name}')
+            self._cam_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:4px;')
+
+    def _update_camera_frame(self, frame: np.ndarray):
+        """Convert BGR numpy frame to QPixmap and display it."""
+        h, w = frame.shape[:2]
+        self._last_frame_wh = (w, h)
+
+        # Only run detection once the grid is fully defined
+        if len(self._grid_pts) == 4:
+            self._detect_in_grid(frame)
+
+        # Draw grid overlay / in-progress dots on top
+        self._draw_grid_overlay(frame)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(img).scaled(
+            self._cam_label.width(),
+            self._cam_label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._cam_label.setPixmap(pix)
+
+    # ── Detection ─────────────────────────────────────────────────────────────
+
+    def _detect_in_grid(self, frame: np.ndarray):
+        """Detect red and blue objects inside the manual grid only."""
+        tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in self._grid_pts]
+        n_cols, n_rows = 14, 4
+
+        src = np.float32([tl, tr, br, bl])
+        dst = np.float32([[0, 0], [n_cols, 0], [n_cols, n_rows], [0, n_rows]])
+        H = cv2.getPerspectiveTransform(src, dst)
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        kernel = np.ones((5, 5), np.uint8)
+
+        profiles = [
+            ('Red',  (0, 80, 255), [
+                (np.array([0,   60, 40]),  np.array([10,  255, 255])),
+                (np.array([160, 60, 40]),  np.array([180, 255, 255])),
+            ]),
+            ('Blue', (255, 100, 0), [
+                (np.array([100, 80, 40]),  np.array([130, 255, 255])),
+            ]),
+        ]
+
+        for label, bgr, ranges in profiles:
+            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            for lo, hi in ranges:
+                mask |= cv2.inRange(hsv, lo, hi)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w < 12 or h < 12:
+                    continue
+                cx, cy = x + w // 2, y + h // 2
+
+                # Check centroid is inside the manual grid
+                uv = cv2.perspectiveTransform(
+                    np.float32([[[cx, cy]]]), H
+                )[0][0]
+                col_i, row_i = int(uv[0]), int(uv[1])
+                if not (0 <= col_i < n_cols and 0 <= row_i < n_rows):
+                    continue
+
+                cell = f"{chr(ord('A') + col_i)}{row_i + 1}"
+                cv2.rectangle(frame, (x, y), (x + w, y + h), bgr, 2)
+                cv2.putText(frame, f'{label} [{cell}]', (x, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
+                cv2.drawMarker(frame, (cx, cy), bgr,
+                               cv2.MARKER_CROSS, 12, 2, cv2.LINE_AA)
+
+    # ── Manual grid ──────────────────────────────────────────────────────────
+
+    def _toggle_grid_select(self, checked: bool):
+        self._selecting_grid = checked
+        if checked:
+            self._grid_pts = []
+            self._grid_status.setText('Click point 1 of 4 on the camera feed')
+            self._grid_status.setStyleSheet('color:#ffcc00; font-size:11px; padding-left:6px;')
+            self._cam_label.setCursor(Qt.CrossCursor)
+        else:
+            self._cam_label.setCursor(Qt.ArrowCursor)
+            if len(self._grid_pts) < 4:
+                self._grid_status.setText('Selection cancelled')
+                self._grid_status.setStyleSheet('color:#888; font-size:11px; padding-left:6px;')
+
+    def _clear_grid(self):
+        self._grid_pts = []
+        self._selecting_grid = False
+        self._btn_define_grid.setChecked(False)
+        self._cam_label.setCursor(Qt.ArrowCursor)
+        self._grid_status.setText('No grid defined')
+        self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
+
+    def _cam_label_clicked(self, event):
+        if not self._selecting_grid:
+            return
+        if len(self._grid_pts) >= 4:
+            return
+        pt = self._label_to_frame(event.pos())
+        if pt is None:
+            return
+        self._grid_pts.append(pt)
+        n = len(self._grid_pts)
+        if n < 4:
+            self._grid_status.setText(f'Click point {n + 1} of 4')
+        else:
+            # Sort into TL, TR, BR, BL and lock the grid
+            self._grid_pts = list(self._sort_corners(self._grid_pts))
+            self._selecting_grid = False
+            self._btn_define_grid.setChecked(False)
+            self._cam_label.setCursor(Qt.ArrowCursor)
+            self._grid_status.setText('Grid locked — 4 points set')
+            self._grid_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:6px;')
+
+    def _label_to_frame(self, pos):
+        """Map a QLabel pixel position to frame pixel coordinates."""
+        if self._last_frame_wh is None:
+            return None
+        fw, fh = self._last_frame_wh
+        lw, lh = self._cam_label.width(), self._cam_label.height()
+        scale  = min(lw / fw, lh / fh)
+        ox     = (lw - fw * scale) / 2
+        oy     = (lh - fh * scale) / 2
+        fx     = (pos.x() - ox) / scale
+        fy     = (pos.y() - oy) / scale
+        if 0 <= fx < fw and 0 <= fy < fh:
+            return (int(fx), int(fy))
+        return None
 
     @staticmethod
-    def _cam_btn_style(colour: str) -> str:
-        return (
-            f'QPushButton{{background:{colour};color:white;border-radius:5px;'
-            f'padding:7px 10px;font-size:12px;font-weight:bold;}}'
-            f'QPushButton:hover{{background:{colour}cc;}}'
-            f'QPushButton:disabled{{background:#2a2a2a;color:#555;}}'
-        )
+    def _sort_corners(pts):
+        """Sort 4 points into (TL, TR, BR, BL) order."""
+        pts = np.array(pts, dtype=np.float32)
+        s   = pts.sum(axis=1)
+        d   = np.diff(pts, axis=1).ravel()
+        tl  = pts[np.argmin(s)]
+        br  = pts[np.argmax(s)]
+        tr  = pts[np.argmin(d)]
+        bl  = pts[np.argmax(d)]
+        return [tuple(map(int, p)) for p in (tl, tr, br, bl)]
 
-    def _cam_start(self):
-        text = self._cam_source_combo.currentText()
-        if 'RealSense' in text:
-            source = 'realsense'
-        elif 'Fisheye' in text:
-            source = 'fisheye'
-        elif 'DJI' in text:
-            source = 'dji'
-        else:
-            source = 'webcam'
-        self._cam.start(source)
-        self._btn_cam_start.setEnabled(False)
-        self._btn_cam_stop.setEnabled(True)
+    def _draw_grid_overlay(self, frame):
+        """Draw in-progress dots or the full static grid onto the frame."""
+        pts = self._grid_pts
 
-    def _cam_stop(self):
-        self._cam.stop()
-        self._btn_cam_start.setEnabled(True)
-        self._btn_cam_stop.setEnabled(False)
+        # Draw dots for points selected so far
+        colours = [(0, 200, 255), (0, 255, 150), (255, 200, 0), (255, 80, 80)]
+        labels  = ['TL', 'TR', 'BR', 'BL']
+        for i, pt in enumerate(pts):
+            col = colours[i]
+            cv2.circle(frame, pt, 8,  col,         -1, cv2.LINE_AA)
+            cv2.circle(frame, pt, 10, (255,255,255), 1, cv2.LINE_AA)
+            cv2.putText(frame, labels[i], (pt[0] + 12, pt[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+            cv2.putText(frame, labels[i], (pt[0] + 12, pt[1] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+
+        if len(pts) != 4:
+            return
+
+        tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in pts]
+        n_cols, n_rows = 14, 4
+        steps = 60
+
+        def lerp(a, b, t):
+            return a + (b - a) * t
+
+        def ipt(p):
+            return (int(round(p[0])), int(round(p[1])))
+
+        grid_col = (0, 220, 180)
+
+        # Row lines
+        for i in range(n_rows + 1):
+            t     = i / n_rows
+            left  = lerp(tl, bl, t)
+            right = lerp(tr, br, t)
+            prev  = ipt(lerp(left, right, 0))
+            for j in range(1, steps + 1):
+                cur = ipt(lerp(left, right, j / steps))
+                cv2.line(frame, prev, cur, grid_col, 1, cv2.LINE_AA)
+                prev = cur
+
+        # Column lines
+        for i in range(n_cols + 1):
+            t   = i / n_cols
+            top = lerp(tl, tr, t)
+            bot = lerp(bl, br, t)
+            prev = ipt(lerp(top, bot, 0))
+            for j in range(1, steps + 1):
+                cur = ipt(lerp(top, bot, j / steps))
+                cv2.line(frame, prev, cur, grid_col, 1, cv2.LINE_AA)
+                prev = cur
+
+        # Cell labels
+        for row in range(n_rows):
+            for col in range(n_cols):
+                u   = (col + 0.5) / n_cols
+                v   = (row + 0.5) / n_rows
+                top = lerp(tl, tr, u)
+                bot = lerp(bl, br, u)
+                ctr = ipt(lerp(top, bot, v))
+                lbl = f"{chr(ord('A') + col)}{row + 1}"
+                cv2.putText(frame, lbl, (ctr[0] - 8, ctr[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 2)
+                cv2.putText(frame, lbl, (ctr[0] - 8, ctr[1] + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (255, 255, 255), 1)
+
+        # Border quad
+        quad = np.array([ipt(tl), ipt(tr), ipt(br), ipt(bl)], np.int32)
+        cv2.polylines(frame, [quad], isClosed=True,
+                      color=grid_col, thickness=2, lineType=cv2.LINE_AA)
 
     # ── ROS ───────────────────────────────────────────────────────────────────
 
@@ -669,7 +831,7 @@ class MainWindow(QMainWindow):
             self._log(f'ROS2 init failed: {e}')
 
     def closeEvent(self, event):
-        self._cam.stop()
+        self._camera.stop()
         try:
             self._js_node.destroy_node()
             self._mover_node.destroy_node()
