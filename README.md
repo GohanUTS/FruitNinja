@@ -183,7 +183,7 @@ ros2 launch ur_moveit_config ur_moveit.launch.py \
   description_package:=fruitninja \
   description_file:=ur3e_workcell.urdf.xacro \
   launch_servo:=false launch_rviz:=true
-
+i want the logic for the 
 # Terminal 4 — Planning Scene
 ros2 run fruitninja planning_scene
 
@@ -196,6 +196,195 @@ ros2 service call /controller_manager/switch_controller \
   "{activate_controllers: ['scaled_joint_trajectory_controller'], \
     deactivate_controllers: ['joint_trajectory_controller'], strictness: 2}"
 ```
+
+---
+
+## AI Vision Pipeline
+
+### Install Dependencies
+
+```bash
+pip install ultralytics torch torchvision opencv-python pyrealsense2 numpy
+```
+
+### Step 1 — Collect Dataset
+
+Point the RealSense (or webcam if no RealSense) at the cutting board with fruit on it:
+
+```bash
+cd ~/ros2_ws/src/FruitNinja
+python vision/collect_dataset.py
+```
+
+Controls:
+- **S** — save current frame to `vision/dataset/raw/`
+- **Q** — quit
+
+Target: **200–300 images** under your actual lab lighting. Vary fruit position, rotation, and quantity across captures.
+
+### Step 2 — Annotate on Roboflow
+
+1. Go to [roboflow.com](https://roboflow.com) and create a free account
+2. Create a new project → **Instance Segmentation**
+3. Upload all images from `vision/dataset/raw/`
+4. Draw segmentation masks around each fruit (use the polygon tool)
+5. Apply augmentations: **Hue ±15°, Brightness ±30%, Mosaic, Horizontal Flip**
+6. Export as **YOLOv8 format** → download and extract into:
+   ```
+   vision/dataset/fruitninja_roboflow/
+     images/
+       train/
+       val/
+     labels/
+       train/
+       val/
+   ```
+
+### Step 3 — Fine-tune YOLOv8
+
+```bash
+cd ~/ros2_ws/src/FruitNinja
+
+# Download the base model (first run only)
+# yolo automatically downloads yolov8m-seg.pt on first use
+
+yolo task=segment mode=train \
+     model=yolov8m-seg.pt \
+     data=vision/fruitninja.yaml \
+     epochs=100 imgsz=640 batch=16 \
+     project=vision/runs name=fruitninja_seg
+```
+
+Trained weights will be saved to:
+```
+vision/runs/fruitninja_seg/weights/best.pt
+```
+
+Validate the model:
+```bash
+yolo task=segment mode=val \
+     model=vision/runs/fruitninja_seg/weights/best.pt \
+     data=vision/fruitninja.yaml
+```
+
+### Step 4 — Run the Vision Node
+
+Once weights are in place, start Step 6 from the Startup GUI, or manually:
+
+```bash
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run fruitninja vision_node
+```
+
+Topics published:
+- `/fruit_target` — 3D centroid of detected fruit in `base_link` frame
+- `/estop` — `Bool(True)` if a hand or person is detected
+- `/fruit_detections_debug` — annotated camera image (view with `rqt_image_view`)
+
+---
+
+## RL Trajectory Planner
+
+### Install Dependencies
+
+```bash
+pip install mujoco gymnasium stable-baselines3 torch numpy scipy tensorboard
+```
+
+### Step 1 — Convert URDF to MuJoCo XML (one-time)
+
+```bash
+cd ~/ros2_ws/src/FruitNinja
+python -m mujoco.scripts.compile urdf/ur3e_workcell.urdf.xacro ur3e_workcell.xml
+```
+
+This generates `ur3e_workcell.xml` which the RL environment loads for simulation.
+
+### Step 2 — Behavioural Cloning Pre-training
+
+Pre-trains a policy network to imitate the existing joint-angle lookup table in `grid_mover.py`.
+This warm-starts the SAC actor and significantly cuts training time.
+
+```bash
+cd ~/ros2_ws/src/FruitNinja/rl/pretraining
+python behavioural_clone.py
+```
+
+Takes ~1 minute on CPU. Saves `bc_policy.pth` in the same folder.
+
+The script:
+1. Reads all 56 cells (14 cols × 4 rows) from `grid_mover.py`
+2. For each cell, computes the joint-angle delta from the home pose
+3. Trains a 3-layer MLP (256 hidden units) with MSE loss for 50 epochs
+
+### Step 3 — SAC Training
+
+```bash
+cd ~/ros2_ws/src/FruitNinja/rl
+
+# With BC warm-start (recommended)
+python train_sac.py --bc_weights pretraining/bc_policy.pth
+
+# Without warm-start (fresh training)
+python train_sac.py
+```
+
+Training parameters:
+- **2 million timesteps** — takes hours on GPU, days on CPU
+- **4 parallel environments** for faster experience collection
+- Domain randomisation applied every episode (friction, EE mass, latency)
+- Checkpoints saved every 50,000 steps to `models/checkpoints/`
+- Best model saved to `models/best/`
+
+Monitor training with TensorBoard:
+```bash
+tensorboard --logdir ~/ros2_ws/src/FruitNinja/rl/tb_logs
+# Open http://localhost:6006 in a browser
+```
+
+Final model saved as `sac_fruitninja.zip` in `rl/`.
+
+### Step 4 — Evaluate the Trained Policy
+
+```bash
+cd ~/ros2_ws/src/FruitNinja/rl
+python train_sac.py --eval
+```
+
+Runs 10 evaluation episodes and prints mean distance to target per episode.
+Gate: policy must reach `< 5 mm` from target consistently before deployment.
+
+### Step 5 — Validate in URSim Before Real Robot
+
+**Never run the RL node on the physical arm without URSim validation first.**
+
+1. In the Startup GUI, toggle **Switch to Sim**
+2. Start Steps 0–5 (URSim + full ROS stack)
+3. Copy `rl/sac_fruitninja.zip` to the working directory
+4. Start Step 7 — RL Mover (defaults to **10% velocity scaling**)
+5. Monitor the terminal output — deviation from target is logged every 50 ms
+
+Deployment gate — all three must pass across 3 full A1→N4 grid sweeps:
+- Max joint deviation vs `/joint_states` stays **< 0.1 rad**
+- No unintended E-STOP triggers
+- All 56 cells reached within the position tolerance
+
+Only after passing all three gates should you run the RL mover on the physical UR3e.
+
+### Step 6 — Run the RL Mover Node
+
+Place `sac_fruitninja.zip` at `~/ros2_ws/src/FruitNinja/rl/sac_fruitninja.zip`, then start Step 7 from the Startup GUI, or manually:
+
+```bash
+source /opt/ros/humble/setup.bash && source ~/ros2_ws/install/setup.bash
+ros2 run fruitninja rl_mover_node
+```
+
+The node:
+- Subscribes to `/fruit_target` (from the vision node) to get the 3D cut target
+- Subscribes to `/estop` — immediately halts on any safety trigger
+- Publishes joint trajectories at **20 Hz** to `/scaled_joint_trajectory_controller/joint_trajectory`
+- Uses TF2 forward kinematics (`tool0 → base_link`) for real end-effector position in the observation
 
 ---
 
