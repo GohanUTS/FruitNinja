@@ -29,8 +29,7 @@ sys.path.insert(0, os.path.join(_RL_DIR, '..', 'fruitninja'))
 
 from envs.ur3e_grid_env import (
     UR3eGridEnv, forward_kinematics, _dh_transform, _UR3E_DH,
-    BOARD_X_ORIGIN, BOARD_Y_ORIGIN, BOARD_Z,
-    CELL_WIDTH_M, CELL_HEIGHT_M, NUM_COLS, NUM_ROWS,
+    cell_centre, _P_A1, _P_A4, _P_N1, _P_N4, NUM_COLS, NUM_ROWS,
 )
 from envs.domain_rand_wrapper import DomainRandWrapper
 
@@ -47,20 +46,12 @@ def joint_positions(q: np.ndarray) -> np.ndarray:
     return np.array(pts)
 
 
-# ── Board corner helpers ───────────────────────────────────────────────────────
+# ── Board outline from measured corners ───────────────────────────────────────
 
 def board_corners():
-    """Return the 4 corners of the cutting board in robot base frame."""
-    x0, y0 = BOARD_X_ORIGIN, BOARD_Y_ORIGIN
-    w = NUM_COLS * CELL_WIDTH_M
-    h = NUM_ROWS * CELL_HEIGHT_M
-    z = BOARD_Z
+    """Return the 4 measured corners of the board (closed loop for plotting)."""
     return np.array([
-        [x0,     y0,     z],
-        [x0 + w, y0,     z],
-        [x0 + w, y0 + h, z],
-        [x0,     y0 + h, z],
-        [x0,     y0,     z],   # close the rectangle
+        _P_A1, _P_N1, _P_N4, _P_A4, _P_A1,
     ])
 
 
@@ -70,13 +61,9 @@ GRID_COLS = list('ABCDEFGHIJKLMN')
 GRID_ROWS = ['1', '2', '3', '4']
 
 def cell_to_target(cell: str) -> np.ndarray:
-    col_char = cell[0].upper()
-    row_char  = cell[1]
-    col = GRID_COLS.index(col_char)
-    row = GRID_ROWS.index(row_char)
-    cx = BOARD_X_ORIGIN + (col + 0.5) * CELL_WIDTH_M
-    cy = BOARD_Y_ORIGIN + (row + 0.5) * CELL_HEIGHT_M
-    return np.array([cx, cy, BOARD_Z], dtype=np.float32)
+    col = GRID_COLS.index(cell[0].upper())
+    row = GRID_ROWS.index(cell[1])
+    return cell_centre(col, row)
 
 
 # ── Visualiser ────────────────────────────────────────────────────────────────

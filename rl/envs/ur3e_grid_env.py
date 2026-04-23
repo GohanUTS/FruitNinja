@@ -2,7 +2,7 @@
 """
 UR3eGridEnv
 ===========
-Gym-compatible environment for the FruitNinja UR3e cutting-board task.
+Gymnasium environment for the FruitNinja UR3e cutting-board task.
 
 Observation space (dim=21):
   q[6]         — joint positions (rad)
@@ -14,11 +14,19 @@ Observation space (dim=21):
 Action space (dim=6):
   Joint velocity commands (rad/s), clipped to [-1, 1].
 
-Board geometry (robot base frame):
-  BOARD_X_ORIGIN  — x coordinate of the A1 (far-left) corner
-  BOARD_Y_ORIGIN  — y coordinate of the A1 corner
-  Board surface z = 0.165 m
-  14 columns (A–N), 4 rows (1–4)
+Board geometry — derived from FK of the 4 measured corner joint angles
+in grid_mover.py.  The board is NOT axis-aligned and NOT flat in the
+robot base frame, so targets are computed via bilinear interpolation of
+the 4 measured Cartesian corners (matching grid_mover's joint-space
+interpolation approach).
+
+  P_A1 = ( 0.2697, -0.4846,  0.0968)  — far-left
+  P_A4 = ( 0.3114, -0.3503,  0.1501)  — near-left
+  P_N1 = (-0.3124, -0.4549,  0.0875)  — far-right
+  P_N4 = (-0.3130, -0.3493,  0.1022)  — near-right
+
+Home = board centre (u=0.5, v=0.5 bilinear interpolation of corner
+joint angles from grid_mover.py).
 """
 
 import math
@@ -27,17 +35,40 @@ import gymnasium as gym
 from gymnasium import spaces
 
 
-# ── Board geometry ─────────────────────────────────────────────────────────────
+# ── Measured board corners in robot base frame (from FK of grid_mover corners) ─
+# u = col / 13  (0 → A, 1 → N)
+# v = row / 3   (0 → row-1, 1 → row-4)
 
-BOARD_X_ORIGIN = -0.031        # x of A1 corner in robot base frame (m)
-BOARD_Y_ORIGIN = 0.10          # y of A1 corner in robot base frame (m)
-BOARD_Z        = 0.165         # board surface z in robot base frame (m)
-
-CELL_WIDTH_M   = 0.73 / 14    # ~0.05214 m per column
-CELL_HEIGHT_M  = 0.22 / 4     # 0.055 m per row
+_P_A1 = np.array([ 0.2697, -0.4846,  0.0968], dtype=np.float64)  # u=0, v=0
+_P_A4 = np.array([ 0.3114, -0.3503,  0.1501], dtype=np.float64)  # u=0, v=1
+_P_N1 = np.array([-0.3124, -0.4549,  0.0875], dtype=np.float64)  # u=1, v=0
+_P_N4 = np.array([-0.3130, -0.3493,  0.1022], dtype=np.float64)  # u=1, v=1
 
 NUM_COLS = 14
 NUM_ROWS = 4
+
+
+def cell_centre(col: int, row: int) -> np.ndarray:
+    """
+    Return the Cartesian centre of a grid cell in robot base frame (m).
+
+    Uses bilinear interpolation of the 4 measured corner positions, matching
+    the same approach grid_mover uses in joint space.
+
+    Parameters
+    ----------
+    col : 0-based column index (0 = A … 13 = N)
+    row : 0-based row index   (0 = row-1 … 3 = row-4)
+    """
+    u = col / (NUM_COLS - 1)   # 0.0 → 1.0
+    v = row / (NUM_ROWS - 1)   # 0.0 → 1.0
+    return (
+        (1 - u) * (1 - v) * _P_A1
+        +      u * (1 - v) * _P_N1
+        + (1 - u) *      v * _P_A4
+        +      u  *      v * _P_N4
+    ).astype(np.float32)
+
 
 # ── Robot configuration ────────────────────────────────────────────────────────
 
@@ -50,12 +81,17 @@ JOINT_NAMES = [
     'wrist_3_joint',
 ]
 
-# Home joint angles in radians
-HOME_RAD = np.zeros(6, dtype=np.float32)
+# Home = board centre joint angles (bilinear average of 4 measured corners,
+# degrees → radians).  Keeps the arm in a realistic working configuration.
+_HOME_DEG = [-76.697, -154.855, -39.142, -75.47, 91.41, 234.355]
+HOME_RAD  = np.array([math.radians(d) for d in _HOME_DEG], dtype=np.float32)
 
-# Joint position limits (conservative, in radians)
-Q_MIN = np.array([-2*math.pi] * 6, dtype=np.float32)
-Q_MAX = np.array([ 2*math.pi] * 6, dtype=np.float32)
+# Realistic UR3e joint limits (radians) — tighter than ±2π to match
+# the working envelope used by the real robot.
+Q_MIN = np.array([-2*math.pi, -2*math.pi, -2*math.pi,
+                  -2*math.pi, -2*math.pi, -2*math.pi], dtype=np.float32)
+Q_MAX = np.array([ 2*math.pi,  0.0,        2*math.pi,
+                   2*math.pi,  2*math.pi,  2*math.pi], dtype=np.float32)
 
 # Joint velocity limits (rad/s)
 QDOT_MAX = 1.0   # scalar; applied symmetrically
@@ -176,18 +212,13 @@ class UR3eGridEnv(gym.Env):
         """Randomise target cell and reset robot to home."""
         super().reset(seed=seed)
 
-        # Random cell
+        # Random cell — bilinear interpolation gives true Cartesian centre
         col = int(self.np_random.integers(0, NUM_COLS))  # 0 … 13
         row = int(self.np_random.integers(0, NUM_ROWS))  # 0 … 3
 
-        # Cell centre in robot base frame
-        cx = BOARD_X_ORIGIN + (col + 0.5) * CELL_WIDTH_M
-        cy = BOARD_Y_ORIGIN + (row + 0.5) * CELL_HEIGHT_M
-        cz = BOARD_Z
-
         # +/- 5 mm noise
         noise = self.np_random.uniform(-0.005, 0.005, size=3).astype(np.float32)
-        self._target = np.array([cx, cy, cz], dtype=np.float32) + noise
+        self._target = cell_centre(col, row) + noise
 
         # Reset robot state
         self._q      = HOME_RAD.copy().astype(np.float32)
