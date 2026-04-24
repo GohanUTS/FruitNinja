@@ -84,15 +84,19 @@ JOINT_NAMES = [
 _HOME_DEG = [-76.697, -154.855, -39.142, -75.47, 91.41, 234.355]
 HOME_RAD  = np.array([math.radians(d) for d in _HOME_DEG], dtype=np.float32)
 
-# Realistic UR3e joint limits (radians) — tighter than ±2π to match
-# the working envelope used by the real robot.
+# UR3e joint limits (radians).
+# Per datasheet all joints are ±360° (±2π); joint 6 is unlimited.
+# Q_MAX[1]=0 is a task constraint (shoulder must stay below horizontal
+# to keep the arm reaching down toward the table — not a spec limit).
 Q_MIN = np.array([-2*math.pi, -2*math.pi, -2*math.pi,
                   -2*math.pi, -2*math.pi, -2*math.pi], dtype=np.float32)
 Q_MAX = np.array([ 2*math.pi,  0.0,        2*math.pi,
                    2*math.pi,  2*math.pi,  2*math.pi], dtype=np.float32)
 
-# Joint velocity limits (rad/s)
-QDOT_MAX = 1.0   # scalar; applied symmetrically
+# Joint velocity limit (rad/s).
+# Datasheet max: joints 1–3 = ±π rad/s, joints 4–6 = ±2π rad/s.
+# We use a single conservative scalar well below those limits.
+QDOT_MAX = 0.5   # rad/s — slow, deliberate motion
 
 # ── DH / forward-kinematics helpers ───────────────────────────────────────────
 
@@ -180,7 +184,7 @@ class UR3eGridEnv(gym.Env):
     obs_dim    = 21   # q(6) + q_dot(6) + p_ee(3) + rpy(3) + p_target(3)
     action_dim = 6
 
-    def __init__(self, dt: float = 0.02, max_steps: int = 500):
+    def __init__(self, dt: float = 0.02, max_steps: int = 800):
         super().__init__()
 
         self.dt        = dt
@@ -247,12 +251,14 @@ class UR3eGridEnv(gym.Env):
         J      = jacobian(self._q.astype(np.float64))
         reward = self._compute_reward(p_ee, J)
 
-        dist       = float(np.linalg.norm(p_ee - self._target))
-        terminated = dist < 0.005
-        truncated  = self._step_n >= self.max_steps
+        dist         = float(np.linalg.norm(p_ee - self._target))
+        below_floor  = float(p_ee[2]) < 0.0   # EE below robot base plane
+        terminated   = dist < 0.005 or below_floor
+        truncated    = self._step_n >= self.max_steps
 
         info = {
-            'distance_m': dist,
+            'distance_m':  dist,
+            'below_floor': below_floor,
             'col': None,
             'row': None,
             'step': self._step_n,
@@ -277,39 +283,48 @@ class UR3eGridEnv(gym.Env):
     # ── Reward ─────────────────────────────────────────────────────────────────
 
     def _compute_reward(self, p_ee: np.ndarray, J: np.ndarray) -> float:
-        # --- Gaussian proximity kernel ---
         dist_sq = float(np.sum((p_ee - self._target) ** 2))
-        sigma   = 0.05   # ~5 cm half-width
+        dist    = math.sqrt(dist_sq)
+
+        # --- Closeness: sharper Gaussian so reward rises steeply near target ---
+        sigma            = 0.03   # 3 cm half-width (was 5 cm)
         proximity_reward = math.exp(-dist_sq / (2 * sigma ** 2))
 
         # --- Collision penalty (joint limit proximity) ---
-        margin        = 0.1   # rad
-        at_limit      = np.any(
+        margin    = 0.1   # rad
+        at_limit  = np.any(
             (self._q > Q_MAX - margin) | (self._q < Q_MIN + margin)
         )
         collision_pen = 10.0 if at_limit else 0.0
 
-        # --- Jerk penalty ---
-        jerk    = float(np.sum((self._q_dot - self._prev_q_dot) ** 2))
-        jerk_pen = 0.01 * jerk
+        # --- Stability: jerk penalty (penalise sudden velocity changes) ---
+        jerk     = float(np.sum((self._q_dot - self._prev_q_dot) ** 2))
+        jerk_pen = 0.1 * jerk   # 10× stronger than before
 
-        # --- Singularity penalty (capped to avoid dominating reward) ---
+        # --- Control: velocity smoothness (penalise large joint speeds) ---
+        vel_pen = 0.02 * float(np.sum(self._q_dot ** 2))
+
+        # --- Singularity penalty (capped) ---
         JJT = J @ J.T
         det = abs(float(np.linalg.det(JJT)))
         singularity_pen = min(0.5 / (det + 1e-6), 1.0)
 
-        # --- Task completion bonus ---
-        dist           = math.sqrt(dist_sq)
-        completion_bonus = 5.0 if dist < 0.005 else 0.0
+        # --- Hard floor: EE must stay above z=0 (robot base plane) ---
+        floor_pen = 50.0 if float(p_ee[2]) < 0.0 else 0.0
 
-        # --- Time penalty ---
-        time_pen = 0.001
+        # --- Task completion bonus ---
+        completion_bonus = 10.0 if dist < 0.005 else 0.0
+
+        # --- Time penalty (reduced so stability matters more than speed) ---
+        time_pen = 0.0002
 
         reward = (
             proximity_reward
             - collision_pen
             - jerk_pen
+            - vel_pen
             - singularity_pen
+            - floor_pen
             + completion_bonus
             - time_pen
         )

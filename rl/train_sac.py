@@ -19,6 +19,7 @@ Dependencies (install separately):
 import argparse
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -33,7 +34,7 @@ from envs.domain_rand_wrapper import DomainRandWrapper
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 
-TOTAL_TIMESTEPS   = 500_000
+TOTAL_TIMESTEPS   = 2_000_000
 N_ENVS            = 4
 LEARNING_RATE     = 3e-4
 BUFFER_SIZE       = 1_000_000
@@ -97,9 +98,37 @@ def _load_bc_weights(model, bc_weights_path: str):
     print(f'[BC→SAC] Copied {copied} parameter tensors from {bc_weights_path}')
 
 
+# ── Time-limit callback ───────────────────────────────────────────────────────
+
+class _TimeLimitCallback:
+    """Stop training after `time_limit_sec` wall-clock seconds."""
+    def __init__(self, time_limit_sec: int):
+        from stable_baselines3.common.callbacks import BaseCallback
+
+        class _CB(BaseCallback):
+            def __init__(self_, limit):
+                super().__init__()
+                self_._limit = limit
+                self_._t0    = None
+
+            def _on_training_start(self_):
+                self_._t0 = time.time()
+                print(f'[SAC] Time limit: {self_._limit}s '
+                      f'(≈{self_._limit/3600:.1f} h)')
+
+            def _on_step(self_) -> bool:
+                if time.time() - self_._t0 >= self_._limit:
+                    print(f'\n[SAC] Time limit reached — stopping.')
+                    return False
+                return True
+
+        self.cb = _CB(time_limit_sec)
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(bc_weights: str = None):
+def train(bc_weights: str = None, time_limit_sec: int = None,
+          continue_from: str = None):
     """
     Train a SAC agent on the FruitNinja grid task.
 
@@ -129,18 +158,23 @@ def train(bc_weights: str = None):
     )
 
     # --- SAC model ---
-    model = SAC(
-        policy          = 'MlpPolicy',
-        env             = vec_env,
-        learning_rate   = LEARNING_RATE,
-        buffer_size     = BUFFER_SIZE,
-        batch_size      = BATCH_SIZE,
-        gamma           = GAMMA,
-        tau             = TAU,
-        ent_coef        = ENT_COEF,
-        tensorboard_log = TENSORBOARD_LOG,
-        verbose         = 1,
-    )
+    if continue_from is not None:
+        print(f'[SAC] Continuing from {continue_from}.zip')
+        model = SAC.load(continue_from, env=vec_env,
+                         tensorboard_log=TENSORBOARD_LOG)
+    else:
+        model = SAC(
+            policy          = 'MlpPolicy',
+            env             = vec_env,
+            learning_rate   = LEARNING_RATE,
+            buffer_size     = BUFFER_SIZE,
+            batch_size      = BATCH_SIZE,
+            gamma           = GAMMA,
+            tau             = TAU,
+            ent_coef        = ENT_COEF,
+            tensorboard_log = TENSORBOARD_LOG,
+            verbose         = 1,
+        )
 
     # --- Optional BC weight initialisation ---
     if bc_weights is not None:
@@ -163,14 +197,25 @@ def train(bc_weights: str = None):
         name_prefix = 'sac_fruitninja',
     )
 
-    callbacks = CallbackList([eval_callback, checkpoint_callback])
+    cb_list = [eval_callback, checkpoint_callback]
+    total_steps = TOTAL_TIMESTEPS
+
+    if time_limit_sec is not None:
+        tlcb = _TimeLimitCallback(time_limit_sec)
+        cb_list.append(tlcb.cb)
+        total_steps = 100_000_000  # effectively unlimited; time limit stops it
+
+    callbacks = CallbackList(cb_list)
 
     # --- Train ---
-    print(f'[SAC] Starting training — {TOTAL_TIMESTEPS:,} timesteps')
+    label = (f'{time_limit_sec}s time limit' if time_limit_sec
+             else f'{total_steps:,} timesteps')
+    print(f'[SAC] Starting training — {label}')
     model.learn(
-        total_timesteps = TOTAL_TIMESTEPS,
+        total_timesteps = total_steps,
         callback        = callbacks,
         progress_bar    = True,
+        reset_num_timesteps = (continue_from is None),
     )
 
     # --- Save final model ---
@@ -248,12 +293,35 @@ def main():
         '--model_path', type=str, default=SAVE_PATH,
         help=f'Path to saved model for --eval mode (default: {SAVE_PATH})'
     )
+    parser.add_argument(
+        '--time_limit', type=int, default=None,
+        help='Stop training after this many seconds (e.g. 3600 for 1 hour)'
+    )
+    parser.add_argument(
+        '--continue_from', type=str, default=None,
+        help='Continue training from this model zip (without .zip)'
+    )
+    parser.add_argument(
+        '--best', action='store_true',
+        help='Continue from the best saved model (logs/best_model/best_model.zip)'
+    )
     args = parser.parse_args()
+
+    continue_from = args.continue_from
+    if args.best:
+        best_path = './logs/best_model/best_model'
+        if os.path.exists(best_path + '.zip'):
+            print(f'[SAC] --best: loading {best_path}.zip')
+            continue_from = best_path
+        else:
+            print(f'[SAC] --best: no best model found at {best_path}.zip, starting fresh')
 
     if args.eval:
         evaluate(model_path=args.model_path)
     else:
-        train(bc_weights=args.bc_weights)
+        train(bc_weights=args.bc_weights,
+              time_limit_sec=args.time_limit,
+              continue_from=continue_from)
 
 
 if __name__ == '__main__':
