@@ -32,7 +32,7 @@ from envs.ur3e_grid_env import (
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-_UPRIGHT_Q = np.zeros(6, dtype=np.float32)   # all joints at 0 rad = upright
+_UPRIGHT_Q = np.array([0.0, -np.pi / 2, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)  # real home
 
 
 # ── FK: 7-point joint chain ───────────────────────────────────────────────────
@@ -132,9 +132,10 @@ def _step_to_target(model, env, target, fig, ax, arm_line, ee_trail,
         ee_trail.set_3d_properties(trail[2])
 
         dist_mm = info['distance_m'] * 1000
+        reached = info.get('targets_reached', 0)
         info_txt.set_text(
             f'Step: {env._step_n:4d}   Dist: {dist_mm:6.1f} mm   '
-            f'Reward: {reward:+.3f}'
+            f'Reached: {reached}   Reward: {reward:+.3f}'
         )
 
         plt.pause(delay)

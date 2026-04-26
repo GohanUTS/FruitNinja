@@ -1,3 +1,13 @@
 trolley/*.dae
 trolley/*.STEP
 trolley/*.stl
+
+# RL training artifacts
+rl/checkpoints/
+rl/logs/
+rl/tb_logs/
+rl/sac_fruitninja.zip
+rl/*.log
+rl/envs/__pycache__/
+**/__pycache__/
+*.pyc

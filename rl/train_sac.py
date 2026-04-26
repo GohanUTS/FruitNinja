@@ -28,8 +28,13 @@ import numpy as np
 _RL_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _RL_DIR)
 
-from envs.ur3e_grid_env       import UR3eGridEnv
+from envs.ur3e_grid_env       import UR3eGridEnv, _P_A1, _P_A4, _P_N1, _P_N4, cell_centre
 from envs.domain_rand_wrapper import DomainRandWrapper
+
+# Named fixed targets available via --target
+_NAMED_TARGETS = {
+    'a1': _P_A1, 'a4': _P_A4, 'n1': _P_N1, 'n4': _P_N4,
+}
 
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
@@ -51,10 +56,10 @@ N_EVAL_EPISODES   = 10
 
 # ── Environment factory ────────────────────────────────────────────────────────
 
-def make_env(rank: int = 0, seed: int = 0):
+def make_env(rank: int = 0, seed: int = 0, fixed_target=None):
     """Return a callable that creates a seeded, domain-randomised environment."""
     def _init():
-        env = UR3eGridEnv()
+        env = UR3eGridEnv(fixed_target=fixed_target)
         env = DomainRandWrapper(env)
         return env
     return _init
@@ -128,7 +133,7 @@ class _TimeLimitCallback:
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(bc_weights: str = None, time_limit_sec: int = None,
-          continue_from: str = None):
+          continue_from: str = None, fixed_target=None):
     """
     Train a SAC agent on the FruitNinja grid task.
 
@@ -145,7 +150,7 @@ def train(bc_weights: str = None, time_limit_sec: int = None,
 
     # --- Vectorised training environments ---
     vec_env = make_vec_env(
-        make_env(),
+        make_env(fixed_target=fixed_target),
         n_envs=N_ENVS,
         seed=42,
         vec_env_cls=SubprocVecEnv,
@@ -153,7 +158,7 @@ def train(bc_weights: str = None, time_limit_sec: int = None,
 
     # --- Single evaluation environment ---
     eval_env = make_vec_env(
-        make_env(rank=N_ENVS, seed=1000),
+        make_env(rank=N_ENVS, seed=1000, fixed_target=fixed_target),
         n_envs=1,
     )
 
@@ -305,6 +310,12 @@ def main():
         '--best', action='store_true',
         help='Continue from the best saved model (logs/best_model/best_model.zip)'
     )
+    parser.add_argument(
+        '--target', type=str, default=None,
+        choices=['a1', 'a4', 'n1', 'n4'],
+        help='Train on a single fixed target cell (e.g. a1). '
+             'If omitted, uses 5 random cells per episode.'
+    )
     args = parser.parse_args()
 
     continue_from = args.continue_from
@@ -316,12 +327,17 @@ def main():
         else:
             print(f'[SAC] --best: no best model found at {best_path}.zip, starting fresh')
 
+    fixed_target = _NAMED_TARGETS.get(args.target) if args.target else None
+    if fixed_target is not None:
+        print(f'[SAC] Fixed target: {args.target.upper()} = {fixed_target}')
+
     if args.eval:
         evaluate(model_path=args.model_path)
     else:
         train(bc_weights=args.bc_weights,
               time_limit_sec=args.time_limit,
-              continue_from=continue_from)
+              continue_from=continue_from,
+              fixed_target=fixed_target)
 
 
 if __name__ == '__main__':
