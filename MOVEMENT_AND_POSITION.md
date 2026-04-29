@@ -68,11 +68,12 @@ Converts a cell label (e.g. `"C2"`) to 6 joint angles in degrees using
 1. Convert column letter → `col_idx` (0–13), row number → `row_idx` (0–3)
 2. Compute `u = col_idx / 13` (0 = A, 1 = N) — then **mirror**: `u = 1 - u`
 3. Compute `v = row_idx / 3`  (0 = row1, 1 = row4) — then **mirror**: `v = 1 - v`
-4. Remap into board inset: `u ∈ [0.14, 0.86]`, `v ∈ [0.0, 1.0]`
+4. Remap into board inset: `u ∈ [0.14, 0.86]`, `v ∈ [-0.035, 1.035]`
 5. Bilinear interpolate each of the 6 joints independently
 
 The mirroring and inset were calibrated to keep the arm on the board surface
-and away from the trolley frame edges.
+and away from the trolley frame edges. The slightly wider `v` span gives the
+four row positions more separation without changing the left/right column inset.
 
 ```
 cell_to_joints_deg("C2")  →  [pan°, lift°, elbow°, w1°, w2°, w3°]

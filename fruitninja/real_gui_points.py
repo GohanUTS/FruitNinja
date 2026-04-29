@@ -62,7 +62,10 @@ from PyQt5.QtWidgets import (
     QShortcut, QComboBox,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
-from PyQt5.QtGui import QKeySequence, QImage, QPixmap
+from PyQt5.QtGui import (
+    QKeySequence, QImage, QPixmap, QPainter, QPen, QBrush,
+    QColor, QFont, QLinearGradient, QRadialGradient,
+)
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -516,6 +519,71 @@ class CameraWorker(QObject):
             self.stopped.emit('')
 
 
+# ── Animated brand strip ─────────────────────────────────────────────────────
+
+class FruitNinjaBrand(QWidget):
+    """Animated 3-D style FruitNinja title plate for the operator console."""
+
+    def __init__(self, subtitle: str):
+        super().__init__()
+        self._subtitle = subtitle
+        self._phase = 0
+        self.setMinimumHeight(90)
+        self.setMaximumHeight(104)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(45)
+
+    def _tick(self):
+        self._phase = (self._phase + 3) % 360
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        bg = QLinearGradient(0, 0, w, h)
+        bg.setColorAt(0.0, QColor('#101a22'))
+        bg.setColorAt(0.52, QColor('#172630'))
+        bg.setColorAt(1.0, QColor('#090f15'))
+        p.setBrush(QBrush(bg))
+        p.setPen(QPen(QColor('#334957'), 1))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 8, 8)
+
+        glow_x = int((self._phase / 360.0) * (w + 120)) - 60
+        glow = QRadialGradient(glow_x, h // 2, max(90, h))
+        glow.setColorAt(0.0, QColor(50, 225, 150, 78))
+        glow.setColorAt(1.0, QColor(50, 225, 150, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(glow_x - h, -h // 2, h * 2, h * 2)
+
+        title = 'FRUITNINJA'
+        x, y = 22, 50
+        p.setFont(QFont('Arial Black', 28, QFont.Black))
+        for dx, dy, col in [
+            (4, 5, QColor('#061016')),
+            (3, 3, QColor('#173541')),
+            (2, 2, QColor('#28596a')),
+        ]:
+            p.setPen(QPen(col))
+            p.drawText(x + dx, y + dy, title)
+
+        title_grad = QLinearGradient(x, 20, x + 340, 60)
+        title_grad.setColorAt(0.0, QColor('#ff4b4b'))
+        title_grad.setColorAt(0.45, QColor('#ffd166'))
+        title_grad.setColorAt(1.0, QColor('#38d878'))
+        p.setPen(QPen(QBrush(title_grad), 1))
+        p.drawText(x, y, title)
+
+        p.setFont(QFont('Arial', 10, QFont.DemiBold))
+        p.setPen(QPen(QColor('#a9bbc7')))
+        p.drawText(24, 75, self._subtitle)
+
+        p.end()
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -526,9 +594,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('RealGuiPoints — UR3e Grid Control')
-        self.setMinimumSize(1200, 660)
-        self.setStyleSheet('background:#1e1e1e; color:white;')
+        self.setWindowTitle('FruitNinja — UR3e Grid Control')
+        self.setMinimumSize(1240, 740)
+        self.setStyleSheet('background:#0b1117; color:white;')
 
         self._selected_cells = []
         self._moving = False
@@ -562,9 +630,17 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         root_w = QWidget()
         self.setCentralWidget(root_w)
-        outer = QHBoxLayout(root_w)
+        shell = QVBoxLayout(root_w)
+        shell.setSpacing(10)
+        shell.setContentsMargins(12, 12, 12, 12)
+        shell.addWidget(FruitNinjaBrand('UR3e operator console  |  Select cells, cut fruit, monitor motion'))
+
+        body_w = QWidget()
+        shell.addWidget(body_w, stretch=1)
+
+        outer = QHBoxLayout(body_w)
         outer.setSpacing(10)
-        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         # Left panel — all existing controls
         left_w = QWidget()
@@ -585,19 +661,19 @@ class MainWindow(QMainWindow):
         for col, header in enumerate(['Joint', 'Current Angle']):
             lbl = QLabel(header)
             lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet('color:#aaa; font-size:11px; font-weight:bold;')
+            lbl.setStyleSheet('color:#a9b8c4; font-size:11px; font-weight:bold;')
             js_layout.addWidget(lbl, 0, col)
 
         for row, (jname, jlabel) in enumerate(zip(JOINT_NAMES, JOINT_LABELS)):
             name_lbl = QLabel(jlabel)
-            name_lbl.setStyleSheet('color:#ccc; font-size:12px; padding:2px 8px;')
+            name_lbl.setStyleSheet('color:#d1dde4; font-size:12px; padding:3px 8px;')
             js_layout.addWidget(name_lbl, row + 1, 0)
 
             val_lbl = QLabel('—')
             val_lbl.setAlignment(Qt.AlignCenter)
             val_lbl.setStyleSheet(
-                'background:#2a2a3a; color:#00ddff; font-family:monospace;'
-                'font-size:12px; border-radius:3px; padding:3px 10px;'
+                'background:#08131a; color:#62e6ff; font-family:monospace;'
+                'font-size:12px; border:1px solid #2f5161; border-radius:5px; padding:4px 10px;'
             )
             self._joint_labels[jname] = val_lbl
             js_layout.addWidget(val_lbl, row + 1, 1)
@@ -615,14 +691,14 @@ class MainWindow(QMainWindow):
         for c, col in enumerate(GRID_COLS):
             hdr = QLabel(col)
             hdr.setAlignment(Qt.AlignCenter)
-            hdr.setStyleSheet('color:#888; font-size:10px;')
+            hdr.setStyleSheet('color:#91a5b2; font-size:10px; font-weight:bold;')
             grid_layout.addWidget(hdr, 0, c + 1)
 
         # row headers + cell buttons
         for r, row in enumerate(GRID_ROWS):
             hdr = QLabel(row)
             hdr.setAlignment(Qt.AlignCenter)
-            hdr.setStyleSheet('color:#888; font-size:10px;')
+            hdr.setStyleSheet('color:#91a5b2; font-size:10px; font-weight:bold;')
             grid_layout.addWidget(hdr, r + 1, 0)
 
             for c, col in enumerate(GRID_COLS):
@@ -643,16 +719,16 @@ class MainWindow(QMainWindow):
         act_layout.setSpacing(8)
 
         self._btn_go    = self._action_btn('▶  Move to Selected', '#1a5c1a', self._go)
-        self._btn_ik    = self._action_btn('⊕  Inverse Movement', '#1a3a5c', self._go_ik)
-        self._btn_clear = self._action_btn('✕  Clear', '#3a3a3a', self._clear_selection)
-        self._btn_stop  = self._action_btn('⚠  E-STOP  [SPACE]', '#cc0000', self._stop)
+        self._btn_ik    = self._action_btn('⊕  Inverse Movement', '#1c5f87', self._go_ik)
+        self._btn_clear = self._action_btn('✕  Clear', '#3b4650', self._clear_selection)
+        self._btn_stop  = self._action_btn('⚠  E-STOP  [SPACE]', '#c82020', self._stop)
         self._btn_stop.setStyleSheet(
-            'QPushButton{background:#cc0000;color:white;border:2px solid #ff4444;'
+            'QPushButton{background:#c82020;color:white;border:2px solid #ff5a5a;'
             'border-radius:6px;padding:12px;font-size:14px;font-weight:bold;}'
-            'QPushButton:hover{background:#ee2222;}'
+            'QPushButton:hover{background:#e62b2b;}'
             'QPushButton:pressed{background:#991111;}'
         )
-        self._btn_reset = self._action_btn('↺  Reset (Home)', '#4a3a00', self._reset)
+        self._btn_reset = self._action_btn('↺  Reset (Home)', '#6a5012', self._reset)
 
         act_layout.addWidget(self._btn_go)
         act_layout.addWidget(self._btn_ik)
@@ -665,8 +741,8 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel('● Idle — select a cell and press Move')
         self._status_label.setAlignment(Qt.AlignCenter)
         self._status_label.setStyleSheet(
-            'background:#111; color:#aaa; font-size:13px; font-weight:bold;'
-            'padding:8px; border:1px solid #333; border-radius:4px;'
+            'background:#101a22; color:#a9b8c4; font-size:13px; font-weight:bold;'
+            'padding:9px; border:1px solid #2f4654; border-radius:6px;'
         )
         root.addWidget(self._status_label)
 
@@ -675,8 +751,8 @@ class MainWindow(QMainWindow):
         self._log_widget.setReadOnly(True)
         self._log_widget.setMaximumHeight(90)
         self._log_widget.setStyleSheet(
-            'background:#0a0a0a; color:#00ee00;'
-            'font-family:monospace; font-size:11px;'
+            'background:#071016; color:#79f7b2; border:1px solid #1c303b;'
+            'border-radius:6px; font-family:monospace; font-size:11px; padding:6px;'
         )
         root.addWidget(self._log_widget)
 
@@ -690,20 +766,24 @@ class MainWindow(QMainWindow):
     def _group(title):
         g = QGroupBox(title)
         g.setStyleSheet(
-            'QGroupBox{color:white;font-weight:bold;'
-            'border:1px solid #444;border-radius:4px;margin-top:8px;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:8px;}'
+            'QGroupBox{color:#f5f9fa;font-weight:bold;'
+            'border:1px solid #314652;border-radius:7px;margin-top:10px;'
+            'background:#0f1820;}'
+            'QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}'
         )
-        g.setLayout(QVBoxLayout())
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
+        g.setLayout(layout)
         return g
 
     @staticmethod
     def _cell_style_normal():
         return (
-            'QPushButton{background:#2a2a3a;color:#ccc;border:1px solid #555;'
-            'border-radius:3px;font-size:10px;font-weight:bold;}'
-            'QPushButton:checked{background:#3a7aff;color:white;border:1px solid #88aaff;}'
-            'QPushButton:hover{background:#3a3a5a;}'
+            'QPushButton{background:#14222b;color:#c9d6de;border:1px solid #2f4654;'
+            'border-radius:4px;font-size:10px;font-weight:bold;}'
+            'QPushButton:checked{background:#2f8bd8;color:white;border:1px solid #91cfff;}'
+            'QPushButton:hover{background:#203442;}'
         )
 
     @staticmethod
@@ -711,9 +791,9 @@ class MainWindow(QMainWindow):
         b = QPushButton(text)
         b.setStyleSheet(
             f'QPushButton{{background:{colour};color:white;border-radius:6px;'
-            f'padding:12px;font-size:13px;font-weight:bold;}}'
-            f'QPushButton:hover{{background:{colour}cc;}}'
-            f'QPushButton:pressed{{background:{colour}88;}}'
+            f'padding:12px;font-size:13px;font-weight:bold;border:1px solid rgba(255,255,255,40);}}'
+            f'QPushButton:hover{{background:{colour};border:1px solid rgba(255,255,255,110);}}'
+            f'QPushButton:pressed{{background:{colour};padding-top:13px;padding-bottom:11px;}}'
         )
         b.clicked.connect(slot)
         return b
@@ -989,8 +1069,8 @@ class MainWindow(QMainWindow):
     def _set_status(self, text: str, colour: str = '#aaaaaa'):
         self._status_label.setText(text)
         self._status_label.setStyleSheet(
-            f'background:#111; color:{colour}; font-size:13px; font-weight:bold;'
-            f'padding:8px; border:1px solid #333; border-radius:4px;'
+            f'background:#101a22; color:{colour}; font-size:13px; font-weight:bold;'
+            f'padding:9px; border:1px solid #2f4654; border-radius:6px;'
         )
 
     def _log(self, text: str):
@@ -1013,25 +1093,25 @@ class MainWindow(QMainWindow):
         self._cam_combo.addItem('Osmo DJI Pocket 3', 3)
         self._cam_combo.setFixedWidth(160)
         self._cam_combo.setStyleSheet(
-            'QComboBox{background:#2a2a3a;color:#ccc;border:1px solid #555;'
-            'border-radius:3px;padding:4px 8px;font-size:12px;}'
+            'QComboBox{background:#08131a;color:#c9d6de;border:1px solid #325262;'
+            'border-radius:5px;padding:5px 8px;font-size:12px;}'
             'QComboBox::drop-down{border:none;}'
-            'QComboBox QAbstractItemView{background:#2a2a3a;color:#ccc;'
-            'selection-background-color:#3a7aff;}'
+            'QComboBox QAbstractItemView{background:#101a22;color:#c9d6de;'
+            'selection-background-color:#2f8bd8;}'
         )
         ctrl.addWidget(self._cam_combo)
 
         self._btn_cam = QPushButton('▶  Start Camera')
         self._btn_cam.setStyleSheet(
-            'QPushButton{background:#1a3a5c;color:white;border-radius:5px;'
+            'QPushButton{background:#1c5f87;color:white;border-radius:5px;'
             'padding:7px 12px;font-size:12px;font-weight:bold;}'
-            'QPushButton:hover{background:#2a5a8ccc;}'
+            'QPushButton:hover{background:#2b78a5;}'
         )
         self._btn_cam.clicked.connect(self._toggle_camera)
         ctrl.addWidget(self._btn_cam)
 
         self._cam_status = QLabel('Off')
-        self._cam_status.setStyleSheet('color:#666; font-size:11px; padding-left:4px;')
+        self._cam_status.setStyleSheet('color:#8195a3; font-size:11px; padding-left:4px;')
         ctrl.addWidget(self._cam_status)
         ctrl.addStretch()
 
@@ -1043,10 +1123,10 @@ class MainWindow(QMainWindow):
 
         self._btn_define_grid = QPushButton('✛  Define Grid')
         self._btn_define_grid.setStyleSheet(
-            'QPushButton{background:#2a3a2a;color:#88cc88;border:1px solid #446644;'
+            'QPushButton{background:#143221;color:#8ee6aa;border:1px solid #286947;'
             'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
-            'QPushButton:hover{background:#3a4a3acc;}'
-            'QPushButton:checked{background:#1a5c1a;color:white;border-color:#00cc44;}'
+            'QPushButton:hover{background:#1c4730;}'
+            'QPushButton:checked{background:#1f7a42;color:white;border-color:#71e89f;}'
         )
         self._btn_define_grid.setCheckable(True)
         self._btn_define_grid.clicked.connect(self._toggle_grid_select)
@@ -1054,25 +1134,25 @@ class MainWindow(QMainWindow):
 
         btn_clear_grid = QPushButton('✕  Clear Grid')
         btn_clear_grid.setStyleSheet(
-            'QPushButton{background:#2a2a2a;color:#888;border:1px solid #444;'
+            'QPushButton{background:#16222b;color:#a9b8c4;border:1px solid #314652;'
             'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
-            'QPushButton:hover{background:#3a2a2acc;}'
+            'QPushButton:hover{background:#243442;}'
         )
         btn_clear_grid.clicked.connect(self._clear_grid)
         grid_row.addWidget(btn_clear_grid)
 
         self._btn_cut_detected = QPushButton('✂  Cut Detected Fruit')
         self._btn_cut_detected.setStyleSheet(
-            'QPushButton{background:#3a1a5c;color:#d0b0ff;border:1px solid #6a44aa;'
+            'QPushButton{background:#58336b;color:#f0d8ff;border:1px solid #8d5fb0;'
             'border-radius:4px;padding:5px 10px;font-size:11px;font-weight:bold;}'
-            'QPushButton:hover{background:#4a2a7ccc;}'
-            'QPushButton:disabled{background:#2a2a2a;color:#555;border-color:#333;}'
+            'QPushButton:hover{background:#704186;}'
+            'QPushButton:disabled{background:#172028;color:#52636f;border-color:#263946;}'
         )
         self._btn_cut_detected.clicked.connect(self._cut_detected_fruit)
         grid_row.addWidget(self._btn_cut_detected)
 
         self._grid_status = QLabel('No grid defined')
-        self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
+        self._grid_status.setStyleSheet('color:#8195a3; font-size:11px; padding-left:6px;')
         grid_row.addWidget(self._grid_status)
         grid_row.addStretch()
 
@@ -1083,7 +1163,7 @@ class MainWindow(QMainWindow):
         self._cam_label.setAlignment(Qt.AlignCenter)
         self._cam_label.setMinimumSize(400, 300)
         self._cam_label.setStyleSheet(
-            'background:#000; border:1px solid #333; border-radius:4px;'
+            'background:#03070a; color:#8195a3; border:1px solid #314652; border-radius:6px;'
         )
         self._cam_label.setText('Camera off')
         self._cam_label.mousePressEvent = self._cam_label_clicked
@@ -1095,8 +1175,8 @@ class MainWindow(QMainWindow):
         self._detect_info.setMaximumHeight(110)
         self._detect_info.setPlaceholderText('Detections will appear here…')
         self._detect_info.setStyleSheet(
-            'QTextEdit{background:#1a1a22;color:#ddd;border:1px solid #333;'
-            'border-radius:4px;padding:6px;font-family:monospace;font-size:11px;}'
+            'QTextEdit{background:#071016;color:#d9e6ed;border:1px solid #1c303b;'
+            'border-radius:6px;padding:7px;font-family:monospace;font-size:11px;}'
         )
         layout.addWidget(self._detect_info)
 
@@ -1276,13 +1356,13 @@ class MainWindow(QMainWindow):
         if checked:
             self._grid_pts = []
             self._grid_status.setText('Click point 1 of 4 on the camera feed')
-            self._grid_status.setStyleSheet('color:#ffcc00; font-size:11px; padding-left:6px;')
+            self._grid_status.setStyleSheet('color:#ffd166; font-size:11px; padding-left:6px;')
             self._cam_label.setCursor(Qt.CrossCursor)
         else:
             self._cam_label.setCursor(Qt.ArrowCursor)
             if len(self._grid_pts) < 4:
                 self._grid_status.setText('Selection cancelled')
-                self._grid_status.setStyleSheet('color:#888; font-size:11px; padding-left:6px;')
+                self._grid_status.setStyleSheet('color:#8195a3; font-size:11px; padding-left:6px;')
 
     def _clear_grid(self):
         self._grid_pts = []
@@ -1290,7 +1370,7 @@ class MainWindow(QMainWindow):
         self._btn_define_grid.setChecked(False)
         self._cam_label.setCursor(Qt.ArrowCursor)
         self._grid_status.setText('No grid defined')
-        self._grid_status.setStyleSheet('color:#666; font-size:11px; padding-left:6px;')
+        self._grid_status.setStyleSheet('color:#8195a3; font-size:11px; padding-left:6px;')
 
     def _cam_label_clicked(self, event):
         """

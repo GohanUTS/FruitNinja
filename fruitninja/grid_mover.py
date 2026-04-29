@@ -58,11 +58,12 @@ CORNER_N4 = [-115.72, -140.00,  -71.39,  -60.67,  90.44, 285.49]  # u=1, v=1
 MIRROR_GRID_COLUMNS = True
 
 # Use an inset of the measured full-table grid. Columns stay inset from the
-# trolley frame, while rows use the full calibrated board depth.
+# trolley frame. Rows are spread a little past the measured corner poses so
+# cells like A1/A2/A3/A4 are less bunched up on the cutting board.
 BOARD_U_MIN = 0.14
 BOARD_U_MAX = 0.86
-BOARD_V_MIN = 0.00
-BOARD_V_MAX = 1.00
+BOARD_V_MIN = -0.035
+BOARD_V_MAX = 1.035
 MIRROR_GRID_ROWS = True
 
 

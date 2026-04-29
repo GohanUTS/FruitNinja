@@ -38,8 +38,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QGroupBox, QLineEdit, QTabWidget,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QProcess
-from PyQt5.QtGui import QFont, QColor, QTextCursor
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QProcess, QTimer
+from PyQt5.QtGui import (
+    QFont, QColor, QTextCursor, QPainter, QPen, QBrush,
+    QLinearGradient, QRadialGradient,
+)
 
 
 # ── Step definitions ──────────────────────────────────────────────────────────
@@ -146,26 +149,94 @@ STATUS_STOPPED = ('■ Stopped', '#e0a000')
 
 TAB_STYLE = """
 QTabWidget::pane {
-    border: 1px solid #444;
-    background: #0a0a0a;
+    border: 1px solid #33414a;
+    background: #081016;
+    border-radius: 6px;
 }
 QTabBar::tab {
-    background: #2a2a2a;
-    color: #aaa;
-    padding: 6px 14px;
-    border: 1px solid #444;
+    background: #172028;
+    color: #a9b9c5;
+    padding: 7px 14px;
+    border: 1px solid #33414a;
     border-bottom: none;
     font-size: 11px;
+    min-width: 96px;
 }
 QTabBar::tab:selected {
-    background: #1e1e1e;
+    background: #243241;
     color: white;
     font-weight: bold;
 }
 QTabBar::tab:hover {
-    background: #3a3a3a;
+    background: #2e3f4f;
 }
 """
+
+
+# ── Animated brand strip ─────────────────────────────────────────────────────
+
+class FruitNinjaBrand(QWidget):
+    """Small animated 3-D style brand plate used by the startup launcher."""
+
+    def __init__(self, subtitle: str):
+        super().__init__()
+        self._phase = 0
+        self._subtitle = subtitle
+        self.setMinimumHeight(92)
+        self.setMaximumHeight(108)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(45)
+
+    def _tick(self):
+        self._phase = (self._phase + 3) % 360
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        bg = QLinearGradient(0, 0, w, h)
+        bg.setColorAt(0.0, QColor('#101a22'))
+        bg.setColorAt(0.5, QColor('#16222c'))
+        bg.setColorAt(1.0, QColor('#0a1218'))
+        p.setBrush(QBrush(bg))
+        p.setPen(QPen(QColor('#2f4552'), 1))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 8, 8)
+
+        glow_x = int((self._phase / 360.0) * (w + 120)) - 60
+        glow = QRadialGradient(glow_x, h // 2, max(90, h))
+        glow.setColorAt(0.0, QColor(40, 210, 160, 72))
+        glow.setColorAt(1.0, QColor(40, 210, 160, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(glow_x - h, -h // 2, h * 2, h * 2)
+
+        p.setFont(QFont('Arial Black', 28, QFont.Black))
+        title = 'FRUITNINJA'
+        x = 22
+        y = 51
+        for dx, dy, col in [
+            (4, 5, QColor('#071015')),
+            (3, 3, QColor('#17313a')),
+            (2, 2, QColor('#265363')),
+        ]:
+            p.setPen(QPen(col))
+            p.drawText(x + dx, y + dy, title)
+
+        title_grad = QLinearGradient(x, 22, x + 330, 60)
+        title_grad.setColorAt(0.0, QColor('#ff4b4b'))
+        title_grad.setColorAt(0.45, QColor('#ffd166'))
+        title_grad.setColorAt(1.0, QColor('#37d67a'))
+        p.setPen(QPen(QBrush(title_grad), 1))
+        p.drawText(x, y, title)
+
+        p.setFont(QFont('Arial', 10, QFont.DemiBold))
+        p.setPen(QPen(QColor('#a8bbc7')))
+        p.drawText(24, 76, self._subtitle)
+
+        p.end()
 
 
 # ── Step row widget ───────────────────────────────────────────────────────────
@@ -205,30 +276,37 @@ class StepRow(QObject):
         self.output_widget = QTextEdit()
         self.output_widget.setReadOnly(True)
         self.output_widget.setStyleSheet(
-            'background:#0a0a0a; color:#00ee00;'
-            'font-family:monospace; font-size:11px;'
+            'background:#071016; color:#79f7b2; border:1px solid #1c303b;'
+            'border-radius:6px; font-family:monospace; font-size:11px;'
+            'padding:8px;'
         )
 
         # ── row container ─────────────────────────────────────────────────────
         self.container = QWidget()
+        self.container.setStyleSheet(
+            'QWidget{background:#111c24; border:1px solid #263946; border-radius:6px;}'
+            'QLabel{border:none; background:transparent;}'
+            'QPushButton{border:none;}'
+        )
         layout = QHBoxLayout(self.container)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(12)
 
         label_col = QVBoxLayout()
         label_col.setSpacing(1)
 
         title = QLabel(step['label'])
-        title.setStyleSheet('color:white; font-size:13px; font-weight:bold;')
+        title.setStyleSheet('color:#f3f7f7; font-size:13px; font-weight:bold;')
         label_col.addWidget(title)
 
         desc = QLabel(step['desc'])
-        desc.setStyleSheet('color:#aaa; font-size:11px;')
+        desc.setStyleSheet('color:#a9b8c4; font-size:11px;')
         label_col.addWidget(desc)
 
         if step.get('note'):
             note = QLabel(step['note'])
-            note.setStyleSheet('color:#888; font-size:10px; font-style:italic;')
+            note.setWordWrap(True)
+            note.setStyleSheet('color:#79909f; font-size:10px; font-style:italic;')
             label_col.addWidget(note)
 
         layout.addLayout(label_col, stretch=1)
@@ -331,7 +409,8 @@ class StepRow(QObject):
         self._status_lbl.setText(text)
         self._status_lbl.setStyleSheet(
             f'color:{colour}; font-size:12px; font-weight:bold;'
-            f'background:#111; border-radius:4px; padding:4px 6px;'
+            f'background:#071016; border:1px solid #22313a;'
+            f'border-radius:4px; padding:4px 6px;'
         )
 
 
@@ -343,8 +422,8 @@ class StartupWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('FruitNinja — Startup Launcher')
-        self.setMinimumSize(820, 700)
-        self.setStyleSheet('background:#1e1e1e; color:white;')
+        self.setMinimumSize(960, 760)
+        self.setStyleSheet('background:#0b1117; color:white;')
 
         self._step_rows    = []
         self._steps_layout = None
@@ -356,49 +435,52 @@ class StartupWindow(QMainWindow):
         root_w = QWidget()
         self.setCentralWidget(root_w)
         root = QVBoxLayout(root_w)
-        root.setSpacing(8)
-        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
 
-        # ── Title row with Real/Sim toggle ───────────────────────────────────
-        title_row = QHBoxLayout()
+        root.addWidget(FruitNinjaBrand('UR3e cutting cell startup launcher'))
 
-        title = QLabel('UR3e Startup Sequence')
-        title.setStyleSheet(
-            'color:white; font-size:18px; font-weight:bold; padding:8px;'
-        )
-        title_row.addWidget(title)
-        title_row.addStretch()
+        # ── Mode row ─────────────────────────────────────────────────────────
+        mode_bar = QGroupBox('Run Mode')
+        mode_bar.setStyleSheet(self._group_style())
+        mode_row = QHBoxLayout(mode_bar)
+        mode_row.setContentsMargins(12, 8, 12, 10)
+        mode_row.setSpacing(10)
 
+        mode_hint = QLabel('Start each process in order. Wait for Step 1 and Step 2 to be ready before continuing.')
+        mode_hint.setStyleSheet('color:#a9b8c4; font-size:12px;')
+        mode_row.addWidget(mode_hint, stretch=1)
         self._mode_label = QLabel('REAL')
         self._mode_label.setStyleSheet(
-            'color:#00cc88; font-size:12px; font-weight:bold; padding-right:6px;'
+            'color:#00cc88; font-size:12px; font-weight:bold;'
+            'background:#071a13; border:1px solid #136b4c; border-radius:4px; padding:5px 10px;'
         )
-        title_row.addWidget(self._mode_label)
+        mode_row.addWidget(self._mode_label)
 
         self._sim_toggle = QPushButton('Switch to Sim')
         self._sim_toggle.setFixedWidth(130)
         self._sim_toggle.setStyleSheet(self._sim_btn_style(active=False))
         self._sim_toggle.clicked.connect(self._toggle_sim)
-        title_row.addWidget(self._sim_toggle)
-
-        title_bar = QWidget()
-        title_bar.setStyleSheet('border-bottom:1px solid #444;')
-        title_bar.setLayout(title_row)
-        root.addWidget(title_bar)
+        mode_row.addWidget(self._sim_toggle)
+        root.addWidget(mode_bar)
 
         self._subtitle = QLabel('Run each step in order. Steps 1 and 2 must be fully ready before continuing.')
         self._subtitle.setAlignment(Qt.AlignCenter)
-        self._subtitle.setStyleSheet('color:#888; font-size:11px; padding-bottom:4px;')
+        self._subtitle.setStyleSheet(
+            'color:#93a6b3; font-size:11px; padding:4px 8px;'
+            'background:#101a22; border:1px solid #243744; border-radius:5px;'
+        )
         root.addWidget(self._subtitle)
 
         # ── Robot IP config ───────────────────────────────────────────────────
         ip_group = QGroupBox('Robot IP Address')
         ip_group.setStyleSheet(self._group_style())
         ip_layout = QHBoxLayout(ip_group)
-        ip_layout.setContentsMargins(10, 8, 10, 8)
+        ip_layout.setContentsMargins(12, 8, 12, 10)
+        ip_layout.setSpacing(8)
 
         ip_label = QLabel('IP:')
-        ip_label.setStyleSheet('color:#ccc; font-size:13px;')
+        ip_label.setStyleSheet('color:#c9d6de; font-size:13px; font-weight:bold;')
         ip_label.setFixedWidth(24)
         ip_layout.addWidget(ip_label)
 
@@ -406,9 +488,9 @@ class StartupWindow(QMainWindow):
         self._ip_input.setFixedWidth(160)
         self._ip_input.setFont(QFont('monospace', 13))
         self._ip_input.setStyleSheet(
-            'background:#2a2a3a; color:#00ddff;'
-            'border:1px solid #555; border-radius:4px;'
-            'padding:5px 10px; font-size:13px;'
+            'background:#08131a; color:#62e6ff;'
+            'border:1px solid #325262; border-radius:5px;'
+            'padding:6px 10px; font-size:13px;'
         )
         self._ip_input.setPlaceholderText('e.g. 192.168.0.194')
         ip_layout.addWidget(self._ip_input)
@@ -416,9 +498,9 @@ class StartupWindow(QMainWindow):
         apply_btn = QPushButton('Apply')
         apply_btn.setFixedWidth(80)
         apply_btn.setStyleSheet(
-            'QPushButton{background:#1a3a5c;color:white;border-radius:4px;'
+            'QPushButton{background:#1c5f87;color:white;border-radius:5px;'
             'padding:6px 10px;font-size:12px;font-weight:bold;}'
-            'QPushButton:hover{background:#2a5a8ccc;}'
+            'QPushButton:hover{background:#2b78a5;}'
         )
         apply_btn.setToolTip('Rebuild step commands with the new IP.\nStop running processes first.')
         apply_btn.clicked.connect(self._apply_ip)
@@ -427,9 +509,9 @@ class StartupWindow(QMainWindow):
         ping_btn = QPushButton('Ping')
         ping_btn.setFixedWidth(70)
         ping_btn.setStyleSheet(
-            'QPushButton{background:#2a2a3a;color:#ccc;border:1px solid #555;border-radius:4px;'
+            'QPushButton{background:#15232d;color:#c9d6de;border:1px solid #325262;border-radius:5px;'
             'padding:6px 10px;font-size:12px;font-weight:bold;}'
-            'QPushButton:hover{background:#3a3a5acc;}'
+            'QPushButton:hover{background:#203442;}'
         )
         ping_btn.setToolTip('Ping the robot IP to check connectivity.')
         ping_btn.clicked.connect(self._ping_ip)
@@ -446,15 +528,16 @@ class StartupWindow(QMainWindow):
         self._steps_group = QGroupBox('Steps')
         self._steps_group.setStyleSheet(self._group_style())
         self._steps_layout = QVBoxLayout(self._steps_group)
-        self._steps_layout.setSpacing(4)
+        self._steps_layout.setSpacing(6)
+        self._steps_layout.setContentsMargins(10, 10, 10, 10)
         root.addWidget(self._steps_group)
 
         # Stop-all button
         stop_all_btn = QPushButton('■  Stop All Running Processes')
         stop_all_btn.setStyleSheet(
-            'QPushButton{background:#5a1a1a;color:white;border-radius:6px;'
+            'QPushButton{background:#7a2020;color:white;border-radius:6px;'
             'padding:10px;font-size:13px;font-weight:bold;}'
-            'QPushButton:hover{background:#7a2a2acc;}'
+            'QPushButton:hover{background:#9a2a2a;}'
         )
         stop_all_btn.clicked.connect(self._stop_all)
         root.addWidget(stop_all_btn)
@@ -563,7 +646,7 @@ class StartupWindow(QMainWindow):
             if i < len(steps) - 1:
                 sep = QWidget()
                 sep.setFixedHeight(1)
-                sep.setStyleSheet('background:#333;')
+                sep.setStyleSheet('background:#263946;')
                 self._steps_layout.addWidget(sep)
 
             # Each step gets its own output tab — named the same as the step label
@@ -604,7 +687,8 @@ class StartupWindow(QMainWindow):
             self._ip_input.setEnabled(False)
             self._mode_label.setText('SIM')
             self._mode_label.setStyleSheet(
-                'color:#e0a000; font-size:12px; font-weight:bold; padding-right:6px;'
+                'color:#ffd166; font-size:12px; font-weight:bold;'
+                'background:#261d05; border:1px solid #9b7414; border-radius:4px; padding:5px 10px;'
             )
             self._sim_toggle.setText('Switch to Real')
             self._sim_toggle.setStyleSheet(self._sim_btn_style(active=True))
@@ -612,7 +696,10 @@ class StartupWindow(QMainWindow):
                 f'SIM MODE — URSim Polyscope at  {SIM_VNC_URL}  |  '
                 'Press Play on "External Control" before Step 1.'
             )
-            self._subtitle.setStyleSheet('color:#e0a000; font-size:11px; padding-bottom:4px;')
+            self._subtitle.setStyleSheet(
+                'color:#ffd166; font-size:11px; padding:4px 8px;'
+                'background:#1e190b; border:1px solid #4f3e14; border-radius:5px;'
+            )
             self._populate_steps(SIM_ROBOT_IP, sim=True)
             self._set_ip_status(f'Sim IP: {SIM_ROBOT_IP}', '#e0a000')
         else:
@@ -621,14 +708,18 @@ class StartupWindow(QMainWindow):
             ip = self._ip_input.text().strip() or DEFAULT_ROBOT_IP
             self._mode_label.setText('REAL')
             self._mode_label.setStyleSheet(
-                'color:#00cc88; font-size:12px; font-weight:bold; padding-right:6px;'
+                'color:#00cc88; font-size:12px; font-weight:bold;'
+                'background:#071a13; border:1px solid #136b4c; border-radius:4px; padding:5px 10px;'
             )
             self._sim_toggle.setText('Switch to Sim')
             self._sim_toggle.setStyleSheet(self._sim_btn_style(active=False))
             self._subtitle.setText(
                 'Run each step in order. Steps 1 and 2 must be fully ready before continuing.'
             )
-            self._subtitle.setStyleSheet('color:#888; font-size:11px; padding-bottom:4px;')
+            self._subtitle.setStyleSheet(
+                'color:#93a6b3; font-size:11px; padding:4px 8px;'
+                'background:#101a22; border:1px solid #243744; border-radius:5px;'
+            )
             self._populate_steps(ip, sim=False)
             self._set_ip_status('', '#888')
 
@@ -636,14 +727,14 @@ class StartupWindow(QMainWindow):
     def _sim_btn_style(active: bool) -> str:
         if active:
             return (
-                'QPushButton{background:#4a3a00;color:#ffcc00;border:1px solid #e0a000;'
-                'border-radius:4px;padding:6px 10px;font-size:12px;font-weight:bold;}'
-                'QPushButton:hover{background:#6a5a00cc;}'
+                'QPushButton{background:#4f3a09;color:#ffdc73;border:1px solid #d49a1d;'
+                'border-radius:5px;padding:6px 10px;font-size:12px;font-weight:bold;}'
+                'QPushButton:hover{background:#654a0d;}'
             )
         return (
-            'QPushButton{background:#1a3a1a;color:#00cc88;border:1px solid #00aa66;'
-            'border-radius:4px;padding:6px 10px;font-size:12px;font-weight:bold;}'
-            'QPushButton:hover{background:#2a5a2acc;}'
+            'QPushButton{background:#113820;color:#66e6aa;border:1px solid #16a36a;'
+            'border-radius:5px;padding:6px 10px;font-size:12px;font-weight:bold;}'
+            'QPushButton:hover{background:#1a4f2e;}'
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -651,9 +742,10 @@ class StartupWindow(QMainWindow):
     @staticmethod
     def _group_style():
         return (
-            'QGroupBox{color:white;font-weight:bold;'
-            'border:1px solid #444;border-radius:4px;margin-top:8px;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:8px;}'
+            'QGroupBox{color:#f5f9fa;font-weight:bold;'
+            'border:1px solid #314652;border-radius:7px;margin-top:10px;'
+            'background:#0f1820;}'
+            'QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}'
         )
 
     def _stop_all(self):
