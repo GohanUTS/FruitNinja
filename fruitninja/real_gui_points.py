@@ -34,10 +34,14 @@ import rclpy.executors
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import MoveGroup, ExecuteTrajectory
 from moveit_msgs.msg import (
     Constraints, JointConstraint, MoveItErrorCodes,
+    OrientationConstraint, PositionConstraint, BoundingVolume,
 )
+from moveit_msgs.srv import GetCartesianPath
+from geometry_msgs.msg import Pose as _GPose, Quaternion as _GQuat
+from shape_msgs.msg import SolidPrimitive as _SolidPrimitive
 
 from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
@@ -79,13 +83,36 @@ JOINT_NAMES = [
 
 JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 'Wrist 3']
 
-HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 0.0]
+HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 360.0]
 
 # Cutting motion: deeper safety-limited dip after reaching the board cell.
 CUT_DIP_LIFT  =  40.0   # degrees added to shoulder_lift_joint (index 1)
 CUT_DIP_ELBOW = -40.0   # degrees added to elbow_joint (index 2)
 
 MOVE_GROUP = 'ur_manipulator'
+
+# ── Cartesian / IK constants ───────────────────────────────────────────────────
+# Board corners in base_link frame (measured on physical robot)
+_BOARD_A1 = (+0.3124, +0.4549, 0.0875)   # col 0,  row 0
+_BOARD_A4 = (+0.3130, +0.3493, 0.0875)   # col 0,  row 3
+_BOARD_N1 = (-0.3124, +0.4549, 0.0875)   # col 13, row 0
+_BOARD_N4 = (-0.3130, +0.3493, 0.0875)   # col 13, row 3
+
+IK_APPROACH_CLEARANCE = 0.10   # metres above board surface for approach
+IK_DIP_DEPTH          = 0.010  # metres below board surface for cut stroke
+IK_TILT_TOLERANCE_DEG = 5.0    # ±degrees allowed pitch/roll from straight-down
+# "Straight down" in base_link: 90° rotation around Y axis (tool0 Z → base_link -Z)
+IK_DOWN_QUAT = _GQuat(x=0.0, y=0.7071068, z=0.0, w=0.7071068)
+
+
+def _board_position(col_idx: int, row_idx: int) -> tuple:
+    """Bilinear interpolation of the 4 board corners → (x, y, z) in base_link."""
+    u = col_idx / 13.0
+    v = row_idx / 3.0
+    x = (1-u)*(1-v)*_BOARD_A1[0] + u*(1-v)*_BOARD_N1[0] + (1-u)*v*_BOARD_A4[0] + u*v*_BOARD_N4[0]
+    y = (1-u)*(1-v)*_BOARD_A1[1] + u*(1-v)*_BOARD_N1[1] + (1-u)*v*_BOARD_A4[1] + u*v*_BOARD_N4[1]
+    z = (1-u)*(1-v)*_BOARD_A1[2] + u*(1-v)*_BOARD_N1[2] + (1-u)*v*_BOARD_A4[2] + u*v*_BOARD_N4[2]
+    return (x, y, z)
 
 
 def _wrap_deg(deg: float) -> float:
@@ -127,8 +154,10 @@ class MoverNode(Node):
     """
     def __init__(self):
         super().__init__('real_gui_points_mover')
-        self._client = ActionClient(self, MoveGroup, '/move_action')
-        self._cancel_flag = False
+        self._client        = ActionClient(self, MoveGroup, '/move_action')
+        self._exec_client   = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
+        self._cartesian_srv = self.create_client(GetCartesianPath, '/compute_cartesian_path')
+        self._cancel_flag   = False
 
     def move_to(self, degrees: list, done_cb, fail_cb, current_degrees: list = None):
         self._cancel_flag = False
@@ -163,8 +192,8 @@ class MoverNode(Node):
             goal.request.goal_constraints.append(self._make_constraints(degrees))
             goal.request.num_planning_attempts = 10
             goal.request.allowed_planning_time = 5.0
-            goal.request.max_velocity_scaling_factor     = 0.3
-            goal.request.max_acceleration_scaling_factor = 0.3
+            goal.request.max_velocity_scaling_factor     = 0.1
+            goal.request.max_acceleration_scaling_factor = 0.1
 
             future = self._client.send_goal_async(goal)
             executor.spin_until_future_complete(future)
@@ -205,6 +234,180 @@ class MoverNode(Node):
 
     def cancel(self):
         self._cancel_flag = True
+
+    # ── IK / Cartesian motion ──────────────────────────────────────────────────
+
+    def move_to_pose_ik(self, x: float, y: float, z: float, done_cb, fail_cb):
+        """Approach (x, y, z) using Cartesian IK: PositionConstraint + orientation cone."""
+        self._cancel_flag = False
+        threading.Thread(
+            target=self._pose_ik_thread,
+            args=(x, y, z, done_cb, fail_cb),
+            daemon=True,
+        ).start()
+
+    def _pose_ik_thread(self, x, y, z, done_cb, fail_cb):
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        try:
+            if not self._client.wait_for_server(timeout_sec=5.0):
+                fail_cb('MoveGroup not available — is MoveIt running?')
+                return
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            goal = MoveGroup.Goal()
+            goal.request.group_name = MOVE_GROUP
+            goal.request.goal_constraints.append(self._make_ik_constraints(x, y, z))
+            goal.request.num_planning_attempts = 15
+            goal.request.allowed_planning_time = 8.0
+            goal.request.max_velocity_scaling_factor     = 0.3
+            goal.request.max_acceleration_scaling_factor = 0.3
+
+            future = self._client.send_goal_async(goal)
+            executor.spin_until_future_complete(future)
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                fail_cb('IK goal rejected by MoveIt')
+                return
+
+            result_future = goal_handle.get_result_async()
+            executor.spin_until_future_complete(result_future)
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            result = result_future.result().result
+            if result.error_code.val == MoveItErrorCodes.SUCCESS:
+                done_cb()
+            else:
+                fail_cb(f'IK move failed (code: {result.error_code.val})')
+        finally:
+            executor.remove_node(self)
+
+    def _make_ik_constraints(self, x: float, y: float, z: float) -> Constraints:
+        """Build a Constraints with a 1cm position sphere + 5° downward orientation cone."""
+        c = Constraints()
+
+        # Position: 1 cm sphere around target in base_link
+        pc = PositionConstraint()
+        pc.header.frame_id = 'base_link'
+        pc.header.stamp = self.get_clock().now().to_msg()
+        pc.link_name = 'tool0'
+        bv = BoundingVolume()
+        sp = _SolidPrimitive()
+        sp.type = _SolidPrimitive.SPHERE
+        sp.dimensions = [0.01]
+        bv.primitives.append(sp)
+        bv_pose = _GPose()
+        bv_pose.position.x = x
+        bv_pose.position.y = y
+        bv_pose.position.z = z
+        bv_pose.orientation.w = 1.0
+        bv.primitive_poses.append(bv_pose)
+        pc.constraint_region = bv
+        pc.weight = 1.0
+        c.position_constraints.append(pc)
+
+        # Orientation: tool pointing straight down ± IK_TILT_TOLERANCE_DEG cone
+        # Yaw (z-axis) is free (π) so the solver can use redundancy to avoid collisions.
+        oc = OrientationConstraint()
+        oc.header.frame_id = 'base_link'
+        oc.header.stamp = self.get_clock().now().to_msg()
+        oc.link_name = 'tool0'
+        oc.orientation = IK_DOWN_QUAT
+        tilt = math.radians(IK_TILT_TOLERANCE_DEG)
+        oc.absolute_x_axis_tolerance = tilt
+        oc.absolute_y_axis_tolerance = tilt
+        oc.absolute_z_axis_tolerance = math.radians(45)  # limited yaw prevents wrist folding into lower arm
+        oc.weight = 1.0
+        c.orientation_constraints.append(oc)
+
+        return c
+
+    def move_cartesian_z(self, x: float, y: float, z_target: float, done_cb, fail_cb):
+        """Drop or raise the tool straight along Z via compute_cartesian_path."""
+        self._cancel_flag = False
+        threading.Thread(
+            target=self._cartesian_z_thread,
+            args=(x, y, z_target, done_cb, fail_cb),
+            daemon=True,
+        ).start()
+
+    def _cartesian_z_thread(self, x, y, z_target, done_cb, fail_cb):
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        try:
+            if not self._cartesian_srv.wait_for_service(timeout_sec=5.0):
+                fail_cb('compute_cartesian_path service unavailable')
+                return
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            req = GetCartesianPath.Request()
+            req.header.frame_id = 'base_link'
+            req.header.stamp = self.get_clock().now().to_msg()
+            req.group_name = MOVE_GROUP
+            req.link_name = 'tool0'
+            req.avoid_collisions = True
+            req.max_step = 0.005       # 5 mm resolution
+            req.jump_threshold = 0.0   # disable jump detection for short Z moves
+
+            wp = _GPose()
+            wp.position.x = x
+            wp.position.y = y
+            wp.position.z = z_target
+            wp.orientation = IK_DOWN_QUAT
+            req.waypoints = [wp]
+
+            future = self._cartesian_srv.call_async(req)
+            executor.spin_until_future_complete(future)
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            resp = future.result()
+            if resp.fraction < 0.9:
+                fail_cb(f'Cartesian path {resp.fraction * 100:.0f}% complete — collision likely')
+                return
+
+            if not self._exec_client.wait_for_server(timeout_sec=5.0):
+                fail_cb('execute_trajectory server unavailable')
+                return
+
+            exec_goal = ExecuteTrajectory.Goal()
+            exec_goal.trajectory = resp.solution
+
+            exec_future = self._exec_client.send_goal_async(exec_goal)
+            executor.spin_until_future_complete(exec_future)
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            exec_handle = exec_future.result()
+            if not exec_handle.accepted:
+                fail_cb('Trajectory execution rejected')
+                return
+
+            result_future = exec_handle.get_result_async()
+            executor.spin_until_future_complete(result_future)
+            if self._cancel_flag:
+                fail_cb('Cancelled')
+                return
+
+            result = result_future.result().result
+            if result.error_code.val == MoveItErrorCodes.SUCCESS:
+                done_cb()
+            else:
+                fail_cb(f'Trajectory execution failed (code: {result.error_code.val})')
+        finally:
+            executor.remove_node(self)
 
 
 # ── Camera worker ─────────────────────────────────────────────────────────────
@@ -422,6 +625,7 @@ class MainWindow(QMainWindow):
         act_layout.setSpacing(8)
 
         self._btn_go    = self._action_btn('▶  Move to Selected', '#1a5c1a', self._go)
+        self._btn_ik    = self._action_btn('⊕  Inverse Movement', '#1a3a5c', self._go_ik)
         self._btn_clear = self._action_btn('✕  Clear', '#3a3a3a', self._clear_selection)
         self._btn_stop  = self._action_btn('⚠  E-STOP  [SPACE]', '#cc0000', self._stop)
         self._btn_stop.setStyleSheet(
@@ -433,6 +637,7 @@ class MainWindow(QMainWindow):
         self._btn_reset = self._action_btn('↺  Reset (Home)', '#4a3a00', self._reset)
 
         act_layout.addWidget(self._btn_go)
+        act_layout.addWidget(self._btn_ik)
         act_layout.addWidget(self._btn_clear)
         act_layout.addWidget(self._btn_stop)
         act_layout.addWidget(self._btn_reset)
@@ -600,6 +805,82 @@ class MainWindow(QMainWindow):
             fail_cb=_on_fail,
             current_degrees=current_degrees,
         )
+
+    # ── Inverse Movement (Cartesian IK) ───────────────────────────────────────
+
+    def _go_ik(self):
+        """
+        Start the IK cut sequence for all selected grid cells.
+
+        Uses Cartesian IK instead of joint-space lookup:
+          - APPROACH : MoveIt IK with PositionConstraint sphere + 5° orientation cone
+          - DIP      : straight-line Z drop via compute_cartesian_path
+          - RECOVER  : straight-line Z rise via compute_cartesian_path
+        Cells are processed left-to-right (A→N), same order as the standard move.
+        """
+        if not self._selected_cells:
+            self._set_status('Toggle at least one cell first', '#e0a000')
+            return
+        if self._moving:
+            self._set_status('Already moving — press Stop first', '#e0a000')
+            return
+        self._moving = True
+        queue = list(self._selected_cells)
+        self._log(f'IK Queue: {" → ".join(queue)}')
+        self._move_next_ik(queue)
+
+    def _move_next_ik(self, queue: list):
+        """
+        Recursive per-cell IK cut loop.
+
+        For each cell:
+          1. APPROACH  move_to_pose_ik(x, y, board_z + 0.10)
+                         MoveIt plans to a 1cm position sphere pointing straight down.
+                         5° pitch/roll tolerance + free yaw lets the solver pick the
+                         best joint config to avoid collisions.
+          2. DIP       move_cartesian_z(x, y, board_z - 0.01)
+                         compute_cartesian_path straight down at 5mm resolution.
+          3. RECOVER   move_cartesian_z(x, y, board_z + 0.10)
+                         straight back up to approach height.
+        Then recurses with queue[1:].
+        """
+        if not queue or self._mover_node._cancel_flag:
+            self._moving = False
+            if not queue:
+                self._status_sig.emit('IK sequence complete', '#00cc00')
+                self._log_sig.emit('IK sequence complete')
+            return
+
+        cell = queue[0]
+        remaining = queue[1:]
+        col_idx = GRID_COLS.index(cell[0])
+        row_idx = GRID_ROWS.index(cell[1])
+        bx, by, bz = _board_position(col_idx, row_idx)
+
+        approach_z = bz + IK_APPROACH_CLEARANCE
+        dip_z      = bz - IK_DIP_DEPTH
+
+        self._status_sig.emit(f'IK → {cell}…  ({len(remaining)} remaining)', '#3a7aff')
+        self._log(f'IK moving to {cell}  ({bx:.3f}, {by:.3f}, {bz:.4f})')
+
+        def _on_arrive():
+            self._log_sig.emit(f'IK reached {cell} — dipping')
+            self._status_sig.emit(f'IK cutting at {cell}…', '#e0a000')
+            self._mover_node.move_cartesian_z(bx, by, dip_z, done_cb=_on_dip, fail_cb=_on_fail)
+
+        def _on_dip():
+            self._log_sig.emit(f'IK cut at {cell} — recovering')
+            self._mover_node.move_cartesian_z(bx, by, approach_z, done_cb=_on_recover, fail_cb=_on_fail)
+
+        def _on_recover():
+            self._move_next_ik(remaining)
+
+        def _on_fail(msg):
+            self._status_sig.emit(f'IK failed at {cell}: {msg}', '#ff4444')
+            self._log_sig.emit(f'IK FAIL at {cell}: {msg}')
+            setattr(self, '_moving', False)
+
+        self._mover_node.move_to_pose_ik(bx, by, approach_z, done_cb=_on_arrive, fail_cb=_on_fail)
 
     def _current_joint_degrees(self) -> list:
         return [math.degrees(self._current_joints_rad[name]) for name in JOINT_NAMES]
