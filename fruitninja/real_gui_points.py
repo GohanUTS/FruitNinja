@@ -260,10 +260,11 @@ class MoverNode(Node):
             goal = MoveGroup.Goal()
             goal.request.group_name = MOVE_GROUP
             goal.request.goal_constraints.append(self._make_ik_constraints(x, y, z))
-            goal.request.num_planning_attempts = 15
-            goal.request.allowed_planning_time = 8.0
-            goal.request.max_velocity_scaling_factor     = 0.3
-            goal.request.max_acceleration_scaling_factor = 0.3
+            goal.request.path_constraints = self._make_ik_path_constraints()
+            goal.request.num_planning_attempts = 20
+            goal.request.allowed_planning_time = 10.0
+            goal.request.max_velocity_scaling_factor     = 0.1
+            goal.request.max_acceleration_scaling_factor = 0.1
 
             future = self._client.send_goal_async(goal)
             executor.spin_until_future_complete(future)
@@ -328,6 +329,23 @@ class MoverNode(Node):
         oc.weight = 1.0
         c.orientation_constraints.append(oc)
 
+        return c
+
+    def _make_ik_path_constraints(self) -> Constraints:
+        """
+        Minimal path constraint: restrict only wrist_1 to the range seen across
+        all 4 measured board corners (-94° to -56°) plus safety margin.
+        This specifically prevents the C403A0 clamping stop (tool flange < 2.8 cm
+        from lower arm) without over-constraining the planner on other joints.
+        """
+        c = Constraints()
+        jc = JointConstraint()
+        jc.joint_name      = 'wrist_1_joint'
+        jc.position        = math.radians(-75.0)   # centre of measured range
+        jc.tolerance_above = math.radians(45.0)    # → −30°
+        jc.tolerance_below = math.radians(45.0)    # → −120°
+        jc.weight          = 1.0
+        c.joint_constraints.append(jc)
         return c
 
     def move_cartesian_z(self, x: float, y: float, z_target: float, done_cb, fail_cb):
