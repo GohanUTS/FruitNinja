@@ -81,9 +81,9 @@ JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 
 
 HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 0.0]
 
-# Cutting motion: safety-limited dip after reaching the board cell.
-CUT_DIP_LIFT  =  22.0   # degrees added to shoulder_lift_joint (index 1)
-CUT_DIP_ELBOW = -22.0   # degrees added to elbow_joint (index 2)
+# Cutting motion: deeper safety-limited dip after reaching the board cell.
+CUT_DIP_LIFT  =  40.0   # degrees added to shoulder_lift_joint (index 1)
+CUT_DIP_ELBOW = -40.0   # degrees added to elbow_joint (index 2)
 
 MOVE_GROUP = 'ur_manipulator'
 
