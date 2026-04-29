@@ -41,14 +41,6 @@ from moveit_msgs.msg import (
 
 from fruitninja.grid_mover import cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
-# ── RL model path ─────────────────────────────────────────────────────────────
-_RL_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'rl')
-)
-_RL_MODEL_PATH = os.path.join(_RL_DIR, 'logs', 'best_model', 'best_model')
-if _RL_DIR not in sys.path:
-    sys.path.insert(0, _RL_DIR)
-
 import cv2
 import numpy as np
 
@@ -96,6 +88,10 @@ CUT_DIP_ELBOW = -30.0   # degrees added to elbow_joint (index 2)
 MOVE_GROUP = 'ur_manipulator'
 
 
+def _wrap_deg(deg: float) -> float:
+    return ((deg + 180.0) % 360.0) - 180.0
+
+
 # ── ROS2 nodes ─────────────────────────────────────────────────────────────────
 # Three separate ROS 2 nodes are created so their executors don't block each other.
 # They are all started once in MainWindow._start_ros() and run as daemon threads.
@@ -121,7 +117,7 @@ class MoverNode(Node):
     """
     Sends joint-space motion goals to MoveIt via the /move_action action server.
 
-    move_to(degrees, done_cb, fail_cb)
+    move_to(degrees, done_cb, fail_cb, current_degrees=None)
       - Spawns a background thread so the GUI never freezes during planning.
       - Converts the target joint angles (degrees) into a MoveIt Constraints message.
       - Velocity and acceleration are capped at 30% for safety.
@@ -134,13 +130,22 @@ class MoverNode(Node):
         self._client = ActionClient(self, MoveGroup, '/move_action')
         self._cancel_flag = False
 
-    def move_to(self, degrees: list, done_cb, fail_cb):
+    def move_to(self, degrees: list, done_cb, fail_cb, current_degrees: list = None):
         self._cancel_flag = False
+        target_degrees = self._nearest_equivalent_target(degrees, current_degrees)
         threading.Thread(
             target=self._move_thread,
-            args=(degrees, done_cb, fail_cb),
+            args=(target_degrees, done_cb, fail_cb),
             daemon=True,
         ).start()
+
+    def _nearest_equivalent_target(self, degrees: list, current_degrees: list = None) -> list:
+        if current_degrees is None:
+            return [_wrap_deg(deg) for deg in degrees]
+        return [
+            current + _wrap_deg(target - current)
+            for target, current in zip(degrees, current_degrees)
+        ]
 
     def _move_thread(self, degrees, done_cb, fail_cb):
         executor = rclpy.executors.SingleThreadedExecutor()
@@ -308,10 +313,6 @@ class MainWindow(QMainWindow):
         self._moving = False
         self._cell_btns = {}
         self._camera = CameraWorker()
-
-        # RL model (loaded lazily on first use)
-        self._rl_model = None
-        self._rl_env   = None
         self._current_joints_rad = {n: 0.0 for n in JOINT_NAMES}
 
         # Manual grid state
@@ -421,7 +422,6 @@ class MainWindow(QMainWindow):
         act_layout.setSpacing(8)
 
         self._btn_go    = self._action_btn('▶  Move to Selected', '#1a5c1a', self._go)
-        self._btn_rl    = self._action_btn('🤖  RL Move', '#1a3a5c', self._rl_go)
         self._btn_clear = self._action_btn('✕  Clear', '#3a3a3a', self._clear_selection)
         self._btn_stop  = self._action_btn('⚠  E-STOP  [SPACE]', '#cc0000', self._stop)
         self._btn_stop.setStyleSheet(
@@ -433,7 +433,6 @@ class MainWindow(QMainWindow):
         self._btn_reset = self._action_btn('↺  Reset (Home)', '#4a3a00', self._reset)
 
         act_layout.addWidget(self._btn_go)
-        act_layout.addWidget(self._btn_rl)
         act_layout.addWidget(self._btn_clear)
         act_layout.addWidget(self._btn_stop)
         act_layout.addWidget(self._btn_reset)
@@ -561,6 +560,7 @@ class MainWindow(QMainWindow):
         cell = queue[0]
         remaining = queue[1:]
         degrees = cell_to_joints_deg(cell)
+        current_degrees = self._current_joint_degrees()
 
         # Dip position: slightly lower the end-effector for cutting motion
         dip_degrees = list(degrees)
@@ -577,6 +577,7 @@ class MainWindow(QMainWindow):
                 dip_degrees,
                 done_cb=_on_dip,
                 fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
             )
 
         def _on_dip():
@@ -585,6 +586,7 @@ class MainWindow(QMainWindow):
                 degrees,
                 done_cb=lambda: self._move_next(remaining),
                 fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
             )
 
         def _on_fail(msg):
@@ -592,7 +594,15 @@ class MainWindow(QMainWindow):
             self._log_sig.emit(f'FAIL at {cell}: {msg}')
             setattr(self, '_moving', False)
 
-        self._mover_node.move_to(degrees, done_cb=_on_arrive, fail_cb=_on_fail)
+        self._mover_node.move_to(
+            degrees,
+            done_cb=_on_arrive,
+            fail_cb=_on_fail,
+            current_degrees=current_degrees,
+        )
+
+    def _current_joint_degrees(self) -> list:
+        return [math.degrees(self._current_joints_rad[name]) for name in JOINT_NAMES]
 
     def _cut_detected_fruit(self):
         """
@@ -667,112 +677,8 @@ class MainWindow(QMainWindow):
                 self._status_sig.emit(f'Reset failed: {msg}', '#ff4444'),
                 setattr(self, '_moving', False),
             ),
+            current_degrees=self._current_joint_degrees(),
         )
-
-    # ── RL model ──────────────────────────────────────────────────────────────
-
-    def _load_rl_model(self) -> bool:
-        """Load SAC model and env on first use. Returns True on success."""
-        try:
-            from stable_baselines3 import SAC
-            from envs.ur3e_grid_env import UR3eGridEnv
-            self._status_sig.emit('Loading RL model…', '#e0a000')
-            self._rl_model = SAC.load(_RL_MODEL_PATH)
-            self._rl_env   = UR3eGridEnv()
-            self._log_sig.emit(f'RL model loaded from {_RL_MODEL_PATH}.zip')
-            return True
-        except Exception as e:
-            self._log_sig.emit(f'RL model load failed: {e}')
-            self._status_sig.emit(f'RL load failed: {e}', '#ff4444')
-            return False
-
-    def _rl_go(self):
-        if not self._selected_cells:
-            self._set_status('Toggle at least one cell first', '#e0a000')
-            return
-        if self._moving:
-            self._set_status('Already moving — press Stop first', '#e0a000')
-            return
-        if self._rl_model is None:
-            if not self._load_rl_model():
-                return
-        self._moving = True
-        queue = list(self._selected_cells)
-        self._log(f'RL queue: {" → ".join(queue)}')
-        threading.Thread(
-            target=self._rl_move_thread, args=(queue,), daemon=True
-        ).start()
-
-    def _rl_move_thread(self, queue: list):
-        from envs.ur3e_grid_env import cell_centre
-        import numpy as np
-
-        current_q = np.array(
-            [self._current_joints_rad.get(n, 0.0) for n in JOINT_NAMES],
-            dtype=np.float32,
-        )
-
-        for cell in queue:
-            if self._mover_node._cancel_flag:
-                break
-
-            col = GRID_COLS.index(cell[0])
-            row = GRID_ROWS.index(cell[1])
-            target = cell_centre(col, row)
-
-            self._status_sig.emit(f'RL: simulating path to {cell}…', '#3a7aff')
-
-            # Initialise env from current real joint state
-            self._rl_env.reset()
-            self._rl_env._q      = current_q.copy()
-            self._rl_env._q_dot  = np.zeros(6, dtype=np.float32)
-            self._rl_env._prev_q_dot = np.zeros(6, dtype=np.float32)
-            self._rl_env._target = target.astype(np.float32)
-            self._rl_env._step_n = 0
-            obs = self._rl_env._get_obs()
-
-            # Run policy in simulation to find target joint config
-            done = False
-            while not done:
-                action, _ = self._rl_model.predict(obs, deterministic=True)
-                obs, _, terminated, truncated, info = self._rl_env.step(action)
-                done = terminated or truncated
-
-            dist_mm = info['distance_m'] * 1000
-            self._log_sig.emit(
-                f'RL sim: {cell} done in {self._rl_env._step_n} steps '
-                f'— sim dist {dist_mm:.1f} mm'
-            )
-
-            # Send final simulated joint config to real robot via MoveIt
-            final_deg = [math.degrees(float(q)) for q in self._rl_env._q]
-            done_evt = threading.Event()
-            result   = [None]
-
-            def _done(r=result, e=done_evt):
-                r[0] = 'ok'; e.set()
-
-            def _fail(msg, r=result, e=done_evt):
-                r[0] = msg; e.set()
-
-            self._status_sig.emit(f'RL: executing {cell} on robot…', '#3a7aff')
-            self._mover_node.move_to(final_deg, _done, _fail)
-            done_evt.wait()
-
-            if result[0] != 'ok':
-                self._status_sig.emit(
-                    f'RL move failed at {cell}: {result[0]}', '#ff4444'
-                )
-                self._log_sig.emit(f'RL FAIL at {cell}: {result[0]}')
-                break
-
-            current_q = self._rl_env._q.copy()
-            self._log_sig.emit(f'RL: robot reached {cell}')
-
-        self._moving = False
-        if not self._mover_node._cancel_flag:
-            self._status_sig.emit('RL sequence complete', '#00cc00')
-            self._log_sig.emit('RL move sequence complete')
 
     def _update_joint_display(self, joints: dict):
         for jname, lbl in self._joint_labels.items():

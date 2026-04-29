@@ -4,11 +4,8 @@ FruitNinja Grid Mover
 =====================
 Moves the UR3e to any cell in a 14×4 grid (A1–N4).
 
-The grid is defined by 4 measured corner positions:
-  A1 (col=0, row=0) — far-left
-  A4 (col=0, row=3) — near-left
-  N1 (col=13, row=0) — far-right
-  N4 (col=13, row=3) — near-right
+The grid is defined by 4 measured corner positions. The robot-side mapping
+mirrors the measured columns so A starts on the operator-left side of the board.
 
 All intermediate cells are computed via bilinear interpolation in joint space.
 
@@ -49,15 +46,57 @@ GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N
 GRID_ROWS = ['1', '2', '3', '4']
 
 # Measured corner joint angles in degrees [pan, lift, elbow, w1, w2, w3]
-# u=0 → column A,  u=1 → column N
+# These were captured with the physical left/right board sides reversed relative
+# to the GUI labels, so cell_to_joints_deg mirrors u before interpolation.
+# raw u=0 → original A side,  raw u=1 → original N side
 # v=0 → row 1,     v=1 → row 4
 CORNER_A1 = [-47.63,  -174.40,   -1.88,  -94.15,  92.29, 353.57]  # u=0, v=0
 CORNER_A4 = [-32.58,  -133.07,  -74.35,  -55.93,  92.23,   8.03]  # u=0, v=1
 CORNER_N1 = [-110.86, -171.95,   -8.95,  -91.13,  90.68, 290.33]  # u=1, v=0
 CORNER_N4 = [-115.72, -140.00,  -71.39,  -60.67,  90.44, 285.49]  # u=1, v=1
 
+MIRROR_GRID_COLUMNS = True
+REVERSE_ROWS_FROM_ROW_1 = True
+
 
 # ── Interpolation ──────────────────────────────────────────────────────────────
+
+WRAPPED_JOINT_INDEXES = {5}  # wrist_3_joint; calibration may cross 0/360 degrees
+
+
+def _wrap_deg(deg: float) -> float:
+    """Return the same revolute-joint angle in the [-180, 180) range."""
+    return ((deg + 180.0) % 360.0) - 180.0
+
+
+def _nearest_equivalent_deg(deg: float, reference: float) -> float:
+    """Return deg +/- 360 so it sits closest to reference."""
+    return reference + _wrap_deg(deg - reference)
+
+
+def _bilinear(values: list, u: float, v: float) -> float:
+    return (
+        (1 - u) * (1 - v) * values[0]
+        + u       * (1 - v) * values[1]
+        + (1 - u) * v       * values[2]
+        + u       * v       * values[3]
+    )
+
+
+def _interpolate_joint_deg(index: int, u: float, v: float) -> float:
+    values = [
+        CORNER_A1[index],
+        CORNER_N1[index],
+        CORNER_A4[index],
+        CORNER_N4[index],
+    ]
+
+    if index in WRAPPED_JOINT_INDEXES:
+        reference = values[0]
+        values = [_nearest_equivalent_deg(value, reference) for value in values]
+        return _wrap_deg(_bilinear(values, u, v))
+
+    return _bilinear(values, u, v)
 
 def cell_to_joints_deg(cell: str) -> list:
     """
@@ -78,16 +117,14 @@ def cell_to_joints_deg(cell: str) -> list:
     col_idx = GRID_COLS.index(col_char)   # 0 … 13
     row_idx = GRID_ROWS.index(row_char)   # 0 … 3
 
-    u = col_idx / (len(GRID_COLS) - 1)   # 0.0 → 1.0  (A → N)
-    v = row_idx / (len(GRID_ROWS) - 1)   # 0.0 → 1.0  (row1 → row4)
+    u = col_idx / (len(GRID_COLS) - 1)   # 0.0 → 1.0  (A → N labels)
+    if MIRROR_GRID_COLUMNS:
+        u = 1.0 - u
+    v = row_idx / (len(GRID_ROWS) - 1)   # 0.0 → 1.0  (row1 → row4 labels)
+    if REVERSE_ROWS_FROM_ROW_1:
+        v = -v
 
-    return [
-        (1 - u) * (1 - v) * CORNER_A1[i]
-        + u       * (1 - v) * CORNER_N1[i]
-        + (1 - u) * v       * CORNER_A4[i]
-        + u       * v       * CORNER_N4[i]
-        for i in range(6)
-    ]
+    return [_interpolate_joint_deg(i, u, v) for i in range(6)]
 
 
 def _make_joint_goal(degrees: list) -> Constraints:
@@ -95,7 +132,7 @@ def _make_joint_goal(degrees: list) -> Constraints:
     for name, deg in zip(JOINT_NAMES, degrees):
         jc = JointConstraint()
         jc.joint_name      = name
-        jc.position        = math.radians(deg)
+        jc.position        = math.radians(_wrap_deg(deg))
         jc.tolerance_above = 0.01
         jc.tolerance_below = 0.01
         jc.weight          = 1.0

@@ -31,8 +31,6 @@ setup(
             'grid_mover = fruitninja.grid_mover:main',
             'real_gui_points = fruitninja.real_gui_points:main',
             'startup_gui = fruitninja.startup_gui:main',
-            'vision_node = fruitninja.vision_node:main',
-            'rl_mover_node = fruitninja.rl_mover_node:main',
         ],
     },
 )

@@ -132,20 +132,6 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'oneshot': True,
             'note':    'One-shot command — completes on its own.',
         },
-        {
-            'label':   'Step 6 — Vision Node',
-            'desc':    'AI fruit detection: YOLOv8 segmentation + depth → cell mapping',
-            'cmd':     SOURCE + 'ros2 run fruitninja vision_node',
-            'oneshot': False,
-            'note':    'Publishes /fruit_target and /estop. Start after Step 4 GUI is running.',
-        },
-        {
-            'label':   'Step 7 — RL Mover',
-            'desc':    'SAC policy inference node: replaces MoveIt with learned trajectory control',
-            'cmd':     SOURCE + 'ros2 run fruitninja rl_mover_node',
-            'oneshot': False,
-            'note':    'Validate in URSim at 10% velocity scaling before enabling on real robot. Requires sac_fruitninja.zip.',
-        },
     ]
     return steps
 
