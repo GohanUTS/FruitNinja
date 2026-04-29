@@ -4,8 +4,8 @@ FruitNinja Grid Mover
 =====================
 Moves the UR3e to any cell in a 14×4 grid (A1–N4).
 
-The grid is defined by 4 measured corner positions. The robot-side mapping
-mirrors the measured columns so A starts on the operator-left side of the board.
+The grid is defined by measured corner positions and cropped to the visible
+cutting-board rectangle so targets stay on the board instead of the trolley.
 
 All intermediate cells are computed via bilinear interpolation in joint space.
 
@@ -56,7 +56,14 @@ CORNER_N1 = [-110.86, -171.95,   -8.95,  -91.13,  90.68, 290.33]  # u=1, v=0
 CORNER_N4 = [-115.72, -140.00,  -71.39,  -60.67,  90.44, 285.49]  # u=1, v=1
 
 MIRROR_GRID_COLUMNS = True
-REVERSE_ROWS_FROM_ROW_1 = True
+
+# Use an inset of the measured full-table grid. Columns stay inset from the
+# trolley frame, while rows use the full calibrated board depth.
+BOARD_U_MIN = 0.14
+BOARD_U_MAX = 0.86
+BOARD_V_MIN = 0.00
+BOARD_V_MAX = 1.00
+MIRROR_GRID_ROWS = True
 
 
 # ── Interpolation ──────────────────────────────────────────────────────────────
@@ -98,6 +105,10 @@ def _interpolate_joint_deg(index: int, u: float, v: float) -> float:
 
     return _bilinear(values, u, v)
 
+
+def _remap_unit(value: float, low: float, high: float) -> float:
+    return low + value * (high - low)
+
 def cell_to_joints_deg(cell: str) -> list:
     """
     Bilinear interpolation across the 4 measured corners.
@@ -121,8 +132,10 @@ def cell_to_joints_deg(cell: str) -> list:
     if MIRROR_GRID_COLUMNS:
         u = 1.0 - u
     v = row_idx / (len(GRID_ROWS) - 1)   # 0.0 → 1.0  (row1 → row4 labels)
-    if REVERSE_ROWS_FROM_ROW_1:
-        v = -v
+    if MIRROR_GRID_ROWS:
+        v = 1.0 - v
+    u = _remap_unit(u, BOARD_U_MIN, BOARD_U_MAX)
+    v = _remap_unit(v, BOARD_V_MIN, BOARD_V_MAX)
 
     return [_interpolate_joint_deg(i, u, v) for i in range(6)]
 
