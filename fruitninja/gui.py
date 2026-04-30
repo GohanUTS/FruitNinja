@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout, QGridLayout,
     QPushButton, QLabel, QGroupBox, QTextEdit,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QComboBox,
+    QLineEdit, QComboBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QBrush, QColor, QFont
@@ -436,7 +436,7 @@ class MainWindow(QMainWindow):
         self._btn_build      = self._btn('🔨  Rebuild',          '#1e4a7a', self._rebuild)
         self._btn_launch_sim = self._btn('🖥   Launch Sim',       '#1e5c1e', self._launch_sim)
         self._btn_launch_real= self._btn('🤖  Connect Real UR3e','#5c3a1e', self._launch_real)
-        self._btn_run        = self._btn('▶   Start Cuts',        '#6a1e1e', self._run)
+        self._btn_trace      = self._btn('⬡   Trace Grid',        '#2a5a2a', self._trace_grid)
         self._btn_move_point = self._btn('⊕   Move to Point',     '#1a4a5a', self._move_to_point)
         self._btn_stop       = self._btn('■   Stop All',          '#444444', self._stop)
         self._btn_reset      = self._btn('↺   Reset',             '#4a3a00', self._reset)
@@ -446,52 +446,10 @@ class MainWindow(QMainWindow):
         self._status.setAlignment(Qt.AlignCenter)
         self._status.setStyleSheet('color:#aaa; font-size:12px;')
 
-        # ── cut parameters ────────────────────────────────────────────────────
-        param_group = self._group('Cut Parameters')
-        pl = param_group.layout()
-        pl.setSpacing(6)
-
-        SPIN_STYLE = 'background:#333; color:white; font-size:12px; padding:2px;'
-
-        def _row(label, widget):
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            lbl = QLabel(label)
-            lbl.setFixedWidth(78)
-            lbl.setStyleSheet('color:#ccc; font-size:11px;')
-            widget.setFixedWidth(90)
-            row.addWidget(lbl)
-            row.addWidget(widget)
-            row.addStretch()
-            pl.addLayout(row)
-
-        self._spin_cuts = QSpinBox()
-        self._spin_cuts.setRange(1, 30)
-        self._spin_cuts.setValue(5)
-        self._spin_cuts.setStyleSheet(SPIN_STYLE)
-        _row('Num cuts:', self._spin_cuts)
-
-        self._spin_centre = QDoubleSpinBox()
-        self._spin_centre.setRange(-90, 90)
-        self._spin_centre.setValue(-13.0)
-        self._spin_centre.setSuffix('°')
-        self._spin_centre.setDecimals(1)
-        self._spin_centre.setStyleSheet(SPIN_STYLE)
-        _row('Centre pan:', self._spin_centre)
-
-        self._spin_range = QDoubleSpinBox()
-        self._spin_range.setRange(1, 90)
-        self._spin_range.setValue(28.0)
-        self._spin_range.setSuffix('°')
-        self._spin_range.setDecimals(1)
-        self._spin_range.setStyleSheet(SPIN_STYLE)
-        _row('± Range:', self._spin_range)
-
         for w in (self._btn_build,
                   self._btn_launch_sim, self._btn_launch_real,
-                  self._btn_run, self._btn_move_point, self._btn_stop,
-                  self._btn_reset, self._btn_shutdown,
-                  param_group):
+                  self._btn_trace, self._btn_move_point, self._btn_stop,
+                  self._btn_reset, self._btn_shutdown):
             cl.addWidget(w)
         cl.addStretch()
         cl.addWidget(self._status)
@@ -634,18 +592,12 @@ class MainWindow(QMainWindow):
         )
         self._status_set(f' Real robot {ip}', '#e07000')
 
-    def _run(self):
-        n  = self._spin_cuts.value()
-        c  = self._spin_centre.value()
-        hr = self._spin_range.value()
-        self._status_set('▶ Cutting…', '#ff5555')
+    def _trace_grid(self):
+        self._status_set('⬡ Tracing grid corners…', '#2a9a2a')
         self._shell(
-            'movement',
-            f'{self._ROS} && ros2 run fruitninja movement'
-            f' --num-cuts {n}'
-            f' --pan-centre {c}'
-            f' --pan-half-range {hr}',
-            done_msg='✓ Sequence complete',
+            'grid_move',
+            f'{self._ROS} && ros2 run fruitninja grid_mover --trace',
+            done_msg='✓ Trace complete',
         )
 
     def _move_to_point(self):
