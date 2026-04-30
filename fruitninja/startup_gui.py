@@ -130,7 +130,8 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
                 "ros2 service call /controller_manager/switch_controller "
                 "controller_manager_msgs/srv/SwitchController "
                 "\"{activate_controllers: ['scaled_joint_trajectory_controller'], "
-                "deactivate_controllers: ['joint_trajectory_controller'], strictness: 2}\""
+                "deactivate_controllers: ['joint_trajectory_controller'], "
+                "strictness: 1, activate_asap: true, timeout: {sec: 5, nanosec: 0}}\""
             ),
             'oneshot': True,
             'note':    'One-shot command — completes on its own.',

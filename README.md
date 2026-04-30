@@ -2,7 +2,7 @@
 
 Autonomous and operator-guided fruit cutting system using a Universal Robots UR3e arm,
 ROS 2 Humble, and MoveIt 2. The operator selects grid cells on a cutting board via a GUI,
-and the robot executes approach → dip → recover cut motions at each cell. A camera feed
+and the robot moves through fixed calibrated joint poses for each cell. A camera feed
 with manual grid overlay detects red fruit in real time and can drive the arm automatically.
 
 ---
@@ -33,7 +33,7 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 │                  Main Operator GUI (Step 4)                   │
 │                                                              │
 │  JointStateNode  → subscribes /joint_states                  │
-│  MoverNode       → sends goals to /move_action               │
+│  MoverNode       → sends timed joint trajectories            │
 │  CameraWorker    → captures frames (webcam / RealSense)      │
 │  MainWindow      → PyQt5 UI, grid selection, cut control     │
 └──────────────────────────────────────────────────────────────┘
@@ -43,8 +43,8 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 │  planning_scene.py   │    │  grid_mover.py                   │
 │  (Step 3)            │    │  (imported by real_gui_points)   │
 │                      │    │                                  │
-│  Publishes workcell  │    │  Lookup table: cell name (A1–N4) │
-│  collision objects   │    │  → 6 joint angles in degrees     │
+│  Publishes workcell  │    │  Fixed grid: cell name (A1–N4)  │
+│  collision objects   │    │  → tool pose + joint angles      │
 │  to MoveIt           │    │                                  │
 └──────────────────────┘    └──────────────────────────────────┘
 ```
@@ -58,7 +58,7 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 | `startup_gui.py` | Launcher GUI — runs each ROS process as an embedded QProcess with live output tabs |
 | `real_gui_points.py` | Main operator GUI — grid cell selection, camera feed, cut execution |
 | `planning_scene.py` | Publishes the workcell URDF collision objects (trolley, walls) to MoveIt |
-| `grid_mover.py` | Maps grid cell names (A1–N4, 14 columns × 4 rows) to pre-computed joint angles |
+| `grid_mover.py` | Maps grid cell names (A1–N4, 14 columns × 4 rows) to calibrated tool positions and interpolated joint angles |
 | `colour_detection.py` | OpenCV HSV colour detection + blue-marker grid overlay (standalone util) |
 | `movement.py` | Low-level MoveIt motion helpers used by older GUI scripts |
 | `gui.py` | Legacy simulation GUI |
@@ -67,16 +67,17 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 
 ## How the Cut Motion Works
 
-Each cell cut is a 3-step MoveIt sequence executed by `MoverNode`:
+Each cell cut is a 3-step joint-space trajectory sequence executed by `MoverNode`:
 
 ```
-1. Approach  →  move_to(degrees)           arm arrives at cell pose above board
-2. Dip       →  move_to(dip_degrees)       shoulder +30°, elbow -30° → end-effector drives down
-3. Recover   →  move_to(degrees)           arm lifts back to approach pose
+1. Approach  →  move_to(approach_degrees)  shoulder lift is 11° above the grid pose
+2. Cut       →  move_to(grid_degrees)      arm moves to the fixed calibrated pose
+3. Recover   →  move_to(approach_degrees)  arm lifts back above the grid pose
 ```
 
-The next cell in the queue starts after recover completes. All moves run at 30% velocity and
-acceleration (`max_velocity_scaling_factor = 0.3`).
+The next cell in the queue starts after recover completes. The GUI sends timed
+joint trajectories directly to the scaled controller; it does not send Cartesian
+position goals or IK targets.
 
 **Cut Detected Fruit** button: builds the queue from camera detections and runs the same loop.
 
@@ -100,7 +101,7 @@ Detection uses OpenCV HSV masking (`H: 0–10 and 170–180, S ≥ 100, V ≥ 80
 | Topic / Service / Action | Direction | Used by |
 |--------------------------|-----------|---------|
 | `/joint_states` | subscribe | `JointStateNode` — live angle display |
-| `/move_action` | action client | `MoverNode` — sends MoveGroup goals |
+| `/scaled_joint_trajectory_controller/follow_joint_trajectory` | action client | `MoverNode` — sends timed joint trajectories |
 | `/planning_scene` | publish | `planning_scene.py` — workcell collision objects |
 | `/controller_manager/switch_controller` | service call | Step 5 — activates scaled controller |
 

@@ -2,9 +2,9 @@
 
 ## Overview
 
-The robot is a **UR3e** arm controlled through **ROS 2 + MoveIt**. All motion
-goes through the MoveIt `/move_action` action server, which handles collision
-avoidance, path planning and trajectory execution.
+The robot is a **UR3e** arm controlled through ROS 2. The main GUI sends fixed
+joint trajectories directly to the active scaled trajectory controller. MoveIt
+is still launched for robot state, RViz, and planning scene visibility.
 
 The cutting board is a **14 × 4 grid** of named cells (columns A–N, rows 1–4).
 Every movement targets a specific cell.
@@ -34,16 +34,17 @@ unless stated otherwise.
 - **+Y** → away from the robot, toward the cutting board
 - **+Z** → upward
 
-The cutting board corners (measured physically):
+The cutting board corners are the fixed UR teach-pendant calibration points from
+the four photos:
 
 | Corner | col | row | x (m)   | y (m)   | z (m)  |
 |--------|-----|-----|---------|---------|--------|
-| A1     | 0   | 0   | +0.3124 | +0.4549 | 0.0875 |
-| A4     | 0   | 3   | +0.3130 | +0.3493 | 0.0875 |
-| N1     | 13  | 0   | −0.3124 | +0.4549 | 0.0875 |
-| N4     | 13  | 3   | −0.3130 | +0.3493 | 0.0875 |
+| A1     | 0   | 0   | −0.25322 | −0.30822 | −0.37047 |
+| A4     | 0   | 3   | −0.25440 | −0.43063 | −0.36707 |
+| N1     | 13  | 0   | +0.24152 | −0.31635 | −0.36815 |
+| N4     | 13  | 3   | +0.24024 | −0.44040 | −0.36745 |
 
-Board surface is at **z = 0.0875 m**.
+Z is interpolated across the four measured corner heights.
 
 ---
 
@@ -51,31 +52,30 @@ Board surface is at **z = 0.0875 m**.
 
 **File:** `fruitninja/grid_mover.py`
 
-Converts a cell label (e.g. `"C2"`) to 6 joint angles in degrees using
-**bilinear interpolation in joint space** across 4 measured corner poses.
+Converts a cell label (e.g. `"C2"`) to fixed joint angles using
+**bilinear interpolation** across 4 measured corner joint poses. The matching
+photographed tool positions are kept for logging/checking through
+`cell_to_pose()`, but movement commands use `cell_to_joints_deg()`.
 
 ### Measured corner joint angles (degrees)
 
 | Corner | pan    | lift    | elbow  | wrist1  | wrist2 | wrist3 |
 |--------|--------|---------|--------|---------|--------|--------|
-| A1     | −47.63 | −174.40 | −1.88  | −94.15  | 92.29  | 353.57 |
-| A4     | −32.58 | −133.07 | −74.35 | −55.93  | 92.23  | 8.03   |
-| N1     | −110.86| −171.95 | −8.95  | −91.13  | 90.68  | 290.33 |
-| N4     | −115.72| −140.00 | −71.39 | −60.67  | 90.44  | 285.49 |
+| A1     | 30.42  | −46.19 | 98.65  | −138.12 | −87.00 | 31.65  |
+| A4     | 43.35  | −27.50 | 56.58  | −115.76 | −86.63 | 42.26  |
+| N1     | 107.42 | −46.70 | 104.71 | −152.19 | −87.90 | 108.96 |
+| N4     | 101.90 | −28.80 | 61.76  | −124.25 | −83.95 | 101.79 |
 
 ### Interpolation steps
 
 1. Convert column letter → `col_idx` (0–13), row number → `row_idx` (0–3)
-2. Compute `u = col_idx / 13` (0 = A, 1 = N) — then **mirror**: `u = 1 - u`
-3. Compute `v = row_idx / 3`  (0 = row1, 1 = row4) — then **mirror**: `v = 1 - v`
-4. Remap into board inset: `u ∈ [0.14, 0.86]`, `v ∈ [-0.035, 1.035]`
-5. Bilinear interpolate each of the 6 joints independently
-
-The mirroring and inset were calibrated to keep the arm on the board surface
-and away from the trolley frame edges. The slightly wider `v` span gives the
-four row positions more separation without changing the left/right column inset.
+2. Compute `u = col_idx / 13` (0 = A, 1 = N)
+3. Compute `v = row_idx / 3`  (0 = row1, 1 = row4)
+4. Interpolate the top edge A1→N1 and bottom edge A4→N4
+5. Blend between those two edges with `v`
 
 ```
+cell_to_pose("C2")        →  (x, y, z) in metres
 cell_to_joints_deg("C2")  →  [pan°, lift°, elbow°, w1°, w2°, w3°]
 ```
 
@@ -89,28 +89,21 @@ cell_to_joints_deg("C2")  →  [pan°, lift°, elbow°, w1°, w2°, w3°]
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `HOME_DEG` | `[0, -90, 0, 0, 0, 0]` | Safe upright home pose |
-| `CUT_DIP_LIFT` | `+40°` | Shoulder delta for cutting dip |
-| `CUT_DIP_ELBOW` | `−40°` | Elbow delta for cutting dip |
-| `MOVE_GROUP` | `'ur_manipulator'` | MoveIt planning group |
+| `HOME_DEG` | `[0, -90, 0, 0, 0, 360]` | Safe upright home pose |
+| `APPROACH_LIFT_DELTA` | `−11°` | Shoulder lift offset above the fixed cut pose |
+| `TRAJECTORY_ACTION` | `/scaled_joint_trajectory_controller/follow_joint_trajectory` | Active UR trajectory action |
 
 ### MoverNode
 
-Sends joint-space goals to MoveIt's `/move_action` server.
+Sends fixed joint-space trajectories to the active UR scaled trajectory
+controller. No Cartesian position goals, IK targets, or `compute_cartesian_path`
+calls are used for grid movement.
 
 ```
 MoverNode.move_to(degrees, done_cb, fail_cb)
-  → _make_constraints(degrees)
-      → JointConstraint × 6 joints
-         position     = math.radians(deg)
-         tolerance    = ±0.01 rad
-         weight       = 1.0
-  → MoveGroup.Goal
-      group_name                    = 'ur_manipulator'
-      num_planning_attempts         = 10
-      allowed_planning_time         = 5.0 s
-      max_velocity_scaling_factor   = 0.3  (30%)
-      max_acceleration_scaling_factor = 0.3
+  → FollowJointTrajectory.Goal
+      point 1 = current live joint positions at +0.5 s
+      point 2 = target joint positions after a conservative duration
 ```
 
 The goal runs in a **background daemon thread** so the GUI never freezes.
@@ -127,19 +120,17 @@ target = current + wrap(-180..180)(target - current)
 
 ### Three-step cut sequence
 
-For each selected cell, `_move_next` chains three MoveIt calls:
+For each selected cell, `_move_next` chains three fixed joint-space MoveIt goals:
 
 ```
-1. APPROACH  →  move_to(degrees)
-                  end-effector arrives at cell position (lookup angles)
+1. APPROACH  →  move_to(approach_degrees)
+                  approach_degrees = grid_degrees with shoulder −11°
 
-2. DIP       →  move_to(dip_degrees)
-                  dip_degrees[1] += 40°  (shoulder)
-                  dip_degrees[2] -= 40°  (elbow)
-                  pushes end-effector downward into the board
+2. CUT       →  move_to(grid_degrees)
+                  arm moves to the fixed calibrated cell joint pose
 
-3. RECOVER   →  move_to(degrees)
-                  lifts back to approach position
+3. RECOVER   →  move_to(approach_degrees)
+                  returns to the fixed shoulder-lifted approach pose
                   then calls _move_next(remaining)
 ```
 
@@ -213,21 +204,19 @@ cell label (e.g. "C2")
          │
          ▼
 grid_mover.cell_to_joints_deg("C2")
-  Bilinear interpolation of 4 measured corners
+  Bilinear interpolation of 4 measured joint poses
          │
          ▼
-[pan°, lift°, elbow°, w1°, w2°, w3°]   ← approach angles
+[pan°, lift°, elbow°, w1°, w2°, w3°]   ← fixed grid joint target
          │
-         ├─── dip_degrees = approach ± (40°, −40°) on joints 1,2
+         ├─── approach_degrees = target with shoulder −11°
+         │
+MoverNode.move_to(degrees)
+  FollowJointTrajectory with current joints as first point
          │
          ▼
-MoverNode._make_constraints(degrees)
-  JointConstraint × 6, tolerance ±0.01 rad
-         │
-         ▼
-MoveGroup.Goal → /move_action (MoveIt)
-  MoveIt plans collision-free trajectory
-  Executes at 30% velocity/acceleration
+scaled_joint_trajectory_controller
+  Executes timed joint trajectory without an instant first-point jump
          │
          ▼
 UR3e executes trajectory via RTDE driver

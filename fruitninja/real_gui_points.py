@@ -7,7 +7,7 @@ HOW IT WORKS (overview)
 1. The GUI connects to a live UR3e robot via ROS 2 / MoveIt.
 2. The operator selects grid cells (A1–N4) on the cutting board grid.
 3. Pressing "Move to Selected" drives the robot through each cell in order,
-   performing a three-step cut at each one: approach → dip → recover.
+   using the fixed calibrated joint pose for that cell.
 4. A camera feed (top-right) can run colour detection once the operator has
    manually defined the grid by clicking 4 corner points on the image.
    Only red and blue objects inside that grid are detected.
@@ -19,7 +19,7 @@ HOW IT WORKS (overview)
 KEY CLASSES
 ===========
   JointStateNode   – Subscribes to /joint_states and feeds live angles to the UI.
-  MoverNode        – Sends MoveGroup action goals to MoveIt (runs in background thread).
+  MoverNode        – Sends timed joint trajectories to the scaled controller.
   CameraWorker     – Captures raw frames from a webcam or RealSense in a background thread.
   MainWindow       – PyQt5 main window that wires everything together.
 """
@@ -34,16 +34,11 @@ import rclpy.executors
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState
-from moveit_msgs.action import MoveGroup, ExecuteTrajectory
-from moveit_msgs.msg import (
-    Constraints, JointConstraint, MoveItErrorCodes,
-    PositionConstraint, BoundingVolume,
-)
-from moveit_msgs.srv import GetCartesianPath
-from shape_msgs.msg import SolidPrimitive as _SP
-from geometry_msgs.msg import Pose as _GPose, Quaternion as _GQuat
+from control_msgs.action import FollowJointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
 
-from fruitninja.grid_mover import cell_to_pose, GRID_COLS, GRID_ROWS
+from fruitninja.grid_mover import cell_to_pose, cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
 import cv2
 import numpy as np
@@ -71,9 +66,7 @@ from PyQt5.QtGui import (
 # ── Constants ──────────────────────────────────────────────────────────────────
 # JOINT_NAMES / JOINT_LABELS: the 6 UR3e joints in the order MoveIt expects them.
 # HOME_DEG: the safe "rest" pose used by the Reset button.
-# CUT_DIP_LIFT / CUT_DIP_ELBOW: how many degrees to shift the shoulder and elbow
-#   joints to push the end-effector downward for the cutting stroke.
-# MOVE_GROUP: the MoveIt planning group name for the UR arm.
+# APPROACH_LIFT_DELTA: fixed shoulder lift offset from the calibrated cut pose.
 
 JOINT_NAMES = [
     'shoulder_pan_joint',
@@ -88,17 +81,22 @@ JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 
 
 HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 360.0]
 
-MOVE_GROUP = 'ur_manipulator'
+TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
 
-APPROACH_CLEARANCE = 0.10   # metres above board surface for approach
-DIP_DEPTH          = 0.010  # metres below board surface for cut stroke
-# Tool pointing straight down (90° around Y, tool0 Z → base_link -Z)
-_DOWN_QUAT = _GQuat(x=0.0, y=0.7071068, z=0.0, w=0.7071068)
+APPROACH_LIFT_DELTA = -11.0  # matches legacy hover(-52°) → cut(-41°) spacing
+START_HOLD_SEC = 0.5
+MIN_MOVE_DURATION_SEC = 4.0
+MAX_JOINT_SPEED_DEG_S = 10.0
 
 
 def _board_position(col_idx: int, row_idx: int) -> tuple:
     """Return (x, y, z) for a grid cell by index, delegating to grid_mover."""
     return cell_to_pose(GRID_COLS[col_idx] + GRID_ROWS[row_idx])
+
+
+def _board_joints(col_idx: int, row_idx: int) -> list:
+    """Return calibrated joint angles for the same fixed-grid cell."""
+    return cell_to_joints_deg(GRID_COLS[col_idx] + GRID_ROWS[row_idx])
 
 
 def _wrap_deg(deg: float) -> float:
@@ -128,29 +126,32 @@ class JointStateNode(Node):
 
 class MoverNode(Node):
     """
-    Sends joint-space motion goals to MoveIt via the /move_action action server.
+    Sends fixed joint-space trajectories directly to the active UR controller.
 
     move_to(degrees, done_cb, fail_cb, current_degrees=None)
       - Spawns a background thread so the GUI never freezes during planning.
-      - Converts the target joint angles (degrees) into a MoveIt Constraints message.
-      - Velocity and acceleration are capped at 30% for safety.
+      - Sends the current joint state as the first trajectory point, then the
+        target joint state with a conservative duration.
+      - Does not send Cartesian position goals or compute_cartesian_path requests.
+      - Does not use MoveIt/IK for execution, avoiding instant first-point jumps.
       - On success  → calls done_cb()
       - On failure  → calls fail_cb(reason_string)
       - cancel()    → sets _cancel_flag so the thread exits at the next wait point.
     """
     def __init__(self):
         super().__init__('real_gui_points_mover')
-        self._client        = ActionClient(self, MoveGroup, '/move_action')
-        self._exec_client   = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
-        self._cartesian_srv = self.create_client(GetCartesianPath, '/compute_cartesian_path')
-        self._cancel_flag   = False
+        self._client      = ActionClient(self, FollowJointTrajectory, TRAJECTORY_ACTION)
+        self._cancel_flag = False
 
     def move_to(self, degrees: list, done_cb, fail_cb, current_degrees: list = None):
         self._cancel_flag = False
+        if current_degrees is None:
+            fail_cb('No live joint state yet — wait for /joint_states before moving')
+            return
         target_degrees = self._nearest_equivalent_target(degrees, current_degrees)
         threading.Thread(
             target=self._move_thread,
-            args=(target_degrees, done_cb, fail_cb),
+            args=(current_degrees, target_degrees, done_cb, fail_cb),
             daemon=True,
         ).start()
 
@@ -162,25 +163,52 @@ class MoverNode(Node):
             for target, current in zip(degrees, current_degrees)
         ]
 
-    def _move_thread(self, degrees, done_cb, fail_cb):
+    @staticmethod
+    def _duration_msg(seconds: float) -> Duration:
+        sec = int(seconds)
+        nanosec = int((seconds - sec) * 1_000_000_000)
+        return Duration(sec=sec, nanosec=nanosec)
+
+    def _move_duration(self, current_degrees: list, target_degrees: list) -> float:
+        max_delta = max(
+            abs(target - current)
+            for target, current in zip(target_degrees, current_degrees)
+        )
+        return max(MIN_MOVE_DURATION_SEC, max_delta / MAX_JOINT_SPEED_DEG_S)
+
+    def _make_trajectory_goal(self, current_degrees: list,
+                              target_degrees: list) -> FollowJointTrajectory.Goal:
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = JOINT_NAMES
+
+        start = JointTrajectoryPoint()
+        start.positions = [math.radians(deg) for deg in current_degrees]
+        start.velocities = [0.0] * len(JOINT_NAMES)
+        start.time_from_start = self._duration_msg(START_HOLD_SEC)
+
+        target = JointTrajectoryPoint()
+        target.positions = [math.radians(deg) for deg in target_degrees]
+        target.velocities = [0.0] * len(JOINT_NAMES)
+        target.time_from_start = self._duration_msg(
+            START_HOLD_SEC + self._move_duration(current_degrees, target_degrees)
+        )
+
+        goal.trajectory.points = [start, target]
+        goal.goal_time_tolerance = self._duration_msg(2.0)
+        return goal
+
+    def _move_thread(self, current_degrees, target_degrees, done_cb, fail_cb):
         executor = rclpy.executors.SingleThreadedExecutor()
         executor.add_node(self)
         try:
             if not self._client.wait_for_server(timeout_sec=5.0):
-                fail_cb('MoveGroup not available — is MoveIt running?')
+                fail_cb('Scaled trajectory controller action not available')
                 return
             if self._cancel_flag:
                 fail_cb('Cancelled')
                 return
 
-            goal = MoveGroup.Goal()
-            goal.request.group_name = MOVE_GROUP
-            goal.request.goal_constraints.append(self._make_constraints(degrees))
-            goal.request.num_planning_attempts = 10
-            goal.request.allowed_planning_time = 5.0
-            goal.request.max_velocity_scaling_factor     = 0.1
-            goal.request.max_acceleration_scaling_factor = 0.1
-
+            goal = self._make_trajectory_goal(current_degrees, target_degrees)
             future = self._client.send_goal_async(goal)
             executor.spin_until_future_complete(future)
             if self._cancel_flag:
@@ -189,7 +217,7 @@ class MoverNode(Node):
 
             goal_handle = future.result()
             if not goal_handle.accepted:
-                fail_cb('Goal rejected by MoveIt')
+                fail_cb('Trajectory rejected by scaled_joint_trajectory_controller')
                 return
  
             result_future = goal_handle.get_result_async()
@@ -199,182 +227,16 @@ class MoverNode(Node):
                 return
 
             result = result_future.result().result
-            if result.error_code.val == MoveItErrorCodes.SUCCESS:
+            if result.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
                 done_cb()
             else:
-                fail_cb(f'Move failed (error code: {result.error_code.val})')
+                msg = result.error_string or 'no controller error string'
+                fail_cb(f'Trajectory failed (code: {result.error_code}): {msg}')
         finally:
             executor.remove_node(self)
-
-    def _make_constraints(self, degrees: list) -> Constraints:
-        c = Constraints()
-        for name, deg in zip(JOINT_NAMES, degrees):
-            jc = JointConstraint()
-            jc.joint_name      = name
-            jc.position        = math.radians(deg)
-            jc.tolerance_above = 0.01
-            jc.tolerance_below = 0.01
-            jc.weight          = 1.0
-            c.joint_constraints.append(jc)
-        return c
 
     def cancel(self):
         self._cancel_flag = True
-
-    # ── Pose goal (MoveGroup joint-space planner) ──────────────────────────────
-
-    def move_to_pose(self, x: float, y: float, z: float, done_cb, fail_cb):
-        """Plan to (x, y, z) via MoveGroup joint-space planner."""
-        self._cancel_flag = False
-        threading.Thread(
-            target=self._pose_thread,
-            args=(x, y, z, done_cb, fail_cb),
-            daemon=True,
-        ).start()
-
-    def _pose_thread(self, x, y, z, done_cb, fail_cb):
-        executor = rclpy.executors.SingleThreadedExecutor()
-        executor.add_node(self)
-        try:
-            if not self._client.wait_for_server(timeout_sec=5.0):
-                fail_cb('MoveGroup not available')
-                return
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            sphere = _SP(type=_SP.SPHERE, dimensions=[0.010])
-            target = _GPose()
-            target.position.x = x
-            target.position.y = y
-            target.position.z = z
-            target.orientation.w = 1.0
-            bv = BoundingVolume()
-            bv.primitives.append(sphere)
-            bv.primitive_poses.append(target)
-
-            pc = PositionConstraint()
-            pc.header.frame_id   = 'base_link'
-            pc.link_name         = 'tool0'
-            pc.constraint_region = bv
-            pc.weight            = 1.0
-
-            c = Constraints()
-            c.position_constraints.append(pc)
-
-            goal = MoveGroup.Goal()
-            goal.request.group_name                      = MOVE_GROUP
-            goal.request.goal_constraints.append(c)
-            goal.request.num_planning_attempts           = 10
-            goal.request.allowed_planning_time           = 10.0
-            goal.request.max_velocity_scaling_factor     = 0.3
-            goal.request.max_acceleration_scaling_factor = 0.3
-
-            future = self._client.send_goal_async(goal)
-            executor.spin_until_future_complete(future)
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            goal_handle = future.result()
-            if not goal_handle.accepted:
-                fail_cb('Goal rejected by MoveIt')
-                return
-
-            result_future = goal_handle.get_result_async()
-            executor.spin_until_future_complete(result_future)
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            result = result_future.result().result
-            if result.error_code.val == MoveItErrorCodes.SUCCESS:
-                done_cb()
-            else:
-                fail_cb(f'Planning failed (code: {result.error_code.val})')
-        finally:
-            executor.remove_node(self)
-
-    # ── Cartesian Z motion (dip / recover only) ────────────────────────────────
-
-    def move_cartesian_z(self, x: float, y: float, z_target: float, done_cb, fail_cb):
-        """Drop or raise the tool straight along Z via compute_cartesian_path."""
-        self._cancel_flag = False
-        threading.Thread(
-            target=self._cartesian_z_thread,
-            args=(x, y, z_target, done_cb, fail_cb),
-            daemon=True,
-        ).start()
-
-    def _cartesian_z_thread(self, x, y, z_target, done_cb, fail_cb):
-        executor = rclpy.executors.SingleThreadedExecutor()
-        executor.add_node(self)
-        try:
-            if not self._cartesian_srv.wait_for_service(timeout_sec=5.0):
-                fail_cb('compute_cartesian_path service unavailable')
-                return
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            req = GetCartesianPath.Request()
-            req.header.frame_id = 'base_link'
-            req.header.stamp = self.get_clock().now().to_msg()
-            req.group_name = MOVE_GROUP
-            req.link_name = 'tool0'
-            req.avoid_collisions = False
-            req.max_step = 0.005       # 5 mm resolution
-            req.jump_threshold = 0.0   # disable jump detection for short Z moves
-
-            wp = _GPose()
-            wp.position.x = x
-            wp.position.y = y
-            wp.position.z = z_target
-            wp.orientation = _DOWN_QUAT
-            req.waypoints = [wp]
-
-            future = self._cartesian_srv.call_async(req)
-            executor.spin_until_future_complete(future)
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            resp = future.result()
-            if resp.fraction < 0.5:
-                fail_cb(f'Cartesian path only {resp.fraction * 100:.0f}% complete — target unreachable')
-                return
-
-            if not self._exec_client.wait_for_server(timeout_sec=5.0):
-                fail_cb('execute_trajectory server unavailable')
-                return
-
-            exec_goal = ExecuteTrajectory.Goal()
-            exec_goal.trajectory = resp.solution
-
-            exec_future = self._exec_client.send_goal_async(exec_goal)
-            executor.spin_until_future_complete(exec_future)
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            exec_handle = exec_future.result()
-            if not exec_handle.accepted:
-                fail_cb('Trajectory execution rejected')
-                return
-
-            result_future = exec_handle.get_result_async()
-            executor.spin_until_future_complete(result_future)
-            if self._cancel_flag:
-                fail_cb('Cancelled')
-                return
-
-            result = result_future.result().result
-            if result.error_code.val == MoveItErrorCodes.SUCCESS:
-                done_cb()
-            else:
-                fail_cb(f'Trajectory execution failed (code: {result.error_code.val})')
-        finally:
-            executor.remove_node(self)
 
 
 # ── Camera worker ─────────────────────────────────────────────────────────────
@@ -549,6 +411,7 @@ class MainWindow(QMainWindow):
         self._cell_btns = {}
         self._camera = CameraWorker()
         self._current_joints_rad = {n: 0.0 for n in JOINT_NAMES}
+        self._have_joint_state = False
 
         # Manual grid state
         self._grid_pts       = []    # up to 4 (x, y) in frame coords
@@ -783,7 +646,8 @@ class MainWindow(QMainWindow):
 
     def _go(self):
         """
-        Start the cut sequence for all selected grid cells, left-to-right (A→N).
+        Start the fixed-joint movement sequence for all selected grid cells,
+        left-to-right (A→N).
         """
         if not self._selected_cells:
             self._set_status('Toggle at least one cell first', '#e0a000')
@@ -800,10 +664,10 @@ class MainWindow(QMainWindow):
         """
         Recursive per-cell cut loop for the manual selection sequence.
 
-        For each cell in the queue it chains three MoveIt calls:
-          1. move_to(degrees)       → approach: arm arrives at the cell's pre-computed pose
-          2. move_to(dip_degrees)   → dip:      shoulder+elbow shift drives end-effector down
-          3. move_to(degrees)       → recover:  arm lifts back to approach pose
+        For each cell in the queue it chains three fixed joint-space calls:
+          1. move_to(approach_degrees)  → fixed shoulder lift above grid pose
+          2. move_to(cut_degrees)       → calibrated fixed grid joint pose
+          3. move_to(approach_degrees)  → recover above the grid joint pose
         After recover, _move_next is called again with remaining = queue[1:].
         When the queue is empty (or E-STOP fires) the loop exits.
         """
@@ -818,38 +682,60 @@ class MainWindow(QMainWindow):
         col_idx = GRID_COLS.index(cell[0])
         row_idx = GRID_ROWS.index(cell[1])
         bx, by, bz = _board_position(col_idx, row_idx)
-        approach_z = bz + APPROACH_CLEARANCE
-        dip_z      = bz - DIP_DEPTH
+        cut_degrees = _board_joints(col_idx, row_idx)
+        approach_degrees = list(cut_degrees)
+        approach_degrees[1] += APPROACH_LIFT_DELTA
 
         self._status_sig.emit(f'Moving to {cell}…  ({len(remaining)} remaining)', '#3a7aff')
-        self._log(f'Moving to {cell}')
+        approach_txt = ', '.join(f'{j:.2f}°' for j in approach_degrees)
+        cut_txt = ', '.join(f'{j:.2f}°' for j in cut_degrees)
+        self._log(
+            f'Moving to {cell}: '
+            f'tool=({bx*1000:.1f}, {by*1000:.1f}, {bz*1000:.1f}) mm  '
+            f'approach=[{approach_txt}]  cut=[{cut_txt}]'
+        )
 
         def _on_arrive():
             self._log_sig.emit(f'Reached {cell} — cutting')
             self._status_sig.emit(f'Cutting at {cell}…', '#e0a000')
-            self._mover_node.move_cartesian_z(bx, by, dip_z, done_cb=_on_dip, fail_cb=_on_fail)
+            self._mover_node.move_to(
+                cut_degrees,
+                done_cb=_on_cut,
+                fail_cb=_on_fail,
+                current_degrees=approach_degrees,
+            )
 
-        def _on_dip():
+        def _on_cut():
             self._log_sig.emit(f'Cut at {cell} — recovering')
-            self._mover_node.move_cartesian_z(bx, by, approach_z,
-                                              done_cb=lambda: self._move_next(remaining),
-                                              fail_cb=_on_fail)
+            self._mover_node.move_to(
+                approach_degrees,
+                done_cb=lambda: self._move_next(remaining),
+                fail_cb=_on_fail,
+                current_degrees=cut_degrees,
+            )
 
         def _on_fail(msg):
             self._status_sig.emit(f'Failed at {cell}: {msg}', '#ff4444')
             self._log_sig.emit(f'FAIL at {cell}: {msg}')
             setattr(self, '_moving', False)
 
-        self._mover_node.move_to_pose(bx, by, approach_z, done_cb=_on_arrive, fail_cb=_on_fail)
+        self._mover_node.move_to(
+            approach_degrees,
+            done_cb=_on_arrive,
+            fail_cb=_on_fail,
+            current_degrees=self._current_joint_degrees(),
+        )
 
-    def _current_joint_degrees(self) -> list:
+    def _current_joint_degrees(self) -> list | None:
+        if not self._have_joint_state:
+            return None
         return [math.degrees(self._current_joints_rad[name]) for name in JOINT_NAMES]
 
     def _cut_detected_fruit(self):
         """
         Automated cut sequence driven by camera detection.
         Builds a queue of all detected fruit cells (origin first, no duplicates)
-        and runs the standard approach→dip→recover loop through each one.
+        and runs the standard approach→cut→recover loop through each one.
         Requires the manual grid to be defined (4 corner points clicked) before running.
         """
         if self._moving:
@@ -887,9 +773,8 @@ class MainWindow(QMainWindow):
         Emergency stop — triggered by the E-STOP button or the spacebar shortcut.
 
         Sets the cancel flag on MoverNode (the running move thread checks it and exits),
-        clears any MoveIt collision spheres, and resets the moving flag.
-        The robot completes its current waypoint before stopping (MoveIt has no
-        mid-trajectory abort via this action client), but no further waypoints are sent.
+        and resets the moving flag. The robot completes its current waypoint before
+        stopping, but no further waypoints are sent.
         """
         self._mover_node.cancel()
         self._moving = False
@@ -927,6 +812,8 @@ class MainWindow(QMainWindow):
             if val is not None:
                 lbl.setText(f'{val:+.2f}°')
                 self._current_joints_rad[jname] = math.radians(val)
+        if all(name in joints for name in JOINT_NAMES):
+            self._have_joint_state = True
 
     def _set_status(self, text: str, colour: str = '#aaaaaa'):
         self._status_label.setText(text)
