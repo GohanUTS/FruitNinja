@@ -52,9 +52,9 @@ except Exception:
     _HAS_RS = False
 
 try:
-    import mediapipe.solutions.hands as _mp_hands
-    import mediapipe.solutions.drawing_utils as _mp_drawing
-    import mediapipe.solutions.drawing_styles as _mp_drawing_styles
+    import mediapipe.python.solutions.hands as _mp_hands
+    import mediapipe.python.solutions.drawing_utils as _mp_drawing
+    import mediapipe.python.solutions.drawing_styles as _mp_drawing_styles
     _HAS_MP = True
 except Exception:
     _HAS_MP = False
