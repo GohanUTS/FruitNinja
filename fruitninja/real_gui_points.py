@@ -33,7 +33,8 @@ import rclpy
 import rclpy.executors
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, CompressedImage
+from std_msgs.msg import Bool, Float32MultiArray
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
@@ -248,6 +249,45 @@ class MoverNode(Node):
 
     def cancel(self):
         self._cancel_flag = True
+
+
+# ── Camera + safety bridge node ───────────────────────────────────────────────
+
+class CameraBridgeNode(Node):
+    """
+    Publishes camera frames and grid zone so the standalone safety_node can
+    subscribe without opening the camera itself.
+
+    Topics published:
+      /camera/image_raw/compressed  (sensor_msgs/CompressedImage)
+      /safety/zone                  (std_msgs/Float32MultiArray)
+                                    [x0,y0, x1,y1, x2,y2, x3,y3] TL→TR→BR→BL
+
+    Topic subscribed:
+      /safety/hand_detected         (std_msgs/Bool)
+    """
+    def __init__(self, hand_cb):
+        super().__init__('fruitninja_camera_bridge')
+        self._pub_img  = self.create_publisher(CompressedImage, '/camera/image_raw/compressed', 10)
+        self._pub_zone = self.create_publisher(Float32MultiArray, '/safety/zone', 10)
+        self.create_subscription(Bool, '/safety/hand_detected', hand_cb, 10)
+
+    def publish_frame(self, frame):
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return
+        msg = CompressedImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.format = 'jpeg'
+        msg.data = buf.tobytes()
+        self._pub_img.publish(msg)
+
+    def publish_zone(self, pts):
+        """pts: list of 4 (x, y) tuples in TL, TR, BR, BL order."""
+        flat = [v for pt in pts for v in pt]
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in flat]
+        self._pub_zone.publish(msg)
 
 
 # ── UR3e Dashboard safety interlock ───────────────────────────────────────────
@@ -1084,6 +1124,9 @@ class MainWindow(QMainWindow):
         # Draw grid overlay / in-progress dots on top
         self._draw_grid_overlay(frame)
 
+        # Publish raw frame to /camera/image_raw/compressed for safety_node
+        self._bridge_node.publish_frame(frame)
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -1338,6 +1381,8 @@ class MainWindow(QMainWindow):
             self._cam_label.setCursor(Qt.ArrowCursor)
             self._grid_status.setText('Grid locked — 4 points set')
             self._grid_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:6px;')
+            # Publish zone to safety_node
+            self._bridge_node.publish_zone(self._grid_pts)
             if self._hands_mp is not None:
                 self._safety_label.setText('🛡 Safety: active — monitoring cutting zone')
                 self._safety_label.setStyleSheet(
@@ -1497,13 +1542,23 @@ class MainWindow(QMainWindow):
                 lambda joints: self._joints_sig.emit(joints)
             )
             self._mover_node = MoverNode()
-            # Spin JointStateNode continuously so the angle display stays live
-            threading.Thread(
-                target=rclpy.spin, args=(self._js_node,), daemon=True,
-            ).start()
+            self._bridge_node = CameraBridgeNode(self._on_safety_node_detection)
+            # Spin JointStateNode + bridge node continuously in a shared executor
+            exe = rclpy.executors.MultiThreadedExecutor()
+            exe.add_node(self._js_node)
+            exe.add_node(self._bridge_node)
+            threading.Thread(target=exe.spin, daemon=True).start()
             self._log('ROS2 nodes started')
         except Exception as e:
             self._log(f'ROS2 init failed: {e}')
+
+    def _on_safety_node_detection(self, msg: Bool):
+        """Called from the ROS spin thread — route to main thread via signal."""
+        if msg.data:
+            self._status_sig.emit('⚠ SAFETY: HAND IN ZONE — ROBOT PAUSED', '#ff4444')
+        else:
+            if self._safety_paused:
+                self._status_sig.emit('🛡 Safety: zone clear — ready', '#4de87a')
 
     def closeEvent(self, event):
         self._camera.stop()
@@ -1513,6 +1568,7 @@ class MainWindow(QMainWindow):
         try:
             self._js_node.destroy_node()
             self._mover_node.destroy_node()
+            self._bridge_node.destroy_node()
             rclpy.shutdown()
         except Exception:
             pass

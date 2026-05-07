@@ -125,6 +125,13 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'note':    '',
         },
         {
+            'label':   'Step 6 — Safety Node',
+            'desc':    'Hand-detection safety interlock (subscribes to camera topic)',
+            'cmd':     SOURCE + f'ros2 run fruitninja safety_node --robot-ip {ip}',
+            'oneshot': False,
+            'note':    'Start after Step 4. Define the grid in the GUI to activate the interlock.',
+        },
+        {
             'label':   'Step 5 — Fix Controller',
             'desc':    'Switch to scaled_joint_trajectory_controller (run once after Step 1)',
             'cmd':     SOURCE + (
