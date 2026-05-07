@@ -76,11 +76,12 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
 
     if sim:
         steps.append({
-            'label':   'Step 0 — Start URSim',
-            'desc':    'Launch the UR3e Polyscope simulator via Docker',
-            'cmd':     SOURCE + 'ros2 run ur_client_library start_ursim.sh -m ur3e',
-            'oneshot': False,
-            'note':    f'Then open Polyscope at {SIM_VNC_URL} and press Play on "External Control".',
+            'label':    'Step 0 — Start URSim',
+            'desc':     'Launch the UR3e Polyscope simulator via Docker',
+            'cmd':      SOURCE + 'ros2 run ur_client_library start_ursim.sh -m ur3e',
+            'oneshot':  False,
+            'note':     f'Then open Polyscope at {SIM_VNC_URL} and press Play on "External Control".',
+            'stop_cmd': 'docker stop ursim 2>/dev/null; docker rm ursim 2>/dev/null; true',
         })
 
     steps += [
@@ -119,7 +120,7 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
         {
             'label':   'Step 4 — Main GUI',
             'desc':    'Open the grid-control GUI for cutting',
-            'cmd':     SOURCE + 'ros2 run fruitninja real_gui_points',
+            'cmd':     SOURCE + f'ros2 run fruitninja real_gui_points --robot-ip {ip}',
             'oneshot': False,
             'note':    '',
         },
@@ -355,6 +356,18 @@ class StepRow(QObject):
             self._write_output('Stopping process…\n')
             self._proc.terminate()
             self._apply_status(*STATUS_STOPPED)
+        stop_cmd = self._step.get('stop_cmd')
+        if stop_cmd:
+            self._write_output(f'Running: {stop_cmd}\n')
+            # Use a QProcess so all output is delivered safely in the main thread
+            self._stop_proc = QProcess()
+            self._stop_proc.setProcessChannelMode(QProcess.MergedChannels)
+            self._stop_proc.readyReadStandardOutput.connect(
+                lambda: self._write_output(
+                    self._stop_proc.readAllStandardOutput().data().decode(errors='replace')
+                )
+            )
+            self._stop_proc.start('/bin/bash', ['-c', stop_cmd])
 
     def is_running(self) -> bool:
         return self._proc.state() != QProcess.NotRunning

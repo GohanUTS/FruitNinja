@@ -133,8 +133,8 @@ class PlanningSceneSetup(Node):
         # Robot at near-Y edge, plate extends in +Y:
         #   x_offset = 0.23 - 0.031 = 0.199
         #   y_offset = -0.03 - 0.053 = -0.083
-        mesh_pose.position.x = 0.199
-        mesh_pose.position.y = -0.13
+        mesh_pose.position.x = 0.230   # robot base 370 mm from X_min edge
+        mesh_pose.position.y = -0.240  # robot base 157 mm from Y_min edge
         mesh_pose.position.z = 0.0
         # Combined quaternion for Rz(180°)*Rx(90°): (x=0, y=0.7071, z=0.7071, w=0)
         import math as _math

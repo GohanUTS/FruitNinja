@@ -40,6 +40,8 @@ from builtin_interfaces.msg import Duration
 
 from fruitninja.grid_mover import cell_to_pose, cell_to_joints_deg, GRID_COLS, GRID_ROWS
 
+import argparse
+import socket as _socket
 import cv2
 import numpy as np
 
@@ -48,6 +50,14 @@ try:
     _HAS_RS = True
 except Exception:
     _HAS_RS = False
+
+try:
+    import mediapipe.solutions.hands as _mp_hands
+    import mediapipe.solutions.drawing_utils as _mp_drawing
+    import mediapipe.solutions.drawing_styles as _mp_drawing_styles
+    _HAS_MP = True
+except Exception:
+    _HAS_MP = False
 
 
 from PyQt5.QtWidgets import (
@@ -79,7 +89,7 @@ JOINT_NAMES = [
 
 JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 'Wrist 3']
 
-HOME_DEG = [0.0, -90.0, 0.0, 0.0, 0.0, 360.0]
+HOME_DEG = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 
 TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
 
@@ -180,6 +190,7 @@ class MoverNode(Node):
                               target_degrees: list) -> FollowJointTrajectory.Goal:
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = JOINT_NAMES
+        goal.trajectory.header.stamp = self.get_clock().now().to_msg()
 
         start = JointTrajectoryPoint()
         start.positions = [math.radians(deg) for deg in current_degrees]
@@ -194,7 +205,7 @@ class MoverNode(Node):
         )
 
         goal.trajectory.points = [start, target]
-        goal.goal_time_tolerance = self._duration_msg(2.0)
+        goal.goal_time_tolerance = self._duration_msg(5.0)
         return goal
 
     def _move_thread(self, current_degrees, target_degrees, done_cb, fail_cb):
@@ -237,6 +248,67 @@ class MoverNode(Node):
 
     def cancel(self):
         self._cancel_flag = True
+
+
+# ── UR3e Dashboard safety interlock ───────────────────────────────────────────
+
+class UR3eDashboard:
+    """
+    Thin TCP wrapper for the UR Dashboard Server (port 29999).
+    Used by the safety interlock to pause/resume the robot when a hand
+    is detected inside the cutting zone.
+
+    Uses 'pause' / 'play' — not 'stop' — so the robot resumes from exactly
+    where it paused without needing to re-home.
+
+    Connection failure is silent: if the dashboard is unreachable the safety
+    layer still blocks new trajectories via the _cancel_flag path.
+    """
+    def __init__(self, ip: str, port: int = 29999):
+        self._paused = False
+        self._sock   = None
+        try:
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect((ip, port))
+            s.recv(1024)   # consume welcome banner
+            s.settimeout(1.0)
+            self._sock = s
+            print(f'[Safety] Dashboard connected to {ip}:{port}')
+        except Exception as e:
+            print(f'[Safety] Dashboard connect failed ({ip}:{port}): {e}')
+
+    @property
+    def connected(self) -> bool:
+        return self._sock is not None
+
+    def _send(self, cmd: str):
+        if self._sock is None:
+            return
+        try:
+            self._sock.sendall((cmd + '\n').encode())
+            self._sock.recv(1024)
+        except Exception:
+            pass
+
+    def pause(self):
+        if not self._paused:
+            self._send('pause')
+            self._paused = True
+
+    def resume(self):
+        if self._paused:
+            self._send('play')
+            self._paused = False
+
+    def close(self):
+        if self._sock:
+            try:
+                self.resume()
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
 
 
 # ── Camera worker ─────────────────────────────────────────────────────────────
@@ -400,7 +472,7 @@ class MainWindow(QMainWindow):
     _log_sig    = pyqtSignal(str)
     _cam_sig    = pyqtSignal(object)
 
-    def __init__(self):
+    def __init__(self, robot_ip: str = '192.168.0.194'):
         super().__init__()
         self.setWindowTitle('FruitNinja — UR3e Grid Control')
         self.setMinimumSize(1240, 740)
@@ -420,6 +492,19 @@ class MainWindow(QMainWindow):
 
         # Latest fruit detections: list of {'label', 'origin', 'covered': [cells]}
         self._detected_fruits = []
+
+        # ── Safety interlock ──────────────────────────────────────────────────
+        self._safety_paused = False
+        self._dashboard = UR3eDashboard(robot_ip)
+        if _HAS_MP:
+            self._hands_mp = _mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.6,
+            )
+        else:
+            self._hands_mp = None
 
         self._build_ui()
         self._start_ros()
@@ -546,6 +631,15 @@ class MainWindow(QMainWindow):
         act_layout.addWidget(self._btn_reset)
         root.addLayout(act_layout)
 
+        # ── safety interlock banner ───────────────────────────────────────────
+        self._safety_label = QLabel('🛡 Safety: standby — define grid to activate interlock')
+        self._safety_label.setAlignment(Qt.AlignCenter)
+        self._safety_label.setStyleSheet(
+            'background:#101a22; color:#7a8fa0; font-size:12px; font-weight:bold;'
+            'padding:6px; border:1px solid #2f4654; border-radius:6px;'
+        )
+        root.addWidget(self._safety_label)
+
         # ── status ────────────────────────────────────────────────────────────
         self._status_label = QLabel('● Idle — select a cell and press Move')
         self._status_label.setAlignment(Qt.AlignCenter)
@@ -636,6 +730,9 @@ class MainWindow(QMainWindow):
 
     def _trace_grid(self):
         """Visit all 4 grid corners: A1 → N1 → N4 → A4."""
+        if self._safety_paused:
+            self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
+            return
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
@@ -649,6 +746,9 @@ class MainWindow(QMainWindow):
         Start the fixed-joint movement sequence for all selected grid cells,
         left-to-right (A→N).
         """
+        if self._safety_paused:
+            self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
+            return
         if not self._selected_cells:
             self._set_status('Toggle at least one cell first', '#e0a000')
             return
@@ -772,21 +872,29 @@ class MainWindow(QMainWindow):
         """
         Emergency stop — triggered by the E-STOP button or the spacebar shortcut.
 
-        Sets the cancel flag on MoverNode (the running move thread checks it and exits),
-        and resets the moving flag. The robot completes its current waypoint before
-        stopping, but no further waypoints are sent.
+        Sets the cancel flag on MoverNode (the running move thread checks it and exits).
+        Keeps _moving=True for 2 seconds so the user cannot immediately send a new
+        trajectory while the controller is still finishing the current one.
         """
         self._mover_node.cancel()
-        self._moving = False
-        self._set_status('⚠ EMERGENCY STOP', '#ff4444')
+        self._moving = True   # block new moves until cooldown expires
+        self._set_status('⚠ EMERGENCY STOP — wait 2 s before moving', '#ff4444')
         self._log('EMERGENCY STOP triggered')
+        QTimer.singleShot(2000, self._estop_cooldown_done)
+
+    def _estop_cooldown_done(self):
+        self._moving = False
+        self._set_status('⚠ Stopped — safe to continue', '#e0a000')
 
     def _reset(self):
         """
-        Drive the robot to the HOME_DEG pose ([0, -90, 0, 0, 0, 0] degrees).
+        Drive the robot to the HOME_DEG pose ([0, -90, 0, -90, 0, 0] degrees).
         This is a safe upright posture that keeps the arm clear of the cutting board.
         Blocked while a move is in progress — press E-STOP first if needed.
         """
+        if self._safety_paused:
+            self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
+            return
         if self._moving:
             self._set_status('Moving — press Stop first', '#e0a000')
             return
@@ -967,6 +1075,11 @@ class MainWindow(QMainWindow):
         # Only run detection once the grid is fully defined
         if len(self._grid_pts) == 4:
             self._detect_in_grid(frame)
+            # Safety interlock — hand detection runs on every frame
+            if self._check_hand_in_zone(frame):
+                self._on_hand_detected()
+            else:
+                self._on_zone_clear()
 
         # Draw grid overlay / in-progress dots on top
         self._draw_grid_overlay(frame)
@@ -981,6 +1094,72 @@ class MainWindow(QMainWindow):
             Qt.SmoothTransformation,
         )
         self._cam_label.setPixmap(pix)
+
+    # ── Safety interlock ─────────────────────────────────────────────────────
+
+    def _check_hand_in_zone(self, frame: np.ndarray) -> bool:
+        """
+        Run MediaPipe Hands on frame and return True if any landmark falls
+        inside the 4-corner cutting-zone polygon (the defined grid).
+        Draws landmarks and zone highlight onto frame in-place.
+        Returns False if MediaPipe isn't installed or grid isn't defined.
+        """
+        if self._hands_mp is None or len(self._grid_pts) != 4:
+            return False
+
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self._hands_mp.process(rgb)
+
+        # Build a polygon from the 4 grid corners for point-in-polygon test
+        poly = np.array(self._grid_pts, dtype=np.int32)  # TL, TR, BR, BL
+
+        hand_in_zone = False
+        if result.multi_hand_landmarks:
+            for hand_lms in result.multi_hand_landmarks:
+                # Draw landmarks
+                _mp_drawing.draw_landmarks(
+                    frame, hand_lms,
+                    _mp_hands.HAND_CONNECTIONS,
+                    _mp_drawing_styles.get_default_hand_landmarks_style(),
+                    _mp_drawing_styles.get_default_hand_connections_style(),
+                )
+                # Check every landmark against the grid polygon
+                for lm in hand_lms.landmark:
+                    px, py = int(lm.x * w), int(lm.y * h)
+                    if cv2.pointPolygonTest(poly, (px, py), False) >= 0:
+                        hand_in_zone = True
+                        break
+                if hand_in_zone:
+                    break
+
+        return hand_in_zone
+
+    def _on_hand_detected(self):
+        if self._safety_paused:
+            return
+        self._safety_paused = True
+        self._mover_node.cancel()          # abort any in-flight trajectory
+        self._dashboard.pause()            # pause robot via Dashboard Server
+        self._moving = False
+        self._safety_label.setText('⚠ SAFETY: HAND IN ZONE — ROBOT PAUSED')
+        self._safety_label.setStyleSheet(
+            'background:#5a0000; color:#ff6060; font-size:12px; font-weight:bold;'
+            'padding:6px; border:2px solid #ff3030; border-radius:6px;'
+        )
+        self._log('SAFETY INTERLOCK: hand detected in cutting zone — robot paused')
+
+    def _on_zone_clear(self):
+        if not self._safety_paused:
+            return
+        self._safety_paused = False
+        self._dashboard.resume()           # resume robot via Dashboard Server
+        self._safety_label.setText('🛡 Safety: zone clear — ready')
+        self._safety_label.setStyleSheet(
+            'background:#0a1f10; color:#4de87a; font-size:12px; font-weight:bold;'
+            'padding:6px; border:1px solid #2a7a40; border-radius:6px;'
+        )
+        self._log('SAFETY INTERLOCK: zone clear — robot resumed')
 
     # ── Detection ─────────────────────────────────────────────────────────────
 
@@ -1120,6 +1299,14 @@ class MainWindow(QMainWindow):
         self._cam_label.setCursor(Qt.ArrowCursor)
         self._grid_status.setText('No grid defined')
         self._grid_status.setStyleSheet('color:#8195a3; font-size:11px; padding-left:6px;')
+        # If interlock was active, release it when grid is cleared
+        if self._safety_paused:
+            self._on_zone_clear()
+        self._safety_label.setText('🛡 Safety: standby — define grid to activate interlock')
+        self._safety_label.setStyleSheet(
+            'background:#101a22; color:#7a8fa0; font-size:12px; font-weight:bold;'
+            'padding:6px; border:1px solid #2f4654; border-radius:6px;'
+        )
 
     def _cam_label_clicked(self, event):
         """
@@ -1151,6 +1338,18 @@ class MainWindow(QMainWindow):
             self._cam_label.setCursor(Qt.ArrowCursor)
             self._grid_status.setText('Grid locked — 4 points set')
             self._grid_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:6px;')
+            if self._hands_mp is not None:
+                self._safety_label.setText('🛡 Safety: active — monitoring cutting zone')
+                self._safety_label.setStyleSheet(
+                    'background:#0a1f10; color:#4de87a; font-size:12px; font-weight:bold;'
+                    'padding:6px; border:1px solid #2a7a40; border-radius:6px;'
+                )
+            else:
+                self._safety_label.setText('⚠ Safety: mediapipe not installed — interlock disabled')
+                self._safety_label.setStyleSheet(
+                    'background:#1f1a0a; color:#e0a000; font-size:12px; font-weight:bold;'
+                    'padding:6px; border:1px solid #7a5a00; border-radius:6px;'
+                )
 
     def _label_to_frame(self, pos):
         """
@@ -1308,6 +1507,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._camera.stop()
+        self._dashboard.close()
+        if self._hands_mp is not None:
+            self._hands_mp.close()
         try:
             self._js_node.destroy_node()
             self._mover_node.destroy_node()
@@ -1320,9 +1522,13 @@ class MainWindow(QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main(args=None):
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description='FruitNinja UR3e operator GUI')
+    parser.add_argument('--robot-ip', default='192.168.0.194',
+                        help='IP address of the UR3e controller (default: 192.168.0.194)')
+    parsed, remaining = parser.parse_known_args()
+    app = QApplication([sys.argv[0]] + remaining)
     app.setStyle('Fusion')
-    win = MainWindow()
+    win = MainWindow(robot_ip=parsed.robot_ip)
     win.show()
     sys.exit(app.exec_())
 
