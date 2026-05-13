@@ -143,6 +143,13 @@ def cell_to_pose(cell: str) -> tuple[float, float, float]:
     return _bilinear_tuple(CORNER_TOOL_POSES_M, u, v)
 
 
+def grid_uv_to_pose(u: float, v: float) -> tuple[float, float, float]:
+    """Return (x, y, z) for normalized grid coordinates u/v in [0, 1]."""
+    u = min(1.0, max(0.0, float(u)))
+    v = min(1.0, max(0.0, float(v)))
+    return _bilinear_tuple(CORNER_TOOL_POSES_M, u, v)
+
+
 def cell_to_tool_rotvec_rad(cell: str) -> tuple[float, float, float]:
     """Return interpolated UR tool rotation-vector (RX, RY, RZ) in radians."""
     u, v = _cell_uv(cell)
@@ -152,6 +159,13 @@ def cell_to_tool_rotvec_rad(cell: str) -> tuple[float, float, float]:
 def cell_to_joints_deg(cell: str) -> list[float]:
     """Return interpolated corner-calibrated joint angles in degrees."""
     u, v = _cell_uv(cell)
+    return list(_bilinear_tuple(CORNER_JOINTS_DEG, u, v))
+
+
+def grid_uv_to_joints_deg(u: float, v: float) -> list[float]:
+    """Return interpolated joint angles for normalized grid coordinates."""
+    u = min(1.0, max(0.0, float(u)))
+    v = min(1.0, max(0.0, float(v)))
     return list(_bilinear_tuple(CORNER_JOINTS_DEG, u, v))
 
 

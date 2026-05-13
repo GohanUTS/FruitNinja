@@ -1,0 +1,39 @@
+running develop
+running egg_info
+creating fruitninja.egg-info
+writing fruitninja.egg-info/PKG-INFO
+writing dependency_links to fruitninja.egg-info/dependency_links.txt
+writing entry points to fruitninja.egg-info/entry_points.txt
+writing requirements to fruitninja.egg-info/requires.txt
+writing top-level names to fruitninja.egg-info/top_level.txt
+writing manifest file 'fruitninja.egg-info/SOURCES.txt'
+reading manifest file 'fruitninja.egg-info/SOURCES.txt'
+writing manifest file 'fruitninja.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/python3.10/site-packages/fruitninja.egg-link (link to .)
+Installing grid_mover script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing gui script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing gui_sim script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing gui_ur3e script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing movement script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing planning_scene script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing real_gui_points script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing reset script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing safety_node script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+Installing startup_gui script to /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/lib/fruitninja
+
+Installed /home/gohan/ros2_ws/src/fruitninja/build/fruitninja
+running symlink_data
+creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/ament_index
+creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/ament_index/resource_index
+creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/ament_index/resource_index/packages
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/resource/fruitninja -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/ament_index/resource_index/packages
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/package.xml -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja
+creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/launch
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/launch/Movie.py -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/launch
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/launch/fruitninja.launch.py -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/launch
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/launch/Cutting.launch.py -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/launch
+creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/urdf
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/urdf/ur3e_workcell.urdf.xacro -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/urdf
+creating /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/meshes
+symbolically linking /home/gohan/ros2_ws/src/fruitninja/build/fruitninja/trolley/UR3eTrolley.dae -> /home/gohan/ros2_ws/src/fruitninja/install/fruitninja/share/fruitninja/meshes

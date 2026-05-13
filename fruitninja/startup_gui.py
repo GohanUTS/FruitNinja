@@ -7,10 +7,11 @@ HOW IT WORKS (overview)
 The UR3e robot stack requires several processes to start in order:
   Step 0 (sim only) — URSim Docker container running the virtual Polyscope
   Step 1 — ur_robot_driver   : speaks the RTDE protocol to the physical/sim robot
-  Step 2 — ur_moveit.launch  : MoveIt planner + RViz visualisation
-  Step 3 — planning_scene    : publishes workcell collision objects to MoveIt
-  Step 4 — real_gui_points   : the main operator GUI for cell selection + cutting
-  Step 5 — switch_controller : one-shot service call to activate the right controller
+  Step 2 — switch_controller : one-shot service call to activate the right controller
+  Step 3 — ur_moveit.launch  : MoveIt planner + RViz visualisation
+  Step 4 — planning_scene    : publishes workcell collision objects to MoveIt
+  Step 5 — real_gui_points   : the main operator GUI for cell selection + cutting
+  Step 6 — safety_node       : redundant hand-detection interlock
 
 Each step runs as an independent QProcess inside its own tab.
 The operator presses Start on each row in order and watches the tab output.
@@ -30,6 +31,7 @@ import os
 os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
 
 import sys
+import signal
 import subprocess
 import threading
 
@@ -97,7 +99,20 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'note':    'Wait until "Robot ready to receive control commands" appears in the log.',
         },
         {
-            'label':   'Step 2 — MoveIt',
+            'label':   'Step 2 — Fix Controller',
+            'desc':    'Activate scaled_joint_trajectory_controller for GUI motion',
+            'cmd':     SOURCE + (
+                "ros2 service call /controller_manager/switch_controller "
+                "controller_manager_msgs/srv/SwitchController "
+                "\"{activate_controllers: ['scaled_joint_trajectory_controller'], "
+                "deactivate_controllers: ['joint_trajectory_controller'], "
+                "strictness: 1, activate_asap: true, timeout: {sec: 5, nanosec: 0}}\""
+            ),
+            'oneshot': True,
+            'note':    'Run once after Step 1 is fully connected. If it waits, the UR driver/controller is not ready yet.',
+        },
+        {
+            'label':   'Step 3 — MoveIt',
             'desc':    'Launch MoveIt motion planning + RViz',
             'cmd':     SOURCE + (
                 'ros2 launch ur_moveit_config ur_moveit.launch.py '
@@ -111,14 +126,14 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'note':    'Wait for RViz to open and the robot model to appear.',
         },
         {
-            'label':   'Step 3 — Planning Scene',
+            'label':   'Step 4 — Planning Scene',
             'desc':    'Publish the planning scene (workcell / collision objects)',
             'cmd':     SOURCE + 'ros2 run fruitninja planning_scene',
             'oneshot': False,
             'note':    '',
         },
         {
-            'label':   'Step 4 — Main GUI',
+            'label':   'Step 5 — Main GUI',
             'desc':    'Open the grid-control GUI for cutting',
             'cmd':     SOURCE + f'ros2 run fruitninja real_gui_points --robot-ip {ip}',
             'oneshot': False,
@@ -130,19 +145,6 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'cmd':     SOURCE + f'ros2 run fruitninja safety_node --robot-ip {ip}',
             'oneshot': False,
             'note':    'Start after Step 4. Define the grid in the GUI to activate the interlock.',
-        },
-        {
-            'label':   'Step 5 — Fix Controller',
-            'desc':    'Switch to scaled_joint_trajectory_controller (run once after Step 1)',
-            'cmd':     SOURCE + (
-                "ros2 service call /controller_manager/switch_controller "
-                "controller_manager_msgs/srv/SwitchController "
-                "\"{activate_controllers: ['scaled_joint_trajectory_controller'], "
-                "deactivate_controllers: ['joint_trajectory_controller'], "
-                "strictness: 1, activate_asap: true, timeout: {sec: 5, nanosec: 0}}\""
-            ),
-            'oneshot': True,
-            'note':    'One-shot command — completes on its own.',
         },
     ]
     return steps
@@ -355,13 +357,14 @@ class StepRow(QObject):
         self._apply_status(*STATUS_RUNNING)
         self._write_output(f'Starting: {self._step["label"]}\n')
 
-        # Run the full bash command so ROS sourcing and chained commands work
-        self._proc.start('/bin/bash', ['-c', self._step['cmd']])
+        # Run each step in its own process group so Stop/Stop All can terminate
+        # ROS launch children too, not just the wrapper shell.
+        self._proc.start('/usr/bin/setsid', ['/bin/bash', '-lc', self._step['cmd']])
 
     def stop(self):
         if self._proc.state() != QProcess.NotRunning:
             self._write_output('Stopping process…\n')
-            self._proc.terminate()
+            self._terminate_group(signal.SIGTERM)
             self._apply_status(*STATUS_STOPPED)
         stop_cmd = self._step.get('stop_cmd')
         if stop_cmd:
@@ -381,7 +384,22 @@ class StepRow(QObject):
 
     def kill(self):
         if self._proc.state() != QProcess.NotRunning:
+            self._terminate_group(signal.SIGKILL)
+
+    def _terminate_group(self, sig):
+        pid = int(self._proc.processId())
+        if pid > 0:
+            try:
+                os.killpg(pid, sig)
+                return
+            except ProcessLookupError:
+                return
+            except Exception as e:
+                self._write_output(f'Process-group stop failed: {e}\n')
+        if sig == signal.SIGKILL:
             self._proc.kill()
+        else:
+            self._proc.terminate()
 
     # ── QProcess slots ────────────────────────────────────────────────────────
 

@@ -29,6 +29,7 @@ os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
 import sys
 import math
 import threading
+import time
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
@@ -36,10 +37,14 @@ from rclpy.action import ActionClient
 from sensor_msgs.msg import JointState, CompressedImage
 from std_msgs.msg import Bool, Float32MultiArray
 from control_msgs.action import FollowJointTrajectory
+from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
-from fruitninja.grid_mover import cell_to_pose, cell_to_joints_deg, GRID_COLS, GRID_ROWS
+from fruitninja.grid_mover import (
+    cell_to_pose, cell_to_joints_deg, grid_uv_to_pose,
+    grid_uv_to_joints_deg, GRID_COLS, GRID_ROWS,
+)
 
 import argparse
 import socket as _socket
@@ -98,6 +103,16 @@ APPROACH_LIFT_DELTA = -11.0  # matches legacy hover(-52°) → cut(-41°) spacin
 START_HOLD_SEC = 0.5
 MIN_MOVE_DURATION_SEC = 4.0
 MAX_JOINT_SPEED_DEG_S = 10.0
+CROSS_CUT_WRIST_DELTA_DEG = 90.0
+HAND_ZONE_MIN_LANDMARKS = 5
+HAND_ZONE_PALM_INDICES = (0, 5, 9, 13, 17)
+CLEAR_FRAMES_BEFORE_RESUME = 2
+
+# Trajectory tolerances (per joint, in radians).
+# Path tolerance applies during execution; goal tolerance applies at the end.
+# Set generously so small UR controller overshoot doesn't fail the whole sequence.
+PATH_TOLERANCE_RAD = math.radians(8.0)
+GOAL_TOLERANCE_RAD = math.radians(2.0)
 
 
 def _board_position(col_idx: int, row_idx: int) -> tuple:
@@ -153,6 +168,9 @@ class MoverNode(Node):
         super().__init__('real_gui_points_mover')
         self._client      = ActionClient(self, FollowJointTrajectory, TRAJECTORY_ACTION)
         self._cancel_flag = False
+        self._cancel_generation = 0
+        self._goal_handle = None
+        self._goal_lock   = threading.Lock()
 
     def move_to(self, degrees: list, done_cb, fail_cb, current_degrees: list = None):
         self._cancel_flag = False
@@ -160,9 +178,10 @@ class MoverNode(Node):
             fail_cb('No live joint state yet — wait for /joint_states before moving')
             return
         target_degrees = self._nearest_equivalent_target(degrees, current_degrees)
+        generation = self._cancel_generation
         threading.Thread(
             target=self._move_thread,
-            args=(current_degrees, target_degrees, done_cb, fail_cb),
+            args=(current_degrees, target_degrees, done_cb, fail_cb, generation),
             daemon=True,
         ).start()
 
@@ -207,23 +226,46 @@ class MoverNode(Node):
 
         goal.trajectory.points = [start, target]
         goal.goal_time_tolerance = self._duration_msg(5.0)
+
+        # Per-joint tolerances — without these the controller falls back to its
+        # configured defaults which are tight (~0.01 rad) and frequently fail
+        # the sequence with GOAL_TOLERANCE_VIOLATED on the real hardware even
+        # though the robot is physically capable of reaching the target.
+        for name in JOINT_NAMES:
+            path_t = JointTolerance()
+            path_t.name = name
+            path_t.position = PATH_TOLERANCE_RAD
+            goal.path_tolerance.append(path_t)
+
+            goal_t = JointTolerance()
+            goal_t.name = name
+            goal_t.position = GOAL_TOLERANCE_RAD
+            goal.goal_tolerance.append(goal_t)
         return goal
 
-    def _move_thread(self, current_degrees, target_degrees, done_cb, fail_cb):
+    def _was_cancelled(self, generation: int) -> bool:
+        return self._cancel_flag or generation != self._cancel_generation
+
+    def _move_thread(self, current_degrees, target_degrees, done_cb, fail_cb, generation):
         executor = rclpy.executors.SingleThreadedExecutor()
         executor.add_node(self)
+        goal_handle = None
         try:
             if not self._client.wait_for_server(timeout_sec=5.0):
-                fail_cb('Scaled trajectory controller action not available')
+                fail_cb(
+                    f'No action server at {TRAJECTORY_ACTION}. '
+                    'Run Startup Step 2 — Fix Controller, and confirm the UR '
+                    'driver is fully connected / External Control is playing.'
+                )
                 return
-            if self._cancel_flag:
+            if self._was_cancelled(generation):
                 fail_cb('Cancelled')
                 return
 
             goal = self._make_trajectory_goal(current_degrees, target_degrees)
             future = self._client.send_goal_async(goal)
             executor.spin_until_future_complete(future)
-            if self._cancel_flag:
+            if self._was_cancelled(generation):
                 fail_cb('Cancelled')
                 return
 
@@ -231,10 +273,12 @@ class MoverNode(Node):
             if not goal_handle.accepted:
                 fail_cb('Trajectory rejected by scaled_joint_trajectory_controller')
                 return
+            with self._goal_lock:
+                self._goal_handle = goal_handle
  
             result_future = goal_handle.get_result_async()
             executor.spin_until_future_complete(result_future)
-            if self._cancel_flag: 
+            if self._was_cancelled(generation):
                 fail_cb('Cancelled')
                 return
 
@@ -245,10 +289,24 @@ class MoverNode(Node):
                 msg = result.error_string or 'no controller error string'
                 fail_cb(f'Trajectory failed (code: {result.error_code}): {msg}')
         finally:
+            with self._goal_lock:
+                if self._goal_handle is goal_handle:
+                    self._goal_handle = None
             executor.remove_node(self)
 
     def cancel(self):
         self._cancel_flag = True
+        self._cancel_generation += 1
+        with self._goal_lock:
+            goal_handle = self._goal_handle
+        if goal_handle is not None:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception as e:
+                self.get_logger().warn(f'Failed to cancel active trajectory goal: {e}')
+
+    def clear_cancel(self):
+        self._cancel_flag = False
 
 
 # ── Camera + safety bridge node ───────────────────────────────────────────────
@@ -273,7 +331,9 @@ class CameraBridgeNode(Node):
         self.create_subscription(Bool, '/safety/hand_detected', hand_cb, 10)
 
     def publish_frame(self, frame):
-        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Quality 60 is plenty for hand detection downstream, ~50% smaller
+        # than 80 — meaningfully reduces encode time and topic bandwidth.
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
         if not ok:
             return
         msg = CompressedImage()
@@ -289,6 +349,11 @@ class CameraBridgeNode(Node):
         msg.data = [float(v) for v in flat]
         self._pub_zone.publish(msg)
 
+    def clear_zone(self):
+        msg = Float32MultiArray()
+        msg.data = []
+        self._pub_zone.publish(msg)
+
 
 # ── UR3e Dashboard safety interlock ───────────────────────────────────────────
 
@@ -297,9 +362,6 @@ class UR3eDashboard:
     Thin TCP wrapper for the UR Dashboard Server (port 29999).
     Used by the safety interlock to pause/resume the robot when a hand
     is detected inside the cutting zone.
-
-    Uses 'pause' / 'play' — not 'stop' — so the robot resumes from exactly
-    where it paused without needing to re-home.
 
     Connection failure is silent: if the dashboard is unreachable the safety
     layer still blocks new trajectories via the _cancel_flag path.
@@ -335,6 +397,10 @@ class UR3eDashboard:
         if not self._paused:
             self._send('pause')
             self._paused = True
+
+    def stop(self):
+        self._send('stop')
+        self._paused = False
 
     def resume(self):
         if self._paused:
@@ -511,6 +577,7 @@ class MainWindow(QMainWindow):
     _status_sig = pyqtSignal(str, str)
     _log_sig    = pyqtSignal(str)
     _cam_sig    = pyqtSignal(object)
+    _safety_sig = pyqtSignal(bool)
 
     def __init__(self, robot_ip: str = '192.168.0.194'):
         super().__init__()
@@ -529,6 +596,15 @@ class MainWindow(QMainWindow):
         self._grid_pts       = []    # up to 4 (x, y) in frame coords
         self._selecting_grid = False
         self._last_frame_wh  = None  # (w, h) of last received frame
+
+        # Per-frame throttle counter — MediaPipe Hands is ~30 ms/frame on CPU,
+        # which alone exceeds the 33 ms budget at 30 fps and makes the feed
+        # visibly lag.  Heavier work runs only every Nth frame so the display
+        # stays smooth while detection still updates several times a second.
+        self._frame_counter = 0
+        self._last_zone_publish_frame = 0
+        self._safety_clear_frames = 0
+        self._resume_after_safety = None
 
         # Latest fruit detections: list of {'label', 'origin', 'covered': [cells]}
         self._detected_fruits = []
@@ -553,6 +629,7 @@ class MainWindow(QMainWindow):
         self._status_sig.connect(lambda t, c: self._set_status(t, c))
         self._log_sig.connect(self._log_widget.append)
         self._cam_sig.connect(self._update_camera_frame)
+        self._safety_sig.connect(self._handle_safety_node_detection)
         self._camera.frame_ready.connect(
             lambda f: self._cam_sig.emit(f)
         )
@@ -768,6 +845,22 @@ class MainWindow(QMainWindow):
         self._selected_cells.clear()
         self._set_status('Selection cleared', '#aaaaaa')
 
+    def _set_resume_motion(self, label: str, callback):
+        self._resume_after_safety = (label, callback)
+
+    def _clear_resume_motion(self):
+        self._resume_after_safety = None
+
+    def _resume_interrupted_motion(self):
+        if self._resume_after_safety is None:
+            return
+        label, callback = self._resume_after_safety
+        self._resume_after_safety = None
+        self._moving = True
+        self._mover_node.clear_cancel()
+        self._log(f'SAFETY INTERLOCK: resuming {label}')
+        QTimer.singleShot(500, callback)
+
     def _trace_grid(self):
         """Visit all 4 grid corners: A1 → N1 → N4 → A4."""
         if self._safety_paused:
@@ -777,6 +870,7 @@ class MainWindow(QMainWindow):
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
         self._moving = True
+        self._clear_resume_motion()
         corners = ['A1', 'N1', 'N4', 'A4']
         self._log(f'Trace: {" → ".join(corners)}')
         self._move_next(corners)
@@ -796,6 +890,7 @@ class MainWindow(QMainWindow):
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
         self._moving = True
+        self._clear_resume_motion()
         queue = list(self._selected_cells)   # already sorted left-to-right
         self._log(f'Queue: {" → ".join(queue)}')
         self._move_next(queue)
@@ -814,11 +909,16 @@ class MainWindow(QMainWindow):
         if not queue or self._mover_node._cancel_flag:
             self._moving = False
             if not queue:
+                self._clear_resume_motion()
                 self._status_sig.emit('All cells reached', '#00cc00')
                 self._log_sig.emit('Sequence complete')
             return
         cell = queue[0]
         remaining = queue[1:]
+        self._set_resume_motion(
+            f'manual sequence from {cell}',
+            lambda q=list(queue): self._move_next(q),
+        )
         col_idx = GRID_COLS.index(cell[0])
         row_idx = GRID_ROWS.index(cell[1])
         bx, by, bz = _board_position(col_idx, row_idx)
@@ -838,11 +938,17 @@ class MainWindow(QMainWindow):
         def _on_arrive():
             self._log_sig.emit(f'Reached {cell} — cutting')
             self._status_sig.emit(f'Cutting at {cell}…', '#e0a000')
+            # Use the LIVE joint state, not approach_degrees: the previous
+            # move may have been wrapped by _nearest_equivalent_target so the
+            # robot now sits at an angle ±360° from approach_degrees.  Passing
+            # the stale "commanded" target here causes the next wrap to be
+            # computed against the wrong reference, which is what made the
+            # arm spin or loop instead of moving smoothly.
             self._mover_node.move_to(
                 cut_degrees,
                 done_cb=_on_cut,
                 fail_cb=_on_fail,
-                current_degrees=approach_degrees,
+                current_degrees=self._current_joint_degrees(),
             )
 
         def _on_cut():
@@ -851,10 +957,13 @@ class MainWindow(QMainWindow):
                 approach_degrees,
                 done_cb=lambda: self._move_next(remaining),
                 fail_cb=_on_fail,
-                current_degrees=cut_degrees,
+                current_degrees=self._current_joint_degrees(),
             )
 
         def _on_fail(msg):
+            if 'Cancelled' in msg:
+                return
+            self._clear_resume_motion()
             self._status_sig.emit(f'Failed at {cell}: {msg}', '#ff4444')
             self._log_sig.emit(f'FAIL at {cell}: {msg}')
             setattr(self, '_moving', False)
@@ -871,13 +980,41 @@ class MainWindow(QMainWindow):
             return None
         return [math.degrees(self._current_joints_rad[name]) for name in JOINT_NAMES]
 
+    def _fruit_target(self, fruit: dict) -> dict:
+        grid_x, grid_y = fruit['grid_xy']
+        col_pos = min(len(GRID_COLS) - 1, max(0.0, grid_x - 0.5))
+        row_pos = min(len(GRID_ROWS) - 1, max(0.0, grid_y - 0.5))
+        u = col_pos / (len(GRID_COLS) - 1)
+        v = row_pos / (len(GRID_ROWS) - 1)
+
+        cut = grid_uv_to_joints_deg(u, v)
+        approach = list(cut)
+        approach[1] += APPROACH_LIFT_DELTA
+
+        cut_cross = list(cut)
+        cut_cross[5] += CROSS_CUT_WRIST_DELTA_DEG
+        approach_cross = list(cut_cross)
+        approach_cross[1] += APPROACH_LIFT_DELTA
+
+        x, y, z = grid_uv_to_pose(u, v)
+        return {
+            'cut': cut,
+            'approach': approach,
+            'cut_cross': cut_cross,
+            'approach_cross': approach_cross,
+            'tool': (x, y, z),
+        }
+
     def _cut_detected_fruit(self):
         """
         Automated cut sequence driven by camera detection.
-        Builds a queue of all detected fruit cells (origin first, no duplicates)
-        and runs the standard approach→cut→recover loop through each one.
+        Cuts each detected fruit at its contour centroid, then repeats the cut
+        with wrist 3 rotated 90 degrees for a cross-cut.
         Requires the manual grid to be defined (4 corner points clicked) before running.
         """
+        if self._safety_paused:
+            self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
+            return
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
@@ -888,25 +1025,125 @@ class MainWindow(QMainWindow):
             self._set_status('Define the grid before cutting detected fruit', '#e0a000')
             return
 
-        # Queue: origin first, then remaining covered cells (no duplicates)
-        queue = []
-        seen  = set()
-        for fruit in self._detected_fruits:
-            ordered = [fruit['origin']] + [c for c in fruit['covered']
-                                           if c != fruit['origin']]
-            for c in ordered:
-                if c not in seen:
-                    seen.add(c)
-                    queue.append(c)
-
-        if not queue:
+        fruits = sorted(
+            self._detected_fruits,
+            key=lambda f: (f['grid_xy'][0], f['grid_xy'][1]),
+        )
+        if not fruits:
             self._set_status('No valid cells from detection', '#e0a000')
             return
 
         self._moving = True
-        self._log(f'Cut (detected): {" → ".join(queue)}')
-        self._status_sig.emit(f'Cutting {len(queue)} detected cell(s)…', '#3a7aff')
-        self._move_next(queue)
+        self._clear_resume_motion()
+        self._log('Cut (detected): ' + ' → '.join(f["origin"] for f in fruits))
+        self._status_sig.emit(f'Cutting {len(fruits)} detected fruit(s)…', '#3a7aff')
+        self._cut_next_fruit(fruits)
+
+    def _cut_next_fruit(self, fruits: list):
+        if self._safety_paused or self._mover_node._cancel_flag:
+            if not self._safety_paused:
+                self._clear_resume_motion()
+            self._moving = False
+            return
+        if not fruits:
+            self._moving = False
+            self._clear_resume_motion()
+            self._status_sig.emit('Detected fruit cut complete', '#00cc00')
+            self._log_sig.emit('Detected fruit sequence complete')
+            return
+
+        fruit = fruits[0]
+        remaining = fruits[1:]
+        self._set_resume_motion(
+            f'detected fruit sequence from {fruit["origin"]}',
+            lambda q=list(fruits): self._cut_next_fruit(q),
+        )
+        target = self._fruit_target(fruit)
+        x, y, z = target['tool']
+        label = fruit['origin']
+        gx, gy = fruit['grid_xy']
+        self._log(
+            f'Fruit {label}: centroid grid=({gx:.2f}, {gy:.2f})  '
+            f'tool=({x*1000:.1f}, {y*1000:.1f}, {z*1000:.1f}) mm  '
+            f'cross wrist +{CROSS_CUT_WRIST_DELTA_DEG:.0f}°'
+        )
+        self._status_sig.emit(f'Cutting fruit at {label}…', '#3a7aff')
+
+        def _safe_to_continue() -> bool:
+            if self._safety_paused or self._mover_node._cancel_flag:
+                self._moving = False
+                return False
+            return True
+
+        def _on_first_approach():
+            if not _safe_to_continue():
+                return
+            self._status_sig.emit(f'First cut at {label}…', '#e0a000')
+            self._mover_node.move_to(
+                target['cut'],
+                done_cb=_on_first_cut,
+                fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
+            )
+
+        def _on_first_cut():
+            if not _safe_to_continue():
+                return
+            self._log_sig.emit(f'First cut at {label} — lifting')
+            self._mover_node.move_to(
+                target['approach'],
+                done_cb=_on_recovered,
+                fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
+            )
+
+        def _on_recovered():
+            if not _safe_to_continue():
+                return
+            self._status_sig.emit(f'Rotating cutter for cross-cut at {label}…', '#e0a000')
+            self._mover_node.move_to(
+                target['approach_cross'],
+                done_cb=_on_cross_ready,
+                fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
+            )
+
+        def _on_cross_ready():
+            if not _safe_to_continue():
+                return
+            self._status_sig.emit(f'Cross-cut at {label}…', '#e0a000')
+            self._mover_node.move_to(
+                target['cut_cross'],
+                done_cb=_on_cross_cut,
+                fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
+            )
+
+        def _on_cross_cut():
+            if not _safe_to_continue():
+                return
+            self._log_sig.emit(f'Cross-cut at {label} — lifting')
+            self._mover_node.move_to(
+                target['approach_cross'],
+                done_cb=lambda: self._cut_next_fruit(remaining),
+                fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
+            )
+
+        def _on_fail(msg):
+            if 'Cancelled' in msg:
+                return
+            self._clear_resume_motion()
+            self._status_sig.emit(f'Fruit cut failed at {label}: {msg}', '#ff4444')
+            self._log_sig.emit(f'FAIL fruit {label}: {msg}')
+            setattr(self, '_moving', False)
+
+        self._mover_node.move_to(
+            target['approach'],
+            done_cb=_on_first_approach,
+            fail_cb=_on_fail,
+            current_degrees=self._current_joint_degrees(),
+        )
 
     def _stop(self):
         """
@@ -916,10 +1153,12 @@ class MainWindow(QMainWindow):
         Keeps _moving=True for 2 seconds so the user cannot immediately send a new
         trajectory while the controller is still finishing the current one.
         """
+        self._clear_resume_motion()
         self._mover_node.cancel()
+        self._dashboard.stop()
         self._moving = True   # block new moves until cooldown expires
         self._set_status('⚠ EMERGENCY STOP — wait 2 s before moving', '#ff4444')
-        self._log('EMERGENCY STOP triggered')
+        self._log('EMERGENCY STOP triggered — trajectory cancelled and robot stopped')
         QTimer.singleShot(2000, self._estop_cooldown_done)
 
     def _estop_cooldown_done(self):
@@ -939,6 +1178,7 @@ class MainWindow(QMainWindow):
             self._set_status('Moving — press Stop first', '#e0a000')
             return
         self._moving = True
+        self._clear_resume_motion()
         self._set_status('Moving to Home…', '#e0a000')
         self._log('Resetting to home position')
         self._mover_node.move_to(
@@ -1112,20 +1352,42 @@ class MainWindow(QMainWindow):
         h, w = frame.shape[:2]
         self._last_frame_wh = (w, h)
 
-        # Only run detection once the grid is fully defined
+        self._frame_counter += 1
+        # MediaPipe Hands runs every 3rd frame (~10 Hz hand detection).
+        # Red detection runs every 2nd frame (~15 Hz fruit detection).
+        # All frames still display, draw the grid overlay, and publish.
+        run_hands = (self._frame_counter % 3 == 0)
+        run_detect = (self._frame_counter % 2 == 0)
+
+        # Only run detection/safety once the grid is fully defined. The safety
+        # node also gets frames only while this locked zone exists, so it cannot
+        # keep using an old grid after the operator clears or redefines it.
         if len(self._grid_pts) == 4:
-            self._detect_in_grid(frame)
-            # Safety interlock — hand detection runs on every frame
-            if self._check_hand_in_zone(frame):
-                self._on_hand_detected()
-            else:
-                self._on_zone_clear()
+            if run_detect:
+                self._detect_in_grid(frame)
+            if run_hands:
+                # Safety interlock — hand detection runs on every Nth frame
+                if self._check_hand_in_zone(frame):
+                    self._safety_clear_frames = 0
+                    self._on_hand_detected()
+                else:
+                    if self._safety_paused:
+                        self._safety_clear_frames += 1
+                        if self._safety_clear_frames >= CLEAR_FRAMES_BEFORE_RESUME:
+                            self._on_zone_clear()
+            if self._frame_counter - self._last_zone_publish_frame >= 15:
+                self._bridge_node.publish_zone(self._grid_pts)
+                self._last_zone_publish_frame = self._frame_counter
+        else:
+            self._detected_fruits = []
 
         # Draw grid overlay / in-progress dots on top
         self._draw_grid_overlay(frame)
 
-        # Publish raw frame to /camera/image_raw/compressed for safety_node
-        self._bridge_node.publish_frame(frame)
+        # Publish frame to safety_node every 2nd frame to halve bandwidth and
+        # downstream MediaPipe load.  Safety reaction stays well under 100 ms.
+        if len(self._grid_pts) == 4 and self._frame_counter % 2 == 0:
+            self._bridge_node.publish_frame(frame)
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
@@ -1160,49 +1422,74 @@ class MainWindow(QMainWindow):
         hand_in_zone = False
         if result.multi_hand_landmarks:
             for hand_lms in result.multi_hand_landmarks:
-                # Draw landmarks
-                _mp_drawing.draw_landmarks(
-                    frame, hand_lms,
-                    _mp_hands.HAND_CONNECTIONS,
-                    _mp_drawing_styles.get_default_hand_landmarks_style(),
-                    _mp_drawing_styles.get_default_hand_connections_style(),
+                pts = [
+                    (int(lm.x * w), int(lm.y * h))
+                    for lm in hand_lms.landmark
+                ]
+                inside = [
+                    pt for pt in pts
+                    if cv2.pointPolygonTest(poly, pt, False) >= 0
+                ]
+                palm_pts = [pts[i] for i in HAND_ZONE_PALM_INDICES]
+                palm_inside_count = sum(
+                    1 for pt in palm_pts
+                    if cv2.pointPolygonTest(poly, pt, False) >= 0
                 )
-                # Check every landmark against the grid polygon
-                for lm in hand_lms.landmark:
-                    px, py = int(lm.x * w), int(lm.y * h)
-                    if cv2.pointPolygonTest(poly, (px, py), False) >= 0:
-                        hand_in_zone = True
-                        break
-                if hand_in_zone:
+                palm_center = (
+                    int(sum(p[0] for p in palm_pts) / len(palm_pts)),
+                    int(sum(p[1] for p in palm_pts) / len(palm_pts)),
+                )
+                palm_inside = cv2.pointPolygonTest(poly, palm_center, False) >= 0
+
+                # Only trip when the hand body is actually in the locked grid,
+                # not when MediaPipe sees fingertips or a skeleton near it.
+                if palm_inside or (
+                    len(inside) >= HAND_ZONE_MIN_LANDMARKS
+                    and palm_inside_count >= 2
+                ):
+                    hand_in_zone = True
+                    _mp_drawing.draw_landmarks(
+                        frame, hand_lms,
+                        _mp_hands.HAND_CONNECTIONS,
+                        _mp_drawing_styles.get_default_hand_landmarks_style(),
+                        _mp_drawing_styles.get_default_hand_connections_style(),
+                    )
                     break
 
         return hand_in_zone
 
-    def _on_hand_detected(self):
+    def _on_hand_detected(self, source: str = 'local camera'):
         if self._safety_paused:
             return
         self._safety_paused = True
+        self._safety_clear_frames = 0
         self._mover_node.cancel()          # abort any in-flight trajectory
-        self._dashboard.pause()            # pause robot via Dashboard Server
+        self._dashboard.pause()            # pause External Control / UR program
         self._moving = False
         self._safety_label.setText('⚠ SAFETY: HAND IN ZONE — ROBOT PAUSED')
         self._safety_label.setStyleSheet(
             'background:#5a0000; color:#ff6060; font-size:12px; font-weight:bold;'
             'padding:6px; border:2px solid #ff3030; border-radius:6px;'
         )
-        self._log('SAFETY INTERLOCK: hand detected in cutting zone — robot paused')
+        self._log(f'SAFETY INTERLOCK: hand detected by {source} — trajectory cancelled and robot paused')
 
     def _on_zone_clear(self):
         if not self._safety_paused:
             return
         self._safety_paused = False
-        self._dashboard.resume()           # resume robot via Dashboard Server
-        self._safety_label.setText('🛡 Safety: zone clear — ready')
+        self._safety_clear_frames = 0
+        self._mover_node.clear_cancel()
+        self._dashboard.resume()
+        self._safety_label.setText('🛡 Safety: zone clear — resuming motion')
         self._safety_label.setStyleSheet(
             'background:#0a1f10; color:#4de87a; font-size:12px; font-weight:bold;'
             'padding:6px; border:1px solid #2a7a40; border-radius:6px;'
         )
-        self._log('SAFETY INTERLOCK: zone clear — robot resumed')
+        if self._resume_after_safety is not None:
+            self._log('SAFETY INTERLOCK: zone clear — resuming interrupted motion')
+            self._resume_interrupted_motion()
+        else:
+            self._log('SAFETY INTERLOCK: zone clear — ready')
 
     # ── Detection ─────────────────────────────────────────────────────────────
 
@@ -1214,9 +1501,10 @@ class MainWindow(QMainWindow):
           1. Build a perspective transform H from the 4 clicked corner points
              that maps frame pixels → grid coordinates (0..14, 0..4).
           2. For each red contour:
-             a. Skip if centroid maps outside the grid (0 ≤ col < 14, 0 ≤ row < 4).
-             b. 'origin cell'  = the grid cell the centroid lands in.
-             c. 'covered cells' = all cells touched by the bounding-box corners.
+             a. Use contour moments for the fruit origin/centroid.
+             b. Skip if centroid maps outside the grid (0 ≤ col < 14, 0 ≤ row < 4).
+             c. 'origin cell'  = the grid cell the centroid lands in.
+             d. 'covered cells' = all cells touched by the bounding-box corners.
           3. Draws bounding box + label on the frame (annotations are visible in GUI).
           4. Stores results in self._detected_fruits for use by _cut_detected_fruit.
 
@@ -1233,12 +1521,25 @@ class MainWindow(QMainWindow):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         kernel = np.ones((5, 5), np.uint8)
 
+        # Restrict detection to inside the user-defined quad — anything outside
+        # (face, walls, hands, etc.) is masked out at the source.
+        quad_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(quad_mask,
+                           np.array(self._grid_pts, dtype=np.int32), 255)
+
+        # HSV gates tuned to reject skin: skin sits around H 0..20, S 30..130.
+        # Real ripe-red fruit pegs S above ~170, so the high S floor here
+        # rejects faces/hands/arms while still catching tomatoes/apples.
         profiles = [
             ('Red',  (0, 80, 255), [
-                (np.array([0,   100, 80]),   np.array([10,  255, 255])),
-                (np.array([170, 100, 80]),   np.array([180, 255, 255])),
+                (np.array([0,   170, 90]),   np.array([8,   255, 255])),
+                (np.array([172, 170, 90]),   np.array([180, 255, 255])),
             ]),
         ]
+
+        # Minimum geometric thresholds — also help filter spurious blobs.
+        MIN_AREA_PX     = 400    # ignore anything smaller than ~20×20 px
+        MIN_SOLIDITY    = 0.70   # area / convex-hull area; skin patches are wispy
 
         def cell_name(c, r):
             return f"{chr(ord('A') + c)}{r + 1}"
@@ -1250,21 +1551,35 @@ class MainWindow(QMainWindow):
             mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
             for lo, hi in ranges:
                 mask |= cv2.inRange(hsv, lo, hi)
+            mask = cv2.bitwise_and(mask, quad_mask)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                            cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < MIN_AREA_PX:
+                    continue
+                hull_area = cv2.contourArea(cv2.convexHull(cnt))
+                if hull_area > 0 and (area / hull_area) < MIN_SOLIDITY:
+                    continue
                 x, y, w, h = cv2.boundingRect(cnt)
                 if w < 12 or h < 12:
                     continue
-                cx, cy = x + w // 2, y + h // 2
+                moments = cv2.moments(cnt)
+                if abs(moments['m00']) < 1e-6:
+                    continue
+                cx = int(moments['m10'] / moments['m00'])
+                cy = int(moments['m01'] / moments['m00'])
+                rect = cv2.minAreaRect(cnt)
+                shape_angle = float(rect[2])
 
                 # Origin cell from centroid
                 uv = cv2.perspectiveTransform(
                     np.float32([[[cx, cy]]]), H
                 )[0][0]
+                grid_x, grid_y = float(uv[0]), float(uv[1])
                 col_i, row_i = int(uv[0]), int(uv[1])
                 if not (0 <= col_i < n_cols and 0 <= row_i < n_rows):
                     continue
@@ -1299,11 +1614,18 @@ class MainWindow(QMainWindow):
 
                 info_lines.append(
                     f'{label}  origin: {origin_cell}  '
+                    f'grid: ({grid_x:.2f}, {grid_y:.2f})  '
                     f'cells ({len(covered)}): {", ".join(covered)}'
                 )
-                fruits.append({'label': label,
-                                'origin': origin_cell,
-                                'covered': covered})
+                fruits.append({
+                    'label': label,
+                    'origin': origin_cell,
+                    'grid_xy': (grid_x, grid_y),
+                    'frame_xy': (cx, cy),
+                    'covered': covered,
+                    'area_px': float(area),
+                    'shape_angle_deg': shape_angle,
+                })
 
         self._detected_fruits = fruits
         if hasattr(self, '_detect_info'):
@@ -1326,6 +1648,12 @@ class MainWindow(QMainWindow):
         self._selecting_grid = checked
         if checked:
             self._grid_pts = []
+            self._detected_fruits = []
+            self._clear_resume_motion()
+            if hasattr(self, '_bridge_node'):
+                self._bridge_node.clear_zone()
+            if self._safety_paused:
+                self._on_zone_clear()
             self._grid_status.setText('Click point 1 of 4 on the camera feed')
             self._grid_status.setStyleSheet('color:#ffd166; font-size:11px; padding-left:6px;')
             self._cam_label.setCursor(Qt.CrossCursor)
@@ -1337,11 +1665,18 @@ class MainWindow(QMainWindow):
 
     def _clear_grid(self):
         self._grid_pts = []
+        self._detected_fruits = []
+        self._clear_resume_motion()
         self._selecting_grid = False
         self._btn_define_grid.setChecked(False)
         self._cam_label.setCursor(Qt.ArrowCursor)
         self._grid_status.setText('No grid defined')
         self._grid_status.setStyleSheet('color:#8195a3; font-size:11px; padding-left:6px;')
+        self._set_status('Grid cleared — safety standby', '#aaaaaa')
+        if hasattr(self, '_bridge_node'):
+            self._bridge_node.clear_zone()
+        if hasattr(self, '_detect_info'):
+            self._detect_info.setPlainText('')
         # If interlock was active, release it when grid is cleared
         if self._safety_paused:
             self._on_zone_clear()
@@ -1383,6 +1718,7 @@ class MainWindow(QMainWindow):
             self._grid_status.setStyleSheet('color:#00cc88; font-size:11px; padding-left:6px;')
             # Publish zone to safety_node
             self._bridge_node.publish_zone(self._grid_pts)
+            self._last_zone_publish_frame = self._frame_counter
             if self._hands_mp is not None:
                 self._safety_label.setText('🛡 Safety: active — monitoring cutting zone')
                 self._safety_label.setStyleSheet(
@@ -1548,17 +1884,24 @@ class MainWindow(QMainWindow):
             exe.add_node(self._js_node)
             exe.add_node(self._bridge_node)
             threading.Thread(target=exe.spin, daemon=True).start()
+            self._bridge_node.clear_zone()
             self._log('ROS2 nodes started')
         except Exception as e:
             self._log(f'ROS2 init failed: {e}')
 
     def _on_safety_node_detection(self, msg: Bool):
         """Called from the ROS spin thread — route to main thread via signal."""
-        if msg.data:
-            self._status_sig.emit('⚠ SAFETY: HAND IN ZONE — ROBOT PAUSED', '#ff4444')
-        else:
-            if self._safety_paused:
-                self._status_sig.emit('🛡 Safety: zone clear — ready', '#4de87a')
+        self._safety_sig.emit(bool(msg.data))
+
+    def _handle_safety_node_detection(self, hand_detected: bool):
+        if hand_detected:
+            self._safety_clear_frames = 0
+            if len(self._grid_pts) == 4:
+                self._on_hand_detected(source='safety node')
+        elif self._safety_paused:
+            self._safety_clear_frames += 1
+            if self._safety_clear_frames >= CLEAR_FRAMES_BEFORE_RESUME:
+                self._on_zone_clear()
 
     def closeEvent(self, event):
         self._camera.stop()

@@ -1,0 +1,1 @@
+/home/gohan/ros2_ws/src/fruitninja/build/fruitninja/launch/fruitninja.launch.py

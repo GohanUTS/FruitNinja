@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, TimerAction, DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -32,10 +33,16 @@ def generate_launch_description():
         default_value='50001',
         description='Reverse port for UR External Control program (real robot)',
     )
+    safety_arg = DeclareLaunchArgument(
+        'enable_safety_node',
+        default_value='true',
+        description='Run the standalone hand-detection safety_node alongside the GUI',
+    )
 
-    robot_ip     = LaunchConfiguration('robot_ip')
-    use_fake_hw  = LaunchConfiguration('use_fake_hardware')
-    reverse_port = LaunchConfiguration('reverse_port')
+    robot_ip       = LaunchConfiguration('robot_ip')
+    use_fake_hw    = LaunchConfiguration('use_fake_hardware')
+    reverse_port   = LaunchConfiguration('reverse_port')
+    enable_safety  = LaunchConfiguration('enable_safety_node')
 
     # ── 1. UR Robot Driver ─────────────────────────────────────────────────────
     ur_control = IncludeLaunchDescription(
@@ -87,11 +94,32 @@ def generate_launch_description():
         ]
     )
 
+    # ── 4. Safety hand-detection node (delayed 14s, optional) ─────────────────
+    # Subscribes to /camera/image_raw/compressed (published by the GUI),
+    # runs MediaPipe Hands, and pauses the UR Dashboard when a hand enters
+    # the cutting zone.  The GUI also runs MediaPipe locally for visual
+    # feedback; this node provides the redundant out-of-process backup.
+    safety_node = TimerAction(
+        period=14.0,
+        actions=[
+            Node(
+                package='fruitninja',
+                executable='safety_node',
+                name='fruitninja_safety',
+                output='screen',
+                parameters=[{'robot_ip': robot_ip}],
+                condition=IfCondition(enable_safety),
+            )
+        ]
+    )
+
     return LaunchDescription([
         robot_ip_arg,
         fake_hw_arg,
         reverse_port_arg,
+        safety_arg,
         ur_control,
         ur_moveit,
         planning_scene,
+        safety_node,
     ])
