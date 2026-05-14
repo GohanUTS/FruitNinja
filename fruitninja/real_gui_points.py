@@ -114,6 +114,14 @@ CLEAR_FRAMES_BEFORE_RESUME = 2
 PATH_TOLERANCE_RAD = math.radians(8.0)
 GOAL_TOLERANCE_RAD = math.radians(2.0)
 
+# Compressed frame size published to /camera/image_raw/compressed for safety_node.
+# 640x480 is the sweet spot for MediaPipe Hands — fast inference without losing
+# the spatial resolution needed to resolve hand position against the grid polygon.
+# Any camera source (webcam, RealSense, Other) is scaled to this before encoding.
+SAFETY_FRAME_W = 640
+SAFETY_FRAME_H = 480
+SAFETY_JPEG_QUALITY = 60
+
 
 def _board_position(col_idx: int, row_idx: int) -> tuple:
     """Return (x, y, z) for a grid cell by index, delegating to grid_mover."""
@@ -331,9 +339,15 @@ class CameraBridgeNode(Node):
         self.create_subscription(Bool, '/safety/hand_detected', hand_cb, 10)
 
     def publish_frame(self, frame):
-        # Quality 60 is plenty for hand detection downstream, ~50% smaller
-        # than 80 — meaningfully reduces encode time and topic bandwidth.
-        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        # Resize to fixed 640x480 before encoding so MediaPipe always receives
+        # a consistent frame size regardless of camera source resolution.
+        # INTER_AREA is fastest for downscaling and preserves edge sharpness.
+        h, w = frame.shape[:2]
+        if w != SAFETY_FRAME_W or h != SAFETY_FRAME_H:
+            frame = cv2.resize(frame, (SAFETY_FRAME_W, SAFETY_FRAME_H),
+                               interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode('.jpg', frame,
+                               [cv2.IMWRITE_JPEG_QUALITY, SAFETY_JPEG_QUALITY])
         if not ok:
             return
         msg = CompressedImage()
@@ -487,8 +501,8 @@ class CameraWorker(QObject):
             self.stopped.emit('')
 
     def _run_v4l2(self, source: int):
-        # Webcam=0, Fisheye=2 (try /dev/video2), DJI=3 (try /dev/video3)
-        dev_index = {0: 0, 2: 2, 3: 3}.get(source, 0)
+        # Webcam=0, Other=2 (/dev/video2 — any non-standard USB camera)
+        dev_index = {0: 0, 2: 2}.get(source, 0)
         self._cap = cv2.VideoCapture(dev_index)
         if not self._cap.isOpened():
             self._cap = None
@@ -1224,10 +1238,9 @@ class MainWindow(QMainWindow):
         ctrl.setSpacing(6)
 
         self._cam_combo = QComboBox()
-        self._cam_combo.addItem('Webcam',            0)
-        self._cam_combo.addItem('RealSense D435i',   1)
-        self._cam_combo.addItem('Fisheye',           2)
-        self._cam_combo.addItem('Osmo DJI Pocket 3', 3)
+        self._cam_combo.addItem('Webcam',          0)
+        self._cam_combo.addItem('RealSense D435i', 1)
+        self._cam_combo.addItem('Other',           2)
         self._cam_combo.setFixedWidth(160)
         self._cam_combo.setStyleSheet(
             'QComboBox{background:#08131a;color:#c9d6de;border:1px solid #325262;'
@@ -1384,8 +1397,9 @@ class MainWindow(QMainWindow):
         # Draw grid overlay / in-progress dots on top
         self._draw_grid_overlay(frame)
 
-        # Publish frame to safety_node every 2nd frame to halve bandwidth and
-        # downstream MediaPipe load.  Safety reaction stays well under 100 ms.
+        # Publish frame to safety_node every 2nd frame, but only once the grid
+        # is locked — the interlock is not active without a defined zone so
+        # there is no point sending frames before the operator has set one up.
         if len(self._grid_pts) == 4 and self._frame_counter % 2 == 0:
             self._bridge_node.publish_frame(frame)
 

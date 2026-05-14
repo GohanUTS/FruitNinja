@@ -2,24 +2,39 @@
 """
 safety_node.py — ROS 2 hand-detection safety interlock for the FruitNinja UR3e.
 
-Subscribes to /camera/image_raw/compressed, runs MediaPipe Hands on each frame,
-and pauses robot motion via ROS action cancellation plus the UR Dashboard Server
-when a hand enters the cutting zone polygon.
+Camera input (choose one via --camera-index):
+  --camera-index -1  (default) Subscribe to /camera/image_raw/compressed.
+                     Frames come from whichever camera the GUI is using.
+  --camera-index  0  Open /dev/video0 directly (webcam).
+  --camera-index  1  Open Intel RealSense D435i directly via pyrealsense2.
+  --camera-index  2  Open /dev/video2 directly (fisheye).
+  --camera-index  3  Open /dev/video3 directly (DJI Osmo).
 
-The cutting zone is received dynamically on /safety/zone as a Float32MultiArray
-[x0,y0, x1,y1, x2,y2, x3,y3] (TL, TR, BR, BL pixel coords in the camera frame).
+In direct-camera mode the node opens the hardware itself and does NOT rely
+on the GUI being running or any camera being started in the GUI.
+
+The cutting zone is always received on /safety/zone as a Float32MultiArray
+[x0,y0, x1,y1, x2,y2, x3,y3] (TL, TR, BR, BL pixel coords).
 real_gui_points.py publishes this whenever the operator locks the 4-corner grid.
 
 Usage
 -----
-  ros2 run fruitninja safety_node --robot-ip 192.168.0.194
+  # Topic mode (default — GUI camera feeds the node)
+  ros2 run fruitninja safety_node --robot-ip 192.168.0.197
+
+  # Direct webcam (independent of GUI)
+  ros2 run fruitninja safety_node --robot-ip 192.168.0.197 --camera-index 0
+
+  # Direct RealSense (independent of GUI)
+  ros2 run fruitninja safety_node --robot-ip 192.168.0.197 --camera-index 1
 
 Parameters (ROS)
 ----------------
-  robot_ip        (string, default '192.168.0.194')
+  robot_ip        (string, default '192.168.0.197')
   dashboard_port  (int,    default 29999)
-  tolerance_px    (int,    default 0)    — pixels of extra margin outside zone
-  zone_timeout_s  (double, default 1.0)  — clear stale zones if GUI stops publishing
+  camera_index    (int,    default -1)   — -1 = topic mode, >=0 = direct camera
+  tolerance_px    (int,    default 0)
+  zone_timeout_s  (double, default 1.0)
   max_hands       (int,    default 2)
   detection_conf  (double, default 0.7)
   tracking_conf   (double, default 0.6)
@@ -29,6 +44,7 @@ import sys
 import socket
 import argparse
 import time
+import threading
 
 import rclpy
 from rclpy.node import Node
@@ -38,6 +54,18 @@ from action_msgs.srv import CancelGoal
 
 import cv2
 import numpy as np
+
+# All frames are resized to this before MediaPipe runs — matches the size
+# published by CameraBridgeNode so topic mode and direct mode are identical.
+SAFETY_FRAME_W   = 640
+SAFETY_FRAME_H   = 480
+SAFETY_JPEG_QUALITY = 60
+
+try:
+    import pyrealsense2 as rs
+    _HAS_RS = True
+except Exception:
+    _HAS_RS = False
 
 try:
     import mediapipe.python.solutions.hands as _mp_hands
@@ -53,12 +81,12 @@ TRAJECTORY_CANCEL_SERVICE = (
     '/scaled_joint_trajectory_controller/follow_joint_trajectory/_action/cancel_goal'
 )
 HAND_ZONE_MIN_LANDMARKS = 5
-HAND_ZONE_PALM_INDICES = (0, 5, 9, 13, 17)
+HAND_ZONE_PALM_INDICES  = (0, 5, 9, 13, 17)
 
 class Dashboard:
     def __init__(self, ip: str, port: int = 29999):
         self._paused = False
-        self._sock = None
+        self._sock   = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2.0)
@@ -66,7 +94,7 @@ class Dashboard:
             s.recv(1024)
             s.settimeout(1.0)
             self._sock = s
-        except Exception as e:
+        except Exception:
             pass
 
     @property
@@ -108,21 +136,23 @@ class Dashboard:
 # ── Safety node ────────────────────────────────────────────────────────────────
 
 class SafetyNode(Node):
-    def __init__(self, robot_ip: str):
+    def __init__(self, robot_ip: str, camera_index: int):
         super().__init__('fruitninja_safety')
 
         # Parameters
         self.declare_parameter('robot_ip',       robot_ip)
         self.declare_parameter('dashboard_port', 29999)
+        self.declare_parameter('camera_index',   camera_index)
         self.declare_parameter('tolerance_px',   0)
         self.declare_parameter('zone_timeout_s', 1.0)
         self.declare_parameter('max_hands',      2)
         self.declare_parameter('detection_conf', 0.7)
         self.declare_parameter('tracking_conf',  0.6)
 
-        ip   = self.get_parameter('robot_ip').value
-        port = self.get_parameter('dashboard_port').value
-        self._tol = self.get_parameter('tolerance_px').value
+        ip            = self.get_parameter('robot_ip').value
+        port          = self.get_parameter('dashboard_port').value
+        self._cam_idx = self.get_parameter('camera_index').value
+        self._tol     = self.get_parameter('tolerance_px').value
         self._zone_timeout_s = self.get_parameter('zone_timeout_s').value
         self._last_stop_time = 0.0
 
@@ -146,31 +176,118 @@ class SafetyNode(Node):
             self._hands = None
             self.get_logger().error('mediapipe not installed — safety interlock INACTIVE')
 
-        # Zone: TL, TR, BR, BL pixel coords  (None = not yet defined)
+        # Zone
         self._zone_poly: np.ndarray | None = None
         self._zone_stamp = 0.0
 
         # State
         self._hand_in_zone = False
 
-        # Subscribers
+        # Zone subscriber (always active — GUI publishes zone regardless of camera mode)
         self.create_subscription(
-            CompressedImage, '/camera/image_raw/compressed',
-            self._on_image, 10)
-        self.create_subscription(
-            Float32MultiArray, '/safety/zone',
-            self._on_zone, 10)
+            Float32MultiArray, '/safety/zone', self._on_zone, 10)
 
-        # Publishers
-        self._pub_status = self.create_publisher(Bool, '/safety/hand_detected', 10)
+        # Publisher
+        self._pub_status  = self.create_publisher(Bool, '/safety/hand_detected', 10)
         self._cancel_client = self.create_client(CancelGoal, TRAJECTORY_CANCEL_SERVICE)
 
+        # Camera input
+        if self._cam_idx < 0:
+            # Topic mode — subscribe to compressed image from GUI bridge
+            self.create_subscription(
+                CompressedImage, '/camera/image_raw/compressed',
+                self._on_compressed_image, 10)
+            self.get_logger().info(
+                'Camera mode: topic (/camera/image_raw/compressed) — '
+                'frames come from whichever camera the GUI is using'
+            )
+        else:
+            # Direct camera mode — open hardware in a background thread
+            self._direct_running = True
+            t = threading.Thread(target=self._direct_camera_loop, daemon=True)
+            t.start()
+            source_names = {0: 'Webcam (/dev/video0)', 1: 'RealSense D435i',
+                            2: 'Fisheye (/dev/video2)', 3: 'DJI Osmo (/dev/video3)'}
+            name = source_names.get(self._cam_idx, f'/dev/video{self._cam_idx}')
+            self.get_logger().info(f'Camera mode: direct — {name}')
+
         self.get_logger().info('Safety node ready — waiting for zone definition and camera frames')
+
+    # ── Direct camera loop ────────────────────────────────────────────────────
+
+    def _direct_camera_loop(self):
+        """Opens the camera hardware directly and feeds frames into _process_frame."""
+        if self._cam_idx == 1:
+            self._direct_realsense()
+        else:
+            self._direct_v4l2(self._cam_idx)
+
+    def _direct_realsense(self):
+        if not _HAS_RS:
+            self.get_logger().error(
+                'pyrealsense2 not installed — cannot open RealSense directly. '
+                'Install with: pip install pyrealsense2'
+            )
+            return
+        try:
+            pipe = rs.pipeline()
+            cfg  = rs.config()
+            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            pipe.start(cfg)
+            self.get_logger().info('RealSense pipeline started (direct mode)')
+        except Exception as e:
+            self.get_logger().error(f'RealSense start failed: {e}')
+            return
+        try:
+            while self._direct_running:
+                frames = pipe.wait_for_frames(1000)
+                cf = frames.get_color_frame()
+                if cf:
+                    self._process_frame(self._resize(np.asanyarray(cf.get_data())))
+        except Exception as e:
+            self.get_logger().error(f'RealSense error: {e}')
+        finally:
+            try:
+                pipe.stop()
+            except Exception:
+                pass
+
+    def _direct_v4l2(self, index: int):
+        dev = {0: 0, 2: 2, 3: 3}.get(index, index)
+        cap = cv2.VideoCapture(dev)
+        if not cap.isOpened():
+            self.get_logger().error(f'Could not open /dev/video{dev}')
+            return
+        self.get_logger().info(f'Opened /dev/video{dev} (direct mode)')
+        try:
+            while self._direct_running:
+                ret, frame = cap.read()
+                if ret:
+                    self._process_frame(self._resize(frame))
+        finally:
+            cap.release()
+
+    # ── Topic mode image callback ─────────────────────────────────────────────
+
+    def _on_compressed_image(self, msg: CompressedImage):
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        frame  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            self._process_frame(self._resize(frame))
+
+    # ── Frame resize helper ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _resize(frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        if w == SAFETY_FRAME_W and h == SAFETY_FRAME_H:
+            return frame
+        return cv2.resize(frame, (SAFETY_FRAME_W, SAFETY_FRAME_H),
+                          interpolation=cv2.INTER_AREA)
 
     # ── Zone update ───────────────────────────────────────────────────────────
 
     def _on_zone(self, msg: Float32MultiArray):
-        """Receive [] to clear, or [x0,y0, x1,y1, x2,y2, x3,y3] corners."""
         d = msg.data
         if len(d) == 0:
             self._clear_zone('Zone cleared by GUI')
@@ -189,7 +306,7 @@ class SafetyNode(Node):
         )
 
     def _clear_zone(self, reason: str):
-        self._zone_poly = None
+        self._zone_poly  = None
         self._zone_stamp = 0.0
         if self._hand_in_zone:
             self._hand_in_zone = False
@@ -200,37 +317,31 @@ class SafetyNode(Node):
         if not self._cancel_client.service_is_ready():
             self._cancel_client.wait_for_service(timeout_sec=0.05)
         if not self._cancel_client.service_is_ready():
-            self.get_logger().warn(f'Trajectory cancel service not available: {TRAJECTORY_CANCEL_SERVICE}')
             return
-        req = CancelGoal.Request()
-        self._cancel_client.call_async(req)
+        self._cancel_client.call_async(CancelGoal.Request())
 
-    # ── Image callback ────────────────────────────────────────────────────────
+    # ── Core detection ────────────────────────────────────────────────────────
 
-    def _on_image(self, msg: CompressedImage):
+    def _process_frame(self, frame: np.ndarray):
+        """Run hand detection on a BGR frame from any source."""
         if self._hands is None or self._zone_poly is None:
             return
         if time.monotonic() - self._zone_stamp > self._zone_timeout_s:
             self._clear_zone('Safety zone expired — waiting for fresh locked grid')
             return
 
-        np_arr = np.frombuffer(msg.data, np.uint8)
-        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            return
-
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = self._hands.process(rgb)
 
         # Expand zone by tolerance
-        tol = self._tol
+        tol      = self._tol
         poly_exp = self._zone_poly.copy()
         cx = int(poly_exp[:, 0].mean())
         cy = int(poly_exp[:, 1].mean())
         for pt in poly_exp:
-            dx = pt[0] - cx
-            dy = pt[1] - cy
+            dx   = pt[0] - cx
+            dy   = pt[1] - cy
             norm = max(1, (dx**2 + dy**2) ** 0.5)
             pt[0] = int(pt[0] + tol * dx / norm)
             pt[1] = int(pt[1] + tol * dy / norm)
@@ -264,8 +375,6 @@ class SafetyNode(Node):
                 if hand_detected:
                     break
 
-        # Act on state change. While a hand remains in-zone, keep cancelling at
-        # a limited rate so new goals from another client cannot continue motion.
         if hand_detected:
             now = time.monotonic()
             if now - self._last_stop_time > 0.5:
@@ -275,7 +384,7 @@ class SafetyNode(Node):
             if not self._hand_in_zone:
                 self._hand_in_zone = True
                 self.get_logger().warn('HAND IN GRID ZONE — trajectory cancelled and robot paused')
-        elif not hand_detected and self._hand_in_zone:
+        elif self._hand_in_zone:
             self._hand_in_zone = False
             self._db.resume()
             self.get_logger().info('Zone clear — robot resumed')
@@ -283,6 +392,8 @@ class SafetyNode(Node):
         self._pub_status.publish(Bool(data=self._hand_in_zone))
 
     def destroy_node(self):
+        if hasattr(self, '_direct_running'):
+            self._direct_running = False
         self._db.close()
         if self._hands:
             self._hands.close()
@@ -293,11 +404,16 @@ class SafetyNode(Node):
 
 def main(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--robot-ip', default='192.168.0.194')
+    parser.add_argument('--robot-ip',     default='192.168.0.197')
+    parser.add_argument('--camera-index', type=int, default=-1,
+                        help=(
+                            'Camera source: -1=topic (GUI), 0=webcam, '
+                            '1=RealSense, 2=fisheye, 3=DJI Osmo'
+                        ))
     parsed, _ = parser.parse_known_args()
 
     rclpy.init(args=args)
-    node = SafetyNode(robot_ip=parsed.robot_ip)
+    node = SafetyNode(robot_ip=parsed.robot_ip, camera_index=parsed.camera_index)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
