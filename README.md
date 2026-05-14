@@ -16,20 +16,18 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 └──────────┬──────────────────────────────────────────────────┘
            │ launches (via QProcess)
            ▼
-┌──────────────────────┐    ┌──────────────────────────────────┐
-│  ur_robot_driver     │    │  switch_controller (one-shot)    │
-│  (Step 1)            │    │  (Step 2 — Fix Controller)       │
-│                      │    │                                  │
-│  Connects to UR3e    │    │  Activates                       │
-│  via RTDE protocol   │    │  scaled_joint_trajectory_        │
-│  Publishes:          │    │  controller                      │
-│  /joint_states       │    │                                  │
-└──────────────────────┘    └──────────────────────────────────┘
-           │                           │
-           │    ┌──────────────────────┘
-           ▼    ▼
 ┌─────────────────────────────────────────────────────────────┐
-│           ur_moveit_config  (Step 3 — MoveIt)                │
+│  ur_robot_driver  (Step 1)                                   │
+│                                                              │
+│  Connects to UR3e via RTDE protocol                          │
+│  Publishes: /joint_states                                    │
+│  Once ready → auto-switches to scaled_joint_trajectory_      │
+│               controller via /controller_manager service     │
+└─────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────┐
+│           ur_moveit_config  (Step 2 — MoveIt)                │
 │  MoveIt motion planner + RViz  (ur_moveit.launch.py)         │
 └─────────────────────────────────────────────────────────────┘
            │
@@ -64,8 +62,8 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 │  Subscribes camera   │    │  Fixed grid: cell name (A1–N4)  │
 │  + zone topics       │    │  → tool pose + joint angles      │
 │  MediaPipe hand det. │    │  + fractional UV interpolation   │
-│  Dashboard pause/    │    │                                  │
-│  resume on TCP 29999 │    │                                  │
+│  CancelGoal service  │    │                                  │
+│  + Dashboard TCP     │    │                                  │
 └──────────────────────┘    └──────────────────────────────────┘
 ```
 
@@ -80,7 +78,7 @@ with manual grid overlay detects red fruit in real time and can drive the arm au
 | `safety_node.py` | Standalone hand-detection interlock — subscribes to camera + zone topics, pauses robot via Dashboard TCP (port 29999) |
 | `planning_scene.py` | Publishes the workcell URDF collision objects (trolley, walls) to MoveIt |
 | `grid_mover.py` | Maps grid cell names (A1–N4, 14 columns × 4 rows) to calibrated tool positions and interpolated joint angles |
-| `colour_detection.py` | OpenCV HSV colour detection + blue-marker grid overlay (standalone util) |
+| `colour_detection.py` | Standalone util: detects Apple/Lettuce/Banana/Orange via HSV + auto-locates grid from 4 blue corner markers |
 | `movement.py` | Low-level MoveIt motion helpers used by older GUI scripts |
 | `gui.py` | Legacy simulation GUI |
 
@@ -110,7 +108,7 @@ first cut followed by a 90° wrist-3 cross-cut.
 
 ## Camera & Grid Detection
 
-1. Press **▶ Start Camera** and select a source (Webcam / RealSense D435i / Fisheye / Osmo DJI Pocket 3).
+1. Press **▶ Start Camera** and select a source (Webcam / RealSense D435i / Other).
 2. Press **✛ Define Grid** and click 4 corner points on the camera image (any order — auto-sorted to TL/TR/BR/BL).
 3. A 14×4 bilinear perspective grid is drawn on the live feed.
 4. Only **red** objects whose centroid falls inside the grid are detected.
@@ -131,11 +129,11 @@ The safety system has two independent layers:
 | **Local** | `real_gui_points.py` | MediaPipe Hands runs on the GUI machine every 3rd frame; trips when palm centre or ≥ 5 landmarks are inside the locked grid polygon |
 | **Standalone** | `safety_node.py` (Step 6) | Subscribes to `/camera/image_raw/compressed` and `/safety/zone`; runs its own MediaPipe instance; cancels trajectory goals and pauses the UR Dashboard Server |
 
-Camera frames are published to `/camera/image_raw/compressed` from **all camera sources** as soon as the camera is running — the safety node warms up immediately and activates the moment a zone is published (when the grid is locked in the GUI).
+Camera frames are published to `/camera/image_raw/compressed` only once the operator has locked the grid (4 corner points defined) — the safety node activates at that same moment when the zone polygon is published.
 
 When a hand is detected:
-1. Active trajectory goal is cancelled via `cancel_goal_async()`
-2. `pause` is sent to the UR Dashboard Server on TCP port 29999
+1. **Local layer**: active trajectory goal is cancelled via `cancel_goal_async()`, Dashboard Server receives `pause`
+2. **Standalone layer**: trajectory is cancelled via the `CancelGoal` service, Dashboard Server receives `pause`
 3. New motion is blocked until the zone has been clear for 2 consecutive detection frames
 4. Any interrupted sequence can be automatically resumed
 
@@ -192,14 +190,14 @@ Press **Start** on each step **in order**, waiting for each to be ready before c
 
 | Step | Command run internally | When it's ready |
 |------|----------------------|-----------------|
-| Step 1 — UR Driver | `ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur3e robot_ip:=<IP> launch_rviz:=false` | Log shows `"Robot connected to reverse interface. Ready to receive control commands."` |
-| Step 2 — Fix Controller | `ros2 service call /controller_manager/switch_controller … strictness: 1` | One-shot, completes automatically — run immediately after Step 1 is connected |
-| Step 3 — MoveIt | `ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur3e …` | RViz opens and robot model appears |
-| Step 4 — Planning Scene | `ros2 run fruitninja planning_scene` | Runs and publishes collision objects |
-| Step 5 — Main GUI | `ros2 run fruitninja real_gui_points --robot-ip <IP>` | GUI window opens |
-| Step 6 — Safety Node | `ros2 run fruitninja safety_node --robot-ip <IP>` | Logs `"Safety node ready"` — interlock activates once grid is locked in GUI |
+| Step 1 — UR Driver | `ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur3e robot_ip:=<IP> launch_rviz:=false` | Log shows `"Ready to receive control commands"` — controller switch fires automatically 2 s later |
+| Step 2 — MoveIt | `ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur3e …` | RViz opens and robot model appears |
+| Step 3 — Planning Scene | `ros2 run fruitninja planning_scene` | Runs and publishes collision objects |
+| Step 4 — Main GUI | `ros2 run fruitninja real_gui_points --robot-ip <IP>` | GUI window opens |
+| Step 5 — Safety Node | `ros2 run fruitninja safety_node --robot-ip <IP>` | Logs `"Safety node ready"` — interlock activates once grid is locked in GUI |
 
-**Default robot IP:** `192.168.0.194`  
+**Default robot IP:** `192.168.0.194` (used by `real_gui_points` and the Startup GUI)  
+**Note:** `safety_node` has a separate built-in default of `192.168.0.197` — always pass `--robot-ip` explicitly when running it manually.  
 **Laptop IP on the robot network:** `192.168.0.101` (ethernet interface `enp4s0`)
 
 To change the robot IP: edit the **IP field** in the Startup GUI and press **Apply** before starting any steps.

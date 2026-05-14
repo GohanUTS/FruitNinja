@@ -50,34 +50,34 @@ JOINT_NAMES = [
 # ── Fixed grid calibration — photographed UR teach pendant readings ───────────
 #
 # Corner assignment from the base joint in the photos:
-#   Base  30.42° → A1
-#   Base  43.35° → A4
-#   Base 107.42° → N1
-#   Base 101.90° → N4
+#   Base  31.07° → A1
+#   Base  43.97° → A4
+#   Base -30.35° → N1
+#   Base -42.83° → N4
 #
 # Tool positions are stored in metres in the UR/base_link frame.  RX/RY/RZ are
 # the UR tool rotation-vector values in radians, kept here for traceability.
 
 CORNER_TOOL_POSES_M = {
-    'A1': (-0.25322, -0.30822, -0.37047),
-    'A4': (-0.25440, -0.43063, -0.36707),
-    'N1': ( 0.24152, -0.31635, -0.36815),
-    'N4': ( 0.24024, -0.44040, -0.36745),
+    'A1': (-0.24444, -0.30023, -0.34079),
+    'A4': (-0.24502, -0.42324, -0.33927),
+    'N1': ( 0.25091, -0.30122, -0.33918),
+    'N4': ( 0.25719, -0.42685, -0.33850),
 }
 
 CORNER_TOOL_ROT_VEC_RAD = {
-    'A1': (2.193, 2.151,  0.095),
-    'A4': (2.155, 2.203,  0.087),
-    'N1': (2.187, 2.141, -0.001),
-    'N4': (2.159, 2.176,  0.114),
+    'A1': (3.093, -0.047, -0.145),
+    'A4': (3.118, -0.057,  0.017),
+    'N1': (3.124, -0.060, -0.035),
+    'N4': (3.137, -0.034, -0.179),
 }
 
 CORNER_JOINTS_DEG = {
     # shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
-    'A1': ( 30.42, -46.19,  98.65, -138.12, -87.00,  31.65),
-    'A4': ( 43.35, -27.50,  56.58, -115.76, -86.63,  42.26),
-    'N1': (107.42, -46.70, 104.71, -152.19, -87.90, 108.96),
-    'N4': (101.90, -28.80,  61.76, -124.25, -83.95, 101.79),
+    'A1': ( 31.07, -46.60, 107.83, -157.25, -90.72, 123.03),
+    'A4': ( 43.97, -30.44,  65.77, -125.94, -88.64, 136.30),
+    'N1': (-30.35, -132.74, -103.43,  -34.39,  88.55, 241.85),
+    'N4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
 }
 
 # Backwards-compatible aliases for older scripts that imported the old A4 anchor

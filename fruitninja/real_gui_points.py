@@ -100,6 +100,10 @@ HOME_DEG = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
 
 APPROACH_LIFT_DELTA = -11.0  # matches legacy hover(-52°) → cut(-41°) spacing
+
+# If the base joint needs to change by more than this between consecutive moves,
+# route through HOME_DEG first so the arm clears the table before reconfiguring.
+SAFE_TRANSIT_BASE_DEG = 45.0
 START_HOLD_SEC = 0.5
 MIN_MOVE_DURATION_SEC = 4.0
 MAX_JOINT_SPEED_DEG_S = 10.0
@@ -982,17 +986,53 @@ class MainWindow(QMainWindow):
             self._log_sig.emit(f'FAIL at {cell}: {msg}')
             setattr(self, '_moving', False)
 
-        self._mover_node.move_to(
+        self._move_with_safe_transit(
             approach_degrees,
             done_cb=_on_arrive,
             fail_cb=_on_fail,
-            current_degrees=self._current_joint_degrees(),
+            label=cell,
         )
 
     def _current_joint_degrees(self) -> list | None:
         if not self._have_joint_state:
             return None
         return [math.degrees(self._current_joints_rad[name]) for name in JOINT_NAMES]
+
+    def _move_with_safe_transit(self, target_degrees: list, done_cb, fail_cb, label: str = ''):
+        """
+        Move to target_degrees, routing through HOME_DEG first if the base joint
+        would have to swing more than SAFE_TRANSIT_BASE_DEG from the current position.
+        This prevents the arm from sweeping through the table when transitioning
+        between cells that use different kinematic configurations (e.g. A-column
+        at base ~+35° vs N-column at base ~-40°).
+        """
+        current = self._current_joint_degrees()
+        if current is None:
+            fail_cb('No live joint state')
+            return
+        base_delta = abs(_wrap_deg(target_degrees[0] - current[0]))
+        if base_delta > SAFE_TRANSIT_BASE_DEG:
+            transit_label = f'safe transit → home (base swing {base_delta:.0f}°)' + (f' before {label}' if label else '')
+            self._log(f'Large base swing detected ({base_delta:.0f}°) — routing via home')
+            self._status_sig.emit(f'Safe transit via home ({base_delta:.0f}° base swing)…', '#e0a000')
+            self._mover_node.move_to(
+                HOME_DEG,
+                done_cb=lambda: self._mover_node.move_to(
+                    target_degrees,
+                    done_cb=done_cb,
+                    fail_cb=fail_cb,
+                    current_degrees=self._current_joint_degrees(),
+                ),
+                fail_cb=fail_cb,
+                current_degrees=self._current_joint_degrees(),
+            )
+        else:
+            self._mover_node.move_to(
+                target_degrees,
+                done_cb=done_cb,
+                fail_cb=fail_cb,
+                current_degrees=current,
+            )
 
     def _fruit_target(self, fruit: dict) -> dict:
         grid_x, grid_y = fruit['grid_xy']
@@ -1152,11 +1192,11 @@ class MainWindow(QMainWindow):
             self._log_sig.emit(f'FAIL fruit {label}: {msg}')
             setattr(self, '_moving', False)
 
-        self._mover_node.move_to(
+        self._move_with_safe_transit(
             target['approach'],
             done_cb=_on_first_approach,
             fail_cb=_on_fail,
-            current_degrees=self._current_joint_degrees(),
+            label=label,
         )
 
     def _stop(self):

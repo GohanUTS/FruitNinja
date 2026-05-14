@@ -89,30 +89,53 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
     steps += [
         {
             'label':   'Step 1 — UR Driver',
-            'desc':    f'Launch the UR3e robot driver  (robot_ip: {ip})',
+            'desc':    f'Launch the UR3e robot driver and activate the scaled controller  (robot_ip: {ip})',
             'cmd':     SOURCE + (
+                # Launch the driver in the background, then:
+                #  1. Wait for the controller_manager service to appear.
+                #  2. Do the initial controller switch.
+                #  3. Start a watchdog loop that re-switches whenever the
+                #     scaled_joint_trajectory_controller goes inactive (e.g.
+                #     after a protective stop — the driver deactivates it).
+                #  4. Foreground the driver so this shell lives with it.
                 'ros2 launch ur_robot_driver ur_control.launch.py '
-                f'ur_type:=ur3e robot_ip:={ip} '
-                'launch_rviz:=false'
+                f'ur_type:=ur3e robot_ip:={ip} launch_rviz:=false & '
+                'DRIVER_PID=$! ; '
+                'echo "[startup] Waiting for controller_manager..." ; '
+                'until ros2 service list 2>/dev/null | '
+                '  grep -q "/controller_manager/switch_controller" ; '
+                'do sleep 1 ; done ; '
+                'sleep 2 ; '
+                '_do_switch() { '
+                '  ros2 service call /controller_manager/switch_controller '
+                '  controller_manager_msgs/srv/SwitchController '
+                '  "{\\"activate_controllers\\": [\\"scaled_joint_trajectory_controller\\"], '
+                '   \\"deactivate_controllers\\": [\\"joint_trajectory_controller\\"], '
+                '   \\"strictness\\": 1, \\"activate_asap\\": true, '
+                '   \\"timeout\\": {\\"sec\\": 5, \\"nanosec\\": 0}}" 2>&1 ; '
+                '} ; '
+                'echo "[startup] Initial controller switch..." ; '
+                '_do_switch ; '
+                'echo "[startup] Controller active — watchdog started." ; '
+                '( while kill -0 $DRIVER_PID 2>/dev/null ; do '
+                '    sleep 3 ; '
+                '    STATE=$(ros2 control list_controllers 2>/dev/null | '
+                '      grep scaled_joint_trajectory_controller | grep -c "active" || true) ; '
+                '    if [ "$STATE" = "0" ] ; then '
+                '      echo "[watchdog] Controller inactive — re-switching after protective stop..." ; '
+                '      sleep 1 ; '
+                '      _do_switch ; '
+                '      echo "[watchdog] Controller re-activated." ; '
+                '    fi ; '
+                '  done '
+                ') & '
+                'wait $DRIVER_PID'
             ),
             'oneshot': False,
-            'note':    'Wait until "Robot ready to receive control commands" appears in the log.',
+            'note':    'Controller switches automatically on start and after every protective stop.',
         },
         {
-            'label':   'Step 2 — Fix Controller',
-            'desc':    'Activate scaled_joint_trajectory_controller for GUI motion',
-            'cmd':     SOURCE + (
-                "ros2 service call /controller_manager/switch_controller "
-                "controller_manager_msgs/srv/SwitchController "
-                "\"{activate_controllers: ['scaled_joint_trajectory_controller'], "
-                "deactivate_controllers: ['joint_trajectory_controller'], "
-                "strictness: 1, activate_asap: true, timeout: {sec: 5, nanosec: 0}}\""
-            ),
-            'oneshot': True,
-            'note':    'Run once after Step 1 is fully connected. If it waits, the UR driver/controller is not ready yet.',
-        },
-        {
-            'label':   'Step 3 — MoveIt',
+            'label':   'Step 2 — MoveIt',
             'desc':    'Launch MoveIt motion planning + RViz',
             'cmd':     SOURCE + (
                 'ros2 launch ur_moveit_config ur_moveit.launch.py '
@@ -126,25 +149,25 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'note':    'Wait for RViz to open and the robot model to appear.',
         },
         {
-            'label':   'Step 4 — Planning Scene',
+            'label':   'Step 3 — Planning Scene',
             'desc':    'Publish the planning scene (workcell / collision objects)',
             'cmd':     SOURCE + 'ros2 run fruitninja planning_scene',
             'oneshot': False,
             'note':    '',
         },
         {
-            'label':   'Step 5 — Main GUI',
+            'label':   'Step 4 — Main GUI',
             'desc':    'Open the grid-control GUI for cutting',
             'cmd':     SOURCE + f'ros2 run fruitninja real_gui_points --robot-ip {ip}',
             'oneshot': False,
             'note':    '',
         },
         {
-            'label':   'Step 6 — Safety Node',
+            'label':   'Step 5 — Safety Node',
             'desc':    'Hand-detection safety interlock (subscribes to camera topic)',
             'cmd':     SOURCE + f'ros2 run fruitninja safety_node --robot-ip {ip}',
             'oneshot': False,
-            'note':    'Start after Step 4. Define the grid in the GUI to activate the interlock.',
+            'note':    'Start after Step 3. Define the grid in the GUI to activate the interlock.',
         },
     ]
     return steps
@@ -270,11 +293,13 @@ class StepRow(QObject):
     For long-running steps (driver, MoveIt, GUI), the Stop button sends SIGTERM.
     """
 
-    status_signal = pyqtSignal(str, str)   # text, colour
+    status_signal  = pyqtSignal(str, str)   # text, colour
+    trigger_signal = pyqtSignal()           # fired when auto_trigger text is seen
 
     def __init__(self, step: dict):
         super().__init__()
-        self._step = step
+        self._step           = step
+        self._trigger_fired  = False        # only fire once per run
 
         # ── QProcess ──────────────────────────────────────────────────────────
         # MergedChannels: stderr is routed into stdout so one readyRead fires for both.
@@ -350,6 +375,7 @@ class StepRow(QObject):
         if self._proc.state() != QProcess.NotRunning:
             return
 
+        self._trigger_fired = False
         self.output_widget.clear()
         self._btn_start.setEnabled(False)
         # Stop button is only useful for long-running processes
@@ -406,6 +432,10 @@ class StepRow(QObject):
     def _read_output(self):
         raw = self._proc.readAllStandardOutput().data().decode(errors='replace')
         self._write_output(raw)
+        trigger = self._step.get('auto_trigger')
+        if trigger and not self._trigger_fired and trigger in raw:
+            self._trigger_fired = True
+            self.trigger_signal.emit()
 
     def _on_finished(self, exit_code, exit_status):
         """
@@ -690,6 +720,7 @@ class StartupWindow(QMainWindow):
 
             # Each step gets its own output tab — named the same as the step label
             self._tab_widget.addTab(row.output_widget, step['label'])
+
 
     def _append_to_tab(self, label: str, text: str):
         """Called from StepRow (main thread via QProcess signals) to write to a tab."""
