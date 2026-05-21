@@ -91,48 +91,11 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
             'label':   'Step 1 — UR Driver',
             'desc':    f'Launch the UR3e robot driver and activate the scaled controller  (robot_ip: {ip})',
             'cmd':     SOURCE + (
-                # Launch the driver in the background, then:
-                #  1. Wait for the controller_manager service to appear.
-                #  2. Do the initial controller switch.
-                #  3. Start a watchdog loop that re-switches whenever the
-                #     scaled_joint_trajectory_controller goes inactive (e.g.
-                #     after a protective stop — the driver deactivates it).
-                #  4. Foreground the driver so this shell lives with it.
                 'ros2 launch ur_robot_driver ur_control.launch.py '
-                f'ur_type:=ur3e robot_ip:={ip} launch_rviz:=false & '
-                'DRIVER_PID=$! ; '
-                'echo "[startup] Waiting for controller_manager..." ; '
-                'until ros2 service list 2>/dev/null | '
-                '  grep -q "/controller_manager/switch_controller" ; '
-                'do sleep 1 ; done ; '
-                'sleep 2 ; '
-                '_do_switch() { '
-                '  ros2 service call /controller_manager/switch_controller '
-                '  controller_manager_msgs/srv/SwitchController '
-                '  "{\\"activate_controllers\\": [\\"scaled_joint_trajectory_controller\\"], '
-                '   \\"deactivate_controllers\\": [\\"joint_trajectory_controller\\"], '
-                '   \\"strictness\\": 1, \\"activate_asap\\": true, '
-                '   \\"timeout\\": {\\"sec\\": 5, \\"nanosec\\": 0}}" 2>&1 ; '
-                '} ; '
-                'echo "[startup] Initial controller switch..." ; '
-                '_do_switch ; '
-                'echo "[startup] Controller active — watchdog started." ; '
-                '( while kill -0 $DRIVER_PID 2>/dev/null ; do '
-                '    sleep 3 ; '
-                '    STATE=$(ros2 control list_controllers 2>/dev/null | '
-                '      grep scaled_joint_trajectory_controller | grep -c "active" || true) ; '
-                '    if [ "$STATE" = "0" ] ; then '
-                '      echo "[watchdog] Controller inactive — re-switching after protective stop..." ; '
-                '      sleep 1 ; '
-                '      _do_switch ; '
-                '      echo "[watchdog] Controller re-activated." ; '
-                '    fi ; '
-                '  done '
-                ') & '
-                'wait $DRIVER_PID'
+                f'ur_type:=ur3e robot_ip:={ip} launch_rviz:=false '
             ),
             'oneshot': False,
-            'note':    'Controller switches automatically on start and after every protective stop.',
+            'note':    'After start, press Play on the UR pendant so External Control runs.',
         },
         {
             'label':   'Step 2 — MoveIt',

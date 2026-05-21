@@ -8,7 +8,6 @@ from moveit_msgs.msg import PlanningScene, CollisionObject
 from shape_msgs.msg import Mesh, MeshTriangle
 from geometry_msgs.msg import Pose, Point
 from ament_index_python.packages import get_package_share_directory
-import time
 
 _DAE_NS = {'c': 'http://www.collada.org/2005/11/COLLADASchema'}
 
@@ -99,8 +98,8 @@ class PlanningSceneSetup(Node):
             '/planning_scene',
             10
         )
-
-        time.sleep(1.0)
+        self._publish_count = 0
+        self._timer = self.create_timer(5.0, self.setup_scene)
         self.setup_scene()
 
     def setup_scene(self):
@@ -170,15 +169,25 @@ class PlanningSceneSetup(Node):
         planning_scene.world.collision_objects.append(floor)
 
         self.scene_pub.publish(planning_scene)
-        self.get_logger().info('Planning scene published: trolley mesh + floor boundary.')
+        self._publish_count += 1
+        if self._publish_count == 1:
+            self.get_logger().info(
+                'Planning scene published: trolley mesh + floor boundary.'
+            )
+        else:
+            self.get_logger().debug('Planning scene refreshed.')
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = PlanningSceneSetup()
-    rclpy.spin_once(node, timeout_sec=2.0)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

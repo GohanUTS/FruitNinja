@@ -9,8 +9,9 @@ UR3e teach pendant.  The photographed corner readings are stored below as both
 tool positions and joint positions; movement uses the bilinearly interpolated
 joint positions.
 
-Movement uses fixed joint-angle goals from the calibrated grid.  Tool positions
-are logged for checking, but no Cartesian position goal / IK target is sent.
+Movement sends timed joint trajectories from the live joint state to the fixed
+calibrated grid angles.  Tool positions are logged for checking, but no
+Cartesian position goal / IK target is sent.
 
 Coordinate mapping (base_link frame):
   X axis  width  :  A → N  (left → right,  +X direction)
@@ -24,19 +25,22 @@ Usage (CLI):
 
 import argparse
 import math
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
+from sensor_msgs.msg import JointState
+from control_msgs.action import FollowJointTrajectory
+from control_msgs.msg import JointTolerance
+from trajectory_msgs.msg import JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
 
 
 # ── Grid layout ────────────────────────────────────────────────────────────────
 
 GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']
 GRID_ROWS = ['1', '2', '3', '4']
-
-MOVE_GROUP   = 'ur_manipulator'
 
 JOINT_NAMES = [
     'shoulder_pan_joint',
@@ -46,6 +50,21 @@ JOINT_NAMES = [
     'wrist_2_joint',
     'wrist_3_joint',
 ]
+
+TRAJECTORY_ACTIONS = [
+    '/scaled_joint_trajectory_controller/follow_joint_trajectory',
+    '/joint_trajectory_controller/follow_joint_trajectory',
+]
+
+START_HOLD_SEC = 0.5
+MIN_MOVE_DURATION_SEC = 4.0
+MAX_JOINT_SPEED_DEG_S = 10.0
+
+# Direct controller tolerances.  These mirror real_gui_points.py; the old
+# MoveIt trace path used tight 0.01 rad constraints and could abort on small
+# real-robot settling error before the corner trace completed.
+PATH_TOLERANCE_RAD = math.radians(8.0)
+GOAL_TOLERANCE_RAD = math.radians(2.0)
 
 # ── Fixed grid calibration — photographed UR teach pendant readings ───────────
 #
@@ -169,20 +188,81 @@ def grid_uv_to_joints_deg(u: float, v: float) -> list[float]:
     return list(_bilinear_tuple(CORNER_JOINTS_DEG, u, v))
 
 
-# ── MoveGroup joint-goal construction ──────────────────────────────────────────
+# ── Direct trajectory construction ─────────────────────────────────────────────
 
-def _make_joint_goal(degrees: list[float]) -> Constraints:
-    """Joint-only goal. This avoids Cartesian position goals and IK."""
-    c = Constraints()
-    for name, deg in zip(JOINT_NAMES, degrees):
-        jc = JointConstraint()
-        jc.joint_name      = name
-        jc.position        = math.radians(deg)
-        jc.tolerance_above = 0.01
-        jc.tolerance_below = 0.01
-        jc.weight          = 1.0
-        c.joint_constraints.append(jc)
-    return c
+def _wrap_deg(deg: float) -> float:
+    return ((deg + 180.0) % 360.0) - 180.0
+
+
+def _nearest_equivalent_target(degrees: list[float],
+                               current_degrees: list[float]) -> list[float]:
+    return [
+        current + _wrap_deg(target - current)
+        for target, current in zip(degrees, current_degrees)
+    ]
+
+
+def _duration_msg(seconds: float) -> Duration:
+    sec = int(seconds)
+    nanosec = int((seconds - sec) * 1_000_000_000)
+    return Duration(sec=sec, nanosec=nanosec)
+
+
+def _move_duration(current_degrees: list[float],
+                   target_degrees: list[float]) -> float:
+    max_delta = max(
+        abs(target - current)
+        for target, current in zip(target_degrees, current_degrees)
+    )
+    return max(MIN_MOVE_DURATION_SEC, max_delta / MAX_JOINT_SPEED_DEG_S)
+
+
+def _make_trajectory_goal(node: Node,
+                          current_degrees: list[float],
+                          target_degrees: list[float]) -> FollowJointTrajectory.Goal:
+    goal = FollowJointTrajectory.Goal()
+    goal.trajectory.joint_names = JOINT_NAMES
+    goal.trajectory.header.stamp = node.get_clock().now().to_msg()
+
+    start = JointTrajectoryPoint()
+    start.positions = [math.radians(deg) for deg in current_degrees]
+    start.velocities = [0.0] * len(JOINT_NAMES)
+    start.time_from_start = _duration_msg(START_HOLD_SEC)
+
+    target = JointTrajectoryPoint()
+    target.positions = [math.radians(deg) for deg in target_degrees]
+    target.velocities = [0.0] * len(JOINT_NAMES)
+    target.time_from_start = _duration_msg(
+        START_HOLD_SEC + _move_duration(current_degrees, target_degrees)
+    )
+
+    goal.trajectory.points = [start, target]
+    goal.goal_time_tolerance = _duration_msg(5.0)
+
+    for name in JOINT_NAMES:
+        path_t = JointTolerance()
+        path_t.name = name
+        path_t.position = PATH_TOLERANCE_RAD
+        goal.path_tolerance.append(path_t)
+
+        goal_t = JointTolerance()
+        goal_t.name = name
+        goal_t.position = GOAL_TOLERANCE_RAD
+        goal.goal_tolerance.append(goal_t)
+
+    return goal
+
+
+def _trajectory_error_name(code: int) -> str:
+    names = {
+        FollowJointTrajectory.Result.SUCCESSFUL: 'SUCCESSFUL',
+        FollowJointTrajectory.Result.INVALID_GOAL: 'INVALID_GOAL',
+        FollowJointTrajectory.Result.INVALID_JOINTS: 'INVALID_JOINTS',
+        FollowJointTrajectory.Result.OLD_HEADER_TIMESTAMP: 'OLD_HEADER_TIMESTAMP',
+        FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED: 'PATH_TOLERANCE_VIOLATED',
+        FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED: 'GOAL_TOLERANCE_VIOLATED',
+    }
+    return names.get(code, f'UNKNOWN_{code}')
 
 
 # ── ROS2 node ──────────────────────────────────────────────────────────────────
@@ -190,37 +270,88 @@ def _make_joint_goal(degrees: list[float]) -> Constraints:
 class GridMoverNode(Node):
     def __init__(self):
         super().__init__('fruitninja_grid_mover')
-        self._client = ActionClient(self, MoveGroup, '/move_action')
+        self._clients = [
+            (name, ActionClient(self, FollowJointTrajectory, name))
+            for name in TRAJECTORY_ACTIONS
+        ]
+        self._current_joints_deg: list[float] | None = None
+        self.create_subscription(JointState, '/joint_states', self._on_joint_state, 10)
+
+    def _on_joint_state(self, msg: JointState):
+        joints = {
+            name: math.degrees(pos)
+            for name, pos in zip(msg.name, msg.position)
+            if name in JOINT_NAMES
+        }
+        if all(name in joints for name in JOINT_NAMES):
+            self._current_joints_deg = [joints[name] for name in JOINT_NAMES]
+
+    def _wait_for_current_joints(self, timeout_sec: float = 5.0) -> list[float] | None:
+        deadline = time.monotonic() + timeout_sec
+        while self._current_joints_deg is None and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if self._current_joints_deg is None:
+            self.get_logger().error(
+                'No live joint state yet — check the UR driver and /joint_states'
+            )
+            return None
+        return list(self._current_joints_deg)
+
+    def _select_trajectory_client(self):
+        for action_name, client in self._clients:
+            if client.wait_for_server(timeout_sec=1.0):
+                return action_name, client
+        self.get_logger().error(
+            'No FollowJointTrajectory action server available. '
+            'Check that the UR controller is running and that either '
+            'scaled_joint_trajectory_controller or joint_trajectory_controller is active.'
+        )
+        return None, None
 
     def _move_to_joints(self, degrees: list[float]) -> bool:
-        if not self._client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error('MoveGroup action server not available')
+        current = self._wait_for_current_joints()
+        if current is None:
             return False
 
-        goal = MoveGroup.Goal()
-        goal.request.group_name                      = MOVE_GROUP
-        goal.request.goal_constraints.append(_make_joint_goal(degrees))
-        goal.request.num_planning_attempts           = 10
-        goal.request.allowed_planning_time           = 5.0
-        goal.request.max_velocity_scaling_factor     = 0.3
-        goal.request.max_acceleration_scaling_factor = 0.3
+        action_name, client = self._select_trajectory_client()
+        if client is None:
+            return False
 
-        future = self._client.send_goal_async(goal)
+        target = _nearest_equivalent_target(degrees, current)
+        self.get_logger().info(f'Using trajectory controller: {action_name}')
+        self.get_logger().info(
+            f'Move duration: {_move_duration(current, target):.1f} s  '
+            f'goal tolerance: {math.degrees(GOAL_TOLERANCE_RAD):.1f}°'
+        )
+
+        goal = _make_trajectory_goal(self, current, target)
+        future = client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, future)
         goal_handle = future.result()
 
+        if goal_handle is None:
+            self.get_logger().error('Trajectory goal send failed')
+            return False
         if not goal_handle.accepted:
-            self.get_logger().error('Goal rejected by MoveIt')
+            self.get_logger().error('Trajectory rejected by controller')
             return False
 
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
-        result = result_future.result().result
+        result_msg = result_future.result()
+        if result_msg is None:
+            self.get_logger().error('Trajectory result unavailable')
+            return False
+        result = result_msg.result
 
-        if result.error_code.val == MoveItErrorCodes.SUCCESS:
+        if result.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
             return True
 
-        self.get_logger().error(f'Planning failed (code: {result.error_code.val})')
+        error_name = _trajectory_error_name(result.error_code)
+        error_text = result.error_string or 'no controller error string'
+        self.get_logger().error(
+            f'Trajectory failed ({error_name}, code: {result.error_code}): {error_text}'
+        )
         return False
 
     def move_to_cell(self, cell: str) -> bool:

@@ -34,10 +34,13 @@ import rclpy
 import rclpy.executors
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from sensor_msgs.msg import JointState, CompressedImage
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Float64
 from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTolerance
+from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
@@ -98,6 +101,8 @@ JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 
 HOME_DEG = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 
 TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
+MOVE_GROUP_ACTION = '/move_action'
+MOVE_GROUP_NAME = 'ur_manipulator'
 
 APPROACH_LIFT_DELTA = -11.0  # matches legacy hover(-52°) → cut(-41°) spacing
 
@@ -117,6 +122,11 @@ CLEAR_FRAMES_BEFORE_RESUME = 2
 # Set generously so small UR controller overshoot doesn't fail the whole sequence.
 PATH_TOLERANCE_RAD = math.radians(8.0)
 GOAL_TOLERANCE_RAD = math.radians(2.0)
+
+# Older real-robot commits that moved reliably used MoveIt MoveGroup joint
+# constraints.  This is still joint-space movement, not a Cartesian pose / IK
+# target.  Keep direct controller execution as a fallback when MoveIt is absent.
+PREFER_MOVEIT_JOINT_GOALS = True
 
 # Compressed frame size published to /camera/image_raw/compressed for safety_node.
 # 640x480 is the sweet spot for MediaPipe Hands — fast inference without losing
@@ -151,15 +161,40 @@ class JointStateNode(Node):
     radians to degrees, then fires joint_callback so the GUI can update
     the live angle display. Runs continuously in a background spin thread.
     """
-    def __init__(self, joint_callback):
+    def __init__(self, joint_callback, program_callback, speed_callback):
         super().__init__('real_gui_points_js')
-        self._cb = joint_callback
+        self._joint_cb = joint_callback
+        self._program_cb = program_callback
+        self._speed_cb = speed_callback
+        status_qos = QoSProfile(
+            depth=10,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
         self.create_subscription(JointState, '/joint_states', self._recv, 10)
+        self.create_subscription(
+            Bool,
+            '/io_and_status_controller/robot_program_running',
+            self._recv_program_running,
+            status_qos,
+        )
+        self.create_subscription(
+            Float64,
+            '/speed_scaling_state_broadcaster/speed_scaling',
+            self._recv_speed_scaling,
+            status_qos,
+        )
 
     def _recv(self, msg: JointState):
         joints = {n: math.degrees(p) for n, p in zip(msg.name, msg.position)
                   if n in JOINT_NAMES}
-        self._cb(joints)
+        self._joint_cb(joints)
+
+    def _recv_program_running(self, msg: Bool):
+        self._program_cb(bool(msg.data))
+
+    def _recv_speed_scaling(self, msg: Float64):
+        self._speed_cb(float(msg.data))
 
 
 class MoverNode(Node):
@@ -179,6 +214,7 @@ class MoverNode(Node):
     def __init__(self):
         super().__init__('real_gui_points_mover')
         self._client      = ActionClient(self, FollowJointTrajectory, TRAJECTORY_ACTION)
+        self._moveit_client = ActionClient(self, MoveGroup, MOVE_GROUP_ACTION)
         self._cancel_flag = False
         self._cancel_generation = 0
         self._goal_handle = None
@@ -191,6 +227,13 @@ class MoverNode(Node):
             return
         target_degrees = self._nearest_equivalent_target(degrees, current_degrees)
         generation = self._cancel_generation
+        if PREFER_MOVEIT_JOINT_GOALS:
+            threading.Thread(
+                target=self._moveit_thread,
+                args=(target_degrees, done_cb, fail_cb, generation),
+                daemon=True,
+            ).start()
+            return
         threading.Thread(
             target=self._move_thread,
             args=(current_degrees, target_degrees, done_cb, fail_cb, generation),
@@ -300,6 +343,75 @@ class MoverNode(Node):
             else:
                 msg = result.error_string or 'no controller error string'
                 fail_cb(f'Trajectory failed (code: {result.error_code}): {msg}')
+        finally:
+            with self._goal_lock:
+                if self._goal_handle is goal_handle:
+                    self._goal_handle = None
+            executor.remove_node(self)
+
+    def _make_moveit_goal(self, target_degrees: list) -> MoveGroup.Goal:
+        goal = MoveGroup.Goal()
+        goal.request.group_name = MOVE_GROUP_NAME
+        goal.request.num_planning_attempts = 10
+        goal.request.allowed_planning_time = 5.0
+        goal.request.max_velocity_scaling_factor = 0.3
+        goal.request.max_acceleration_scaling_factor = 0.3
+
+        constraints = Constraints()
+        for name, deg in zip(JOINT_NAMES, target_degrees):
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = math.radians(deg)
+            jc.tolerance_above = GOAL_TOLERANCE_RAD
+            jc.tolerance_below = GOAL_TOLERANCE_RAD
+            jc.weight = 1.0
+            constraints.joint_constraints.append(jc)
+        goal.request.goal_constraints.append(constraints)
+        return goal
+
+    def _moveit_thread(self, target_degrees, done_cb, fail_cb, generation):
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        goal_handle = None
+        try:
+            if not self._moveit_client.wait_for_server(timeout_sec=5.0):
+                fail_cb(
+                    f'No action server at {MOVE_GROUP_ACTION}. '
+                    'Start Step 2 — MoveIt before sending grid moves.'
+                )
+                return
+            if self._was_cancelled(generation):
+                fail_cb('Cancelled')
+                return
+
+            goal = self._make_moveit_goal(target_degrees)
+            future = self._moveit_client.send_goal_async(goal)
+            executor.spin_until_future_complete(future)
+            if self._was_cancelled(generation):
+                fail_cb('Cancelled')
+                return
+
+            goal_handle = future.result()
+            if goal_handle is None:
+                fail_cb('MoveIt goal send failed')
+                return
+            if not goal_handle.accepted:
+                fail_cb('MoveIt rejected joint goal')
+                return
+            with self._goal_lock:
+                self._goal_handle = goal_handle
+
+            result_future = goal_handle.get_result_async()
+            executor.spin_until_future_complete(result_future)
+            if self._was_cancelled(generation):
+                fail_cb('Cancelled')
+                return
+
+            result = result_future.result().result
+            if result.error_code.val == MoveItErrorCodes.SUCCESS:
+                done_cb()
+            else:
+                fail_cb(f'MoveIt failed (code: {result.error_code.val})')
         finally:
             with self._goal_lock:
                 if self._goal_handle is goal_handle:
@@ -596,6 +708,8 @@ class MainWindow(QMainWindow):
     _log_sig    = pyqtSignal(str)
     _cam_sig    = pyqtSignal(object)
     _safety_sig = pyqtSignal(bool)
+    _program_sig = pyqtSignal(bool)
+    _speed_sig = pyqtSignal(float)
 
     def __init__(self, robot_ip: str = '192.168.0.194'):
         super().__init__()
@@ -609,6 +723,10 @@ class MainWindow(QMainWindow):
         self._camera = CameraWorker()
         self._current_joints_rad = {n: 0.0 for n in JOINT_NAMES}
         self._have_joint_state = False
+        self._program_seen = False
+        self._speed_seen = False
+        self._robot_program_running = False
+        self._speed_scaling = 0.0
 
         # Manual grid state
         self._grid_pts       = []    # up to 4 (x, y) in frame coords
@@ -641,13 +759,14 @@ class MainWindow(QMainWindow):
             self._hands_mp = None
 
         self._build_ui()
-        self._start_ros()
-
         self._joints_sig.connect(self._update_joint_display)
         self._status_sig.connect(lambda t, c: self._set_status(t, c))
         self._log_sig.connect(self._log_widget.append)
         self._cam_sig.connect(self._update_camera_frame)
         self._safety_sig.connect(self._handle_safety_node_detection)
+        self._program_sig.connect(self._update_program_running)
+        self._speed_sig.connect(self._update_speed_scaling)
+        self._start_ros()
         self._camera.frame_ready.connect(
             lambda f: self._cam_sig.emit(f)
         )
@@ -884,6 +1003,8 @@ class MainWindow(QMainWindow):
         if self._safety_paused:
             self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
             return
+        if not self._robot_ready_to_move():
+            return
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
@@ -900,6 +1021,8 @@ class MainWindow(QMainWindow):
         """
         if self._safety_paused:
             self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
+            return
+        if not self._robot_ready_to_move():
             return
         if not self._selected_cells:
             self._set_status('Toggle at least one cell first', '#e0a000')
@@ -1069,6 +1192,8 @@ class MainWindow(QMainWindow):
         if self._safety_paused:
             self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
             return
+        if not self._robot_ready_to_move():
+            return
         if self._moving:
             self._set_status('Already moving — press Stop first', '#e0a000')
             return
@@ -1228,6 +1353,8 @@ class MainWindow(QMainWindow):
         if self._safety_paused:
             self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
             return
+        if not self._robot_ready_to_move():
+            return
         if self._moving:
             self._set_status('Moving — press Stop first', '#e0a000')
             return
@@ -1256,6 +1383,33 @@ class MainWindow(QMainWindow):
                 self._current_joints_rad[jname] = math.radians(val)
         if all(name in joints for name in JOINT_NAMES):
             self._have_joint_state = True
+
+    def _update_program_running(self, running: bool):
+        self._program_seen = True
+        self._robot_program_running = running
+
+    def _update_speed_scaling(self, speed_scaling: float):
+        self._speed_seen = True
+        self._speed_scaling = speed_scaling
+
+    def _robot_ready_to_move(self) -> bool:
+        if not self._have_joint_state:
+            self._set_status('No live joint state — wait for UR Driver', '#e0a000')
+            self._log('MOVE BLOCKED: no /joint_states yet')
+            return False
+        if not self._program_seen or not self._speed_seen:
+            self._set_status('Waiting for UR driver status topics…', '#e0a000')
+            self._log('MOVE BLOCKED: waiting for robot program / speed scaling status')
+            return False
+        if not self._robot_program_running:
+            self._set_status('UR program stopped — press Play on pendant', '#ff4444')
+            self._log('MOVE BLOCKED: /io_and_status_controller/robot_program_running is false')
+            return False
+        if self._speed_scaling <= 0.001:
+            self._set_status('Robot speed is 0 — check pendant speed slider / pause', '#ff4444')
+            self._log('MOVE BLOCKED: /speed_scaling_state_broadcaster/speed_scaling is 0')
+            return False
+        return True
 
     def _set_status(self, text: str, colour: str = '#aaaaaa'):
         self._status_label.setText(text)
@@ -1929,7 +2083,9 @@ class MainWindow(QMainWindow):
         try:
             rclpy.init(args=None)
             self._js_node = JointStateNode(
-                lambda joints: self._joints_sig.emit(joints)
+                lambda joints: self._joints_sig.emit(joints),
+                lambda running: self._program_sig.emit(running),
+                lambda speed: self._speed_sig.emit(speed),
             )
             self._mover_node = MoverNode()
             self._bridge_node = CameraBridgeNode(self._on_safety_node_detection)
