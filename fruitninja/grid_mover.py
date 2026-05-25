@@ -2,7 +2,7 @@
 """
 FruitNinja Grid Mover
 =====================
-Moves the UR3e end-effector to any cell in a 14×4 grid (A1–N4).
+Moves the UR3e end-effector to any cell in a 7×4 grid (A1–G4).
 
 Positions are computed from a fixed four-corner calibration measured on the
 UR3e teach pendant.  The photographed corner readings are stored below as both
@@ -39,14 +39,17 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 
-REQUIRED_GRID_CORNERS = ('A1', 'N1', 'N4', 'A4')
+REQUIRED_GRID_CORNERS = ('A1', 'G1', 'G4', 'A4')
+LEGACY_GRID_CORNER_ALIASES = {
+    'G1': 'N1',
+    'G4': 'N4',
+}
 
 GRID_CALIBRATION_ENV = 'FRUITNINJA_GRID_CALIBRATION'
 DEFAULT_GRID_CALIBRATION_PATH = '~/.fruitninja/grid_calibration.json'
 
-# Named per-robot profiles.  The lab has 4 UR3e stations whose base-to-board
-# distances differ slightly; each station's PC remembers which profile is
-# active so the operator does not have to re-select after every relaunch.
+# Named per-robot profiles.  Each robot can keep its own four-corner joint
+# calibration on disk, and the active profile is remembered between launches.
 CALIBRATION_PROFILES = ('robot1', 'robot2', 'robot3', 'robot4')
 CALIBRATION_PROFILE_DIR = '~/.fruitninja/calibrations'
 ACTIVE_PROFILE_MARKER = '~/.fruitninja/active_profile.txt'
@@ -99,7 +102,7 @@ def list_saved_profiles() -> dict[str, bool]:
 
 # ── Grid layout ────────────────────────────────────────────────────────────────
 
-GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']
+GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
 GRID_ROWS = ['1', '2', '3', '4']
 
 JOINT_NAMES = [
@@ -131,8 +134,8 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 # Corner assignment from the base joint in the photos:
 #   Base  31.07° → A1
 #   Base  43.97° → A4
-#   Base -30.35° → N1
-#   Base -42.83° → N4
+#   Base -30.35° → G1
+#   Base -42.83° → G4
 #
 # Tool positions are stored in metres in the UR/base_link frame.  RX/RY/RZ are
 # the UR tool rotation-vector values in radians, kept here for traceability.
@@ -140,45 +143,42 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 CORNER_TOOL_POSES_M = {
     'A1': (-0.24444, -0.30023, -0.34079),
     'A4': (-0.24502, -0.42324, -0.33927),
-    'N1': ( 0.25091, -0.30122, -0.33918),
-    'N4': ( 0.25719, -0.42685, -0.33850),
+    'G1': ( 0.25091, -0.30122, -0.33918),
+    'G4': ( 0.25719, -0.42685, -0.33850),
 }
 
 CORNER_TOOL_ROT_VEC_RAD = {
     'A1': (3.093, -0.047, -0.145),
     'A4': (3.118, -0.057,  0.017),
-    'N1': (3.124, -0.060, -0.035),
-    'N4': (3.137, -0.034, -0.179),
+    'G1': (3.124, -0.060, -0.035),
+    'G4': (3.137, -0.034, -0.179),
 }
 
 CORNER_JOINTS_DEG = {
     # shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
     'A1': ( 31.07, -46.60, 107.83, -157.25, -90.72, 123.03),
     'A4': ( 43.97, -30.44,  65.77, -125.94, -88.64, 136.30),
-    'N1': (-30.35, -132.74, -103.43,  -34.39,  88.55, 241.85),
-    'N4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
+    'G1': (-30.35, -132.74, -103.43,  -34.39,  88.55, 241.85),
+    'G4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
 }
 
 # ── Per-robot calibration overrides ──────────────────────────────────────────
-# The hardcoded corner tables above were measured on one specific UR3e station.
-# In the lab each robot sits at a slightly different distance from its cutting
-# board, so reusing those numbers on a different station puts the cut points
-# outside that arm's reach (IK failures, controller rejects).
-#
-# apply_calibration() mutates the three corner dicts in place so that every
-# downstream function (cell_to_pose / cell_to_joints_deg / grid_uv_to_*) starts
-# returning the calibrated values without any caller change.  The calibration
-# JSON is captured per-machine via the FruitNinja GUI calibration panel and
-# saved to ~/.fruitninja/grid_calibration.json.
 
-def _validate_corners(corners: dict, expected_len: int, label: str):
-    missing = [c for c in REQUIRED_GRID_CORNERS if c not in corners]
+def _normalise_corner_map(corners: dict, expected_len: int, label: str) -> dict:
+    normalised = dict(corners)
+    for new_key, old_key in LEGACY_GRID_CORNER_ALIASES.items():
+        if new_key not in normalised and old_key in normalised:
+            normalised[new_key] = normalised[old_key]
+
+    missing = [c for c in REQUIRED_GRID_CORNERS if c not in normalised]
     if missing:
         raise ValueError(f'{label}: missing corners {missing}')
+
     for c in REQUIRED_GRID_CORNERS:
-        v = corners[c]
+        v = normalised[c]
         if len(v) != expected_len:
             raise ValueError(f'{label}: corner {c} expected {expected_len} values, got {len(v)}')
+    return normalised
 
 
 def apply_calibration(poses_m: dict | None = None,
@@ -186,15 +186,15 @@ def apply_calibration(poses_m: dict | None = None,
                       joints_deg: dict | None = None) -> None:
     """Mutate the corner tables in place from a captured calibration."""
     if poses_m is not None:
-        _validate_corners(poses_m, 3, 'corner_tool_poses_m')
+        poses_m = _normalise_corner_map(poses_m, 3, 'corner_tool_poses_m')
         for c in REQUIRED_GRID_CORNERS:
             CORNER_TOOL_POSES_M[c] = tuple(float(x) for x in poses_m[c])
     if rot_vec_rad is not None:
-        _validate_corners(rot_vec_rad, 3, 'corner_tool_rot_vec_rad')
+        rot_vec_rad = _normalise_corner_map(rot_vec_rad, 3, 'corner_tool_rot_vec_rad')
         for c in REQUIRED_GRID_CORNERS:
             CORNER_TOOL_ROT_VEC_RAD[c] = tuple(float(x) for x in rot_vec_rad[c])
     if joints_deg is not None:
-        _validate_corners(joints_deg, 6, 'corner_joints_deg')
+        joints_deg = _normalise_corner_map(joints_deg, 6, 'corner_joints_deg')
         for c in REQUIRED_GRID_CORNERS:
             CORNER_JOINTS_DEG[c] = tuple(float(x) for x in joints_deg[c])
 
@@ -209,11 +209,6 @@ def save_calibration(path: str | None = None,
         target = os.path.expanduser(path)
     else:
         target = grid_calibration_path()
-    # Save only joint angles — the movement pipeline interpolates from these
-    # exclusively (cell_to_joints_deg → CORNER_JOINTS_DEG).  XYZ/rotvec were
-    # previously included for human-readable logging but the system never
-    # used them for control; keeping a single source of truth avoids drift
-    # between the two.
     data = {
         'frame_id': frame_id,
         'eef_link': eef_link,
@@ -264,18 +259,18 @@ del _active
 # and average grid spacing constants directly.
 A4_X, A4_Y, A4_Z = CORNER_TOOL_POSES_M['A4']
 COL_SPACING = (
-    (CORNER_TOOL_POSES_M['N1'][0] - CORNER_TOOL_POSES_M['A1'][0]) +
-    (CORNER_TOOL_POSES_M['N4'][0] - CORNER_TOOL_POSES_M['A4'][0])
+    (CORNER_TOOL_POSES_M['G1'][0] - CORNER_TOOL_POSES_M['A1'][0]) +
+    (CORNER_TOOL_POSES_M['G4'][0] - CORNER_TOOL_POSES_M['A4'][0])
 ) / (2 * (len(GRID_COLS) - 1))
 ROW_SPACING = (
     (CORNER_TOOL_POSES_M['A1'][1] - CORNER_TOOL_POSES_M['A4'][1]) +
-    (CORNER_TOOL_POSES_M['N1'][1] - CORNER_TOOL_POSES_M['N4'][1])
+    (CORNER_TOOL_POSES_M['G1'][1] - CORNER_TOOL_POSES_M['G4'][1])
 ) / (2 * (len(GRID_ROWS) - 1))
 
 # ── Cell → fixed-grid interpolation ────────────────────────────────────────────
 
 def _cell_uv(cell: str) -> tuple[float, float]:
-    """Return normalised grid coordinates: u=0..1 A→N, v=0..1 row1→row4."""
+    """Return normalised grid coordinates: u=0..1 A→G, v=0..1 row1→row4."""
     cell = cell.strip().upper()
     if len(cell) != 2:
         raise ValueError(f"Cell must be 2 characters e.g. 'B3'. Got: '{cell}'")
@@ -286,7 +281,7 @@ def _cell_uv(cell: str) -> tuple[float, float]:
     if row_char not in GRID_ROWS:
         raise ValueError(f"Invalid row '{row_char}'. Valid: {GRID_ROWS}")
 
-    col_idx = GRID_COLS.index(col_char)   # 0 = A … 13 = N
+    col_idx = GRID_COLS.index(col_char)   # 0 = A … 6 = G
     row_idx = GRID_ROWS.index(row_char)   # 0 = row1 … 3 = row4
     return col_idx / (len(GRID_COLS) - 1), row_idx / (len(GRID_ROWS) - 1)
 
@@ -301,13 +296,14 @@ def _bilinear_tuple(corners: dict[str, tuple[float, ...]],
     """
     Interpolate a tuple-valued corner table.
 
-    Top edge is A1→N1, bottom edge is A4→N4, then v blends row1→row4.
+    Top edge is A1→G1, bottom edge is A4→G4, then v blends row1→row4.
     """
     n = len(corners['A1'])
+    tl, tr, br, bl = REQUIRED_GRID_CORNERS
     return tuple(
         _lerp(
-            _lerp(corners['A1'][i], corners['N1'][i], u),
-            _lerp(corners['A4'][i], corners['N4'][i], u),
+            _lerp(corners[tl][i], corners[tr][i], u),
+            _lerp(corners[bl][i], corners[br][i], u),
             v,
         )
         for i in range(n)
@@ -538,8 +534,8 @@ class GridMoverNode(Node):
         return success
 
     def trace_corners(self) -> bool:
-        """Visit all 4 grid corners in order: A1 → N1 → N4 → A4."""
-        for cell in ['A1', 'N1', 'N4', 'A4']:
+        """Visit all 4 grid corners in order: A1 → G1 → G4 → A4."""
+        for cell in REQUIRED_GRID_CORNERS:
             self.get_logger().info(f'Tracing corner {cell}')
             if not self.move_to_cell(cell):
                 self.get_logger().error(f'Trace aborted at {cell}')
@@ -553,9 +549,9 @@ def main(args=None):
     parser = argparse.ArgumentParser(description='Move UR3e to a grid cell')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--cell',  type=str,
-                       help='Grid cell e.g. A1, B3, N4')
+                       help='Grid cell e.g. A1, B3, G4')
     group.add_argument('--trace', action='store_true',
-                       help='Trace all 4 grid corners: A1 → N1 → N4 → A4')
+                       help='Trace all 4 grid corners: A1 → G1 → G4 → A4')
     parsed, remaining = parser.parse_known_args()
 
     rclpy.init(args=remaining)

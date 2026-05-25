@@ -39,7 +39,7 @@ BLUE_HSV_RANGES = [
 BLUE_BGR        = (220, 80,  0)
 GRID_BGR        = (200, 200, 0)
 CELL_LABEL_BGR  = (255, 255, 255)
-GRID_COLS       = 14   # 73 cm wide
+GRID_COLS       = 7    # 73 cm wide
 GRID_ROWS       = 4    # 22 cm long
 MIN_MARKER_AREA = 300
 

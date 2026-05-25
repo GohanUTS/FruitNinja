@@ -5,7 +5,7 @@ real_gui_points.py — Main operator GUI for the FruitNinja UR3e cutting robot.
 HOW IT WORKS (overview)
 ========================
 1. The GUI connects to a live UR3e robot via ROS 2 / MoveIt.
-2. The operator selects grid cells (A1–N4) on the cutting board grid.
+2. The operator selects grid cells (A1–G4) on the cutting board grid.
 3. Pressing "Move to Selected" drives the robot through each cell in order,
    using the fixed calibrated joint pose for that cell.
 4. A camera feed (top-right) can run colour detection once the operator has
@@ -48,11 +48,9 @@ from fruitninja.grid_mover import (
     cell_to_pose, cell_to_joints_deg, grid_uv_to_pose,
     grid_uv_to_joints_deg, GRID_COLS, GRID_ROWS,
     REQUIRED_GRID_CORNERS, apply_calibration, save_calibration,
-    load_calibration, grid_calibration_path,
-    CALIBRATION_PROFILES, profile_calibration_path,
+    load_calibration, CALIBRATION_PROFILES,
     get_active_profile, set_active_profile, list_saved_profiles,
 )
-import tf2_ros
 
 import argparse
 import socket as _socket
@@ -89,8 +87,7 @@ from PyQt5.QtGui import (
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 # JOINT_NAMES / JOINT_LABELS: the 6 UR3e joints in the order MoveIt expects them.
-# HOME_DEG: the default safe "rest" pose used by the Reset button.
-#          PROFILE_HOME_DEG overrides this for specific robots.
+# HOME_DEG: the safe "rest" pose used by the Reset button.
 # APPROACH_LIFT_DELTA: fixed shoulder lift offset from the calibrated cut pose.
 
 JOINT_NAMES = [
@@ -106,150 +103,32 @@ JOINT_LABELS = ['Base (pan)', 'Shoulder (lift)', 'Elbow', 'Wrist 1', 'Wrist 2', 
 
 HOME_DEG = [0.0, -90.0, 0.0, -90.0, 0.0, 0.0]
 
-# Robot-specific safe homes / wrist locks.  Robot 3 uses the down-facing pose
-# captured from the joint viewer screenshot:
-#   pan=-90.2, lift=-90.6, elbow=-135.0, w1=-45.0, w2=+90.2, w3=+90.0
-ROBOT3_HOME_DEG = [-90.2, -90.6, -135.0, -45.0, 90.2, 90.0]
-PROFILE_HOME_DEG = {
-    'robot3': ROBOT3_HOME_DEG,
-}
-PROFILE_WRIST_LOCKS = {
-    'robot3': {
-        'wrist_1_deg': ROBOT3_HOME_DEG[3],
-        'wrist_2_deg': ROBOT3_HOME_DEG[4],
-        'wrist_3_deg': ROBOT3_HOME_DEG[5],
-        'tool_down_sum_deg': ROBOT3_HOME_DEG[1] + ROBOT3_HOME_DEG[2] + ROBOT3_HOME_DEG[3],
-    },
-}
-PROFILE_PREFER_MOVEIT = {
-    # Robot 3 still uses MoveIt for normal motion.  The safe-transit code below
-    # skips redundant home-to-home goals, which was the source of the generic
-    # MoveIt 99999 failure seen after pressing Reset then Trace.
-    'robot3': True,
-}
-
 TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
 MOVE_GROUP_ACTION = '/move_action'
 MOVE_GROUP_NAME = 'ur_manipulator'
 
 APPROACH_LIFT_DELTA = -11.0  # matches legacy hover(-52°) → cut(-41°) spacing
 
-# Per-cell press-depth correction.
-#
-# Bilinear interpolation of joint angles between the 4 calibrated corners
-# does NOT produce a flat Cartesian plane — middle cells land below the
-# captured corner plane, corner cells stay closer to it.  As a result a
-# single constant press makes middle cells slam the board while corners
-# barely touch.  Compensate by making the press *smaller* in the middle of
-# the grid and *larger* at the corners.
-#
-# Approx UR3e sensitivity at these poses: ~3 mm of vertical drop per 0.5°
-# of shoulder lift.  Tune CORNER vs CENTER to flatten the depth across the
-# grid.  Set both to the same value to recover a uniform constant press.
-CORNER_PRESS_DEG = 0.8   # how hard corner cells press into the board (deg)
-CENTER_PRESS_DEG = 0.2   # how hard the very centre of the grid presses (deg)
-# Legacy alias still referenced by older logs / docstrings.
-CUT_PRESS_DEG = (CORNER_PRESS_DEG + CENTER_PRESS_DEG) / 2.0
-
-
-# Lock the wrist joints to a fixed orientation for every grid move.
-#
-# joints[0..2] (base / shoulder / elbow) come from the bilinear interpolation
-# of captured corners and decide where the tool tip lands.
-# joints[3..5] (the wrists) are forced to LOCKED_WRIST_*_DEG so the cutter
-# always has the same orientation regardless of the captured wrist drift.
-#
-# Wrist 3 gets +CROSS_CUT_WRIST_DELTA_DEG added for the second pass of the
-# cross-cut sequence; otherwise it stays at LOCKED_WRIST_3_DEG.
-#
-# NOTE: locking wrist_1 to a constant does NOT guarantee the tool points
-# perfectly straight down at every cell — that depends on the sum
-# shoulder + elbow + wrist_1.  USE_AUTO_TOOL_DOWN derives wrist_1 after each
-# final shoulder offset, so the tool stays straight while lowering/recovering.
-LOCK_WRIST_JOINTS = True
-LOCKED_WRIST_1_DEG = 0.0     # captured-grid wrist 1 lock
-LOCKED_WRIST_2_DEG = -90.0   # vertical wrist axis
-LOCKED_WRIST_3_DEG = 0.0     # blade roll for first cut
-
-USE_AUTO_TOOL_DOWN = True    # True → derive wrist_1 instead of using the constant
-TOOL_DOWN_SUM_DEG = -90.0    # only used when USE_AUTO_TOOL_DOWN is True
-
-
-def _active_motion_profile() -> str | None:
-    try:
-        return get_active_profile()
-    except Exception:
-        return None
-
-
-def _profile_home_degrees() -> list:
-    return list(PROFILE_HOME_DEG.get(_active_motion_profile(), HOME_DEG))
-
-
-def _wrist_lock_config() -> dict:
-    return PROFILE_WRIST_LOCKS.get(_active_motion_profile(), {})
-
-
-def _prefer_moveit_joint_goals() -> bool:
-    return PROFILE_PREFER_MOVEIT.get(_active_motion_profile(), PREFER_MOVEIT_JOINT_GOALS)
-
-
-def _lock_wrists(joints_deg, cross_cut: bool = False) -> list:
-    """Override joints[3..5] with the configured wrist lock.
-
-    By default this is a literal lock — wrist_1/2/3 are set to the LOCKED_*
-    constants, or profile-specific lock values for the active robot.  If
-    USE_AUTO_TOOL_DOWN is True, wrist_1 is derived so the active profile's
-    shoulder+elbow+wrist_1 sum stays constant while wrist_2/wrist_3 stay locked.
-    """
-    out = list(joints_deg)
-    if not LOCK_WRIST_JOINTS:
-        return out
-    lock = _wrist_lock_config()
-    wrist_1 = lock.get('wrist_1_deg', LOCKED_WRIST_1_DEG)
-    wrist_2 = lock.get('wrist_2_deg', LOCKED_WRIST_2_DEG)
-    wrist_3 = lock.get('wrist_3_deg', LOCKED_WRIST_3_DEG)
-    tool_down_sum = lock.get('tool_down_sum_deg', TOOL_DOWN_SUM_DEG)
-    if USE_AUTO_TOOL_DOWN:
-        out[3] = tool_down_sum - out[1] - out[2]       # wrist_1 — derived
-    else:
-        out[3] = wrist_1                                # wrist_1 — constant
-    out[4] = wrist_2                                    # wrist_2 — constant
-    out[5] = wrist_3 + (CROSS_CUT_WRIST_DELTA_DEG if cross_cut else 0.0)
-    return out
-
-
-def _grid_target_joints(joints_deg,
-                        shoulder_delta: float = 0.0,
-                        cross_cut: bool = False) -> list:
-    """Apply the final shoulder offset, then lock/derive wrists.
-
-    The order matters for USE_AUTO_TOOL_DOWN: wrist_1 must be calculated from
-    the final shoulder angle, not from the unpressed grid pose.  Otherwise the
-    tool curls during the down move and can miss the point on robot 3.
-    """
-    out = list(joints_deg)
-    out[1] += shoulder_delta
-    return _lock_wrists(out, cross_cut=cross_cut)
-
-
-def _cell_press_deg(u: float, v: float) -> float:
-    """Press depth in shoulder-lift degrees for a normalised grid cell (u, v).
-
-    u, v are in [0, 1] where (0, 0) = A1 corner cell, (1, 1) = N4 corner cell.
-    Uses a bilinear-style "centre factor" that is 0 at any corner and 1 at
-    the dead centre (u=v=0.5) so the press tapers smoothly from corners to
-    the middle of the grid.
-    """
-    u = min(1.0, max(0.0, float(u)))
-    v = min(1.0, max(0.0, float(v)))
-    center_factor = 4.0 * u * (1.0 - u) * 4.0 * v * (1.0 - v)
-    return CORNER_PRESS_DEG + (CENTER_PRESS_DEG - CORNER_PRESS_DEG) * center_factor
-
-# If the base joint needs to change by more than this between consecutive moves,
-# route through the active profile's home first so the arm clears the table
-# before reconfiguring.
+# Manual moves still use the home detour when the base swing is large. Trace
+# Grid deliberately skips it so A→G corner checks do not reset to home.
 SAFE_TRANSIT_BASE_DEG = 45.0
+
+# Camera-to-robot grid trim. The camera grid was reading fruit one row lower
+# than the robot cut grid: a fruit shown as D2 was physically cut by D1.
+# Apply this only to detected-fruit robot targets; the visible camera labels
+# still show what the operator clicked/defined.
+CAMERA_TO_ROBOT_ROW_OFFSET_CELLS = -1.0
+
+# Raise all cut targets slightly. Shoulder lift uses the existing convention
+# where more negative means higher; -0.5° is roughly the 3 mm over-depth seen
+# on the board. The right-near corner gets a little extra because it was the
+# protective-stop corner.
+GLOBAL_CUT_LIFT_DEG = -0.5
+RIGHT_NEAR_CELL = f'{GRID_COLS[-1]}{GRID_ROWS[-1]}'
+CELL_CUT_LIFT_DEG = {
+    RIGHT_NEAR_CELL: -0.5,
+}
+
 START_HOLD_SEC = 0.5
 MIN_MOVE_DURATION_SEC = 4.0
 MAX_JOINT_SPEED_DEG_S = 10.0
@@ -273,9 +152,9 @@ PREFER_MOVEIT_JOINT_GOALS = True
 # 640x480 is the sweet spot for MediaPipe Hands — fast inference without losing
 # the spatial resolution needed to resolve hand position against the grid polygon.
 # Any camera source (webcam, RealSense, Other) is scaled to this before encoding.
-SAFETY_FRAME_W = 480
-SAFETY_FRAME_H = 360
-SAFETY_JPEG_QUALITY = 50
+SAFETY_FRAME_W = 640
+SAFETY_FRAME_H = 480
+SAFETY_JPEG_QUALITY = 60
 
 
 def _board_position(col_idx: int, row_idx: int) -> tuple:
@@ -288,15 +167,29 @@ def _board_joints(col_idx: int, row_idx: int) -> list:
     return cell_to_joints_deg(GRID_COLS[col_idx] + GRID_ROWS[row_idx])
 
 
+def _cut_joints_for_cell(cell: str, joints_deg: list) -> list:
+    out = list(joints_deg)
+    out[1] += GLOBAL_CUT_LIFT_DEG + CELL_CUT_LIFT_DEG.get(cell, 0.0)
+    return out
+
+
+def _camera_grid_to_robot_target(grid_x: float,
+                                 grid_y: float) -> tuple[float, float, float, float, str]:
+    col_pos = min(len(GRID_COLS) - 1, max(0.0, grid_x - 0.5))
+    row_pos = min(
+        len(GRID_ROWS) - 1,
+        max(0.0, grid_y - 0.5 + CAMERA_TO_ROBOT_ROW_OFFSET_CELLS),
+    )
+    u = col_pos / (len(GRID_COLS) - 1)
+    v = row_pos / (len(GRID_ROWS) - 1)
+    target_col = min(len(GRID_COLS) - 1, max(0, int(round(col_pos))))
+    target_row = min(len(GRID_ROWS) - 1, max(0, int(round(row_pos))))
+    target_cell = f'{GRID_COLS[target_col]}{GRID_ROWS[target_row]}'
+    return col_pos, row_pos, u, v, target_cell
+
+
 def _wrap_deg(deg: float) -> float:
     return ((deg + 180.0) % 360.0) - 180.0
-
-
-def _max_wrapped_joint_delta(a_degrees: list, b_degrees: list) -> float:
-    return max(
-        abs(_wrap_deg(a - b))
-        for a, b in zip(a_degrees, b_degrees)
-    )
 
 
 # ── ROS2 nodes ─────────────────────────────────────────────────────────────────
@@ -375,10 +268,7 @@ class MoverNode(Node):
             return
         target_degrees = self._nearest_equivalent_target(degrees, current_degrees)
         generation = self._cancel_generation
-        if _max_wrapped_joint_delta(target_degrees, current_degrees) <= 1.0:
-            done_cb()
-            return
-        if _prefer_moveit_joint_goals():
+        if PREFER_MOVEIT_JOINT_GOALS:
             threading.Thread(
                 target=self._moveit_thread,
                 args=(target_degrees, done_cb, fail_cb, generation),
@@ -879,8 +769,8 @@ class MainWindow(QMainWindow):
         self._robot_program_running = False
         self._speed_scaling = 0.0
 
-        # Per-robot calibration capture state.  Populated as the user clicks
-        # the Capture buttons; flushed to disk + applied live on Save & Use.
+        # Per-robot calibration capture state. Populated by the Capture buttons
+        # and saved to ~/.fruitninja/calibrations/<robot>.json.
         self._pending_calibration: dict = {}
 
         # Manual grid state
@@ -988,7 +878,9 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_calibration_panel())
 
         # ── grid selector ─────────────────────────────────────────────────────
-        grid_group = self._group('Grid — Toggle Cells  (A1=far-left  N4=near-right  |  moves left→right)')
+        grid_group = self._group(
+            f'Grid — Toggle Cells  (A1=far-left  {RIGHT_NEAR_CELL}=near-right  |  moves left→right)'
+        )
         grid_layout = QGridLayout()
         grid_layout.setSpacing(4)
         grid_layout.setContentsMargins(4, 4, 4, 4)
@@ -1116,7 +1008,7 @@ class MainWindow(QMainWindow):
     # ── slots ─────────────────────────────────────────────────────────────────
 
     def _cell_sort_key(self, cell: str):
-        """Sort key: left-to-right (A→N), then top-to-bottom (1→4)."""
+        """Sort key: left-to-right (A→G), then top-to-bottom (1→4)."""
         return (GRID_COLS.index(cell[0]), GRID_ROWS.index(cell[1]))
 
     def _select_cell(self, cell: str):
@@ -1157,7 +1049,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, callback)
 
     def _trace_grid(self):
-        """Visit all 4 grid corners: A1 → N1 → N4 → A4."""
+        """Visit all 4 grid corners without routing through Home."""
         if self._safety_paused:
             self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
             return
@@ -1168,14 +1060,14 @@ class MainWindow(QMainWindow):
             return
         self._moving = True
         self._clear_resume_motion()
-        corners = ['A1', 'N1', 'N4', 'A4']
+        corners = list(REQUIRED_GRID_CORNERS)
         self._log(f'Trace: {" → ".join(corners)}')
-        self._move_next(corners)
+        self._move_next(corners, use_safe_transit=False)
 
     def _go(self):
         """
         Start the fixed-joint movement sequence for all selected grid cells,
-        left-to-right (A→N).
+        left-to-right (A→G).
         """
         if self._safety_paused:
             self._set_status('Safety interlock active — remove hand from zone', '#ff4444')
@@ -1194,7 +1086,7 @@ class MainWindow(QMainWindow):
         self._log(f'Queue: {" → ".join(queue)}')
         self._move_next(queue)
 
-    def _move_next(self, queue: list):
+    def _move_next(self, queue: list, use_safe_transit: bool = True):
         """
         Recursive per-cell cut loop for the manual selection sequence.
 
@@ -1216,23 +1108,16 @@ class MainWindow(QMainWindow):
         remaining = queue[1:]
         self._set_resume_motion(
             f'manual sequence from {cell}',
-            lambda q=list(queue): self._move_next(q),
+            lambda q=list(queue), st=use_safe_transit: self._move_next(q, st),
         )
         col_idx = GRID_COLS.index(cell[0])
         row_idx = GRID_ROWS.index(cell[1])
         bx, by, bz = _board_position(col_idx, row_idx)
-        captured_cut = _board_joints(col_idx, row_idx)
-        u = col_idx / (len(GRID_COLS) - 1)
-        v = row_idx / (len(GRID_ROWS) - 1)
-        press_deg = _cell_press_deg(u, v)
-        cut_degrees = _grid_target_joints(
-            captured_cut,
-            shoulder_delta=press_deg,             # per-cell press into the board
-        )
-        approach_degrees = _grid_target_joints(
-            captured_cut,
-            shoulder_delta=APPROACH_LIFT_DELTA,
-        )
+        raw_cut_degrees = _board_joints(col_idx, row_idx)
+        cut_degrees = _cut_joints_for_cell(cell, raw_cut_degrees)
+        approach_degrees = list(cut_degrees)
+        approach_degrees[1] += APPROACH_LIFT_DELTA
+        cut_lift = GLOBAL_CUT_LIFT_DEG + CELL_CUT_LIFT_DEG.get(cell, 0.0)
 
         self._status_sig.emit(f'Moving to {cell}…  ({len(remaining)} remaining)', '#3a7aff')
         approach_txt = ', '.join(f'{j:.2f}°' for j in approach_degrees)
@@ -1240,7 +1125,7 @@ class MainWindow(QMainWindow):
         self._log(
             f'Moving to {cell}: '
             f'tool=({bx*1000:.1f}, {by*1000:.1f}, {bz*1000:.1f}) mm  '
-            f'press={press_deg:+.2f}°  '
+            f'cut_lift={cut_lift:+.1f}°  '
             f'approach=[{approach_txt}]  cut=[{cut_txt}]'
         )
 
@@ -1264,7 +1149,7 @@ class MainWindow(QMainWindow):
             self._log_sig.emit(f'Cut at {cell} — recovering')
             self._mover_node.move_to(
                 approach_degrees,
-                done_cb=lambda: self._move_next(remaining),
+                done_cb=lambda st=use_safe_transit: self._move_next(remaining, st),
                 fail_cb=_on_fail,
                 current_degrees=self._current_joint_degrees(),
             )
@@ -1277,12 +1162,20 @@ class MainWindow(QMainWindow):
             self._log_sig.emit(f'FAIL at {cell}: {msg}')
             setattr(self, '_moving', False)
 
-        self._move_with_safe_transit(
-            approach_degrees,
-            done_cb=_on_arrive,
-            fail_cb=_on_fail,
-            label=cell,
-        )
+        if use_safe_transit:
+            self._move_with_safe_transit(
+                approach_degrees,
+                done_cb=_on_arrive,
+                fail_cb=_on_fail,
+                label=cell,
+            )
+        else:
+            self._mover_node.move_to(
+                approach_degrees,
+                done_cb=_on_arrive,
+                fail_cb=_on_fail,
+                current_degrees=self._current_joint_degrees(),
+            )
 
     def _current_joint_degrees(self) -> list | None:
         if not self._have_joint_state:
@@ -1291,8 +1184,8 @@ class MainWindow(QMainWindow):
 
     def _move_with_safe_transit(self, target_degrees: list, done_cb, fail_cb, label: str = ''):
         """
-        Move to target_degrees, routing through the active profile's home first
-        if the base joint would have to swing more than SAFE_TRANSIT_BASE_DEG.
+        Move to target_degrees, routing through HOME_DEG first if the base joint
+        would have to swing more than SAFE_TRANSIT_BASE_DEG from the current position.
         This prevents the arm from sweeping through the table when transitioning
         between cells that use different kinematic configurations (e.g. A-column
         at base ~+35° vs N-column at base ~-40°).
@@ -1304,23 +1197,10 @@ class MainWindow(QMainWindow):
         base_delta = abs(_wrap_deg(target_degrees[0] - current[0]))
         if base_delta > SAFE_TRANSIT_BASE_DEG:
             transit_label = f'safe transit → home (base swing {base_delta:.0f}°)' + (f' before {label}' if label else '')
-            home_degrees = _profile_home_degrees()
-            home_delta = _max_wrapped_joint_delta(current, home_degrees)
-            if home_delta <= 3.0:
-                self._log(
-                    f'Large base swing detected ({base_delta:.0f}°), already at home — moving to {label or "target"}'
-                )
-                self._mover_node.move_to(
-                    target_degrees,
-                    done_cb=done_cb,
-                    fail_cb=fail_cb,
-                    current_degrees=current,
-                )
-                return
             self._log(f'Large base swing detected ({base_delta:.0f}°) — routing via home')
             self._status_sig.emit(f'Safe transit via home ({base_delta:.0f}° base swing)…', '#e0a000')
             self._mover_node.move_to(
-                home_degrees,
+                HOME_DEG,
                 done_cb=lambda: self._mover_node.move_to(
                     target_degrees,
                     done_cb=done_cb,
@@ -1340,33 +1220,19 @@ class MainWindow(QMainWindow):
 
     def _fruit_target(self, fruit: dict) -> dict:
         grid_x, grid_y = fruit['grid_xy']
-        col_pos = min(len(GRID_COLS) - 1, max(0.0, grid_x - 0.5))
-        row_pos = min(len(GRID_ROWS) - 1, max(0.0, grid_y - 0.5))
-        u = col_pos / (len(GRID_COLS) - 1)
-        v = row_pos / (len(GRID_ROWS) - 1)
-
-        captured_cut = grid_uv_to_joints_deg(u, v)
-        press_deg = _cell_press_deg(u, v)
-
-        # First pass: apply the final shoulder offset, then lock/derive wrists.
-        cut = _grid_target_joints(captured_cut, shoulder_delta=press_deg)
-        approach = _grid_target_joints(
-            captured_cut,
-            shoulder_delta=APPROACH_LIFT_DELTA,
+        _col_pos, _row_pos, u, v, target_cell = _camera_grid_to_robot_target(
+            grid_x, grid_y
         )
 
-        # Second pass (cross-cut): wrists locked too, but W3 += 90° so the
-        # blade rotates a quarter turn between the two slices.
-        cut_cross = _grid_target_joints(
-            captured_cut,
-            shoulder_delta=press_deg,
-            cross_cut=True,
-        )
-        approach_cross = _grid_target_joints(
-            captured_cut,
-            shoulder_delta=APPROACH_LIFT_DELTA,
-            cross_cut=True,
-        )
+        cut = grid_uv_to_joints_deg(u, v)
+        cut = _cut_joints_for_cell(target_cell, cut)
+        approach = list(cut)
+        approach[1] += APPROACH_LIFT_DELTA
+
+        cut_cross = list(cut)
+        cut_cross[5] += CROSS_CUT_WRIST_DELTA_DEG
+        approach_cross = list(cut_cross)
+        approach_cross[1] += APPROACH_LIFT_DELTA
 
         x, y, z = grid_uv_to_pose(u, v)
         return {
@@ -1375,8 +1241,8 @@ class MainWindow(QMainWindow):
             'cut_cross': cut_cross,
             'approach_cross': approach_cross,
             'tool': (x, y, z),
-            'press_deg': press_deg,
-            'uv': (u, v),
+            'target_cell': target_cell,
+            'cut_lift_deg': GLOBAL_CUT_LIFT_DEG + CELL_CUT_LIFT_DEG.get(target_cell, 0.0),
         }
 
     def _cut_detected_fruit(self):
@@ -1437,16 +1303,13 @@ class MainWindow(QMainWindow):
         target = self._fruit_target(fruit)
         x, y, z = target['tool']
         label = fruit['origin']
+        target_cell = target.get('target_cell', label)
         gx, gy = fruit['grid_xy']
-        u, v = target['uv']
-        fx, fy = fruit.get('frame_xy', (-1, -1))
-        cut_txt = ', '.join(f'{j:.2f}°' for j in target['cut'])
         self._log(
-            f'Fruit {label}: pixel=({fx}, {fy})  '
-            f'grid=({gx:.2f}, {gy:.2f})  uv=({u:.3f}, {v:.3f})  '
+            f'Fruit {label}: centroid grid=({gx:.2f}, {gy:.2f})  '
+            f'robot_target={target_cell}  '
             f'tool=({x*1000:.1f}, {y*1000:.1f}, {z*1000:.1f}) mm  '
-            f'press={target["press_deg"]:+.2f}°  '
-            f'cut=[{cut_txt}]  '
+            f'cut_lift={target["cut_lift_deg"]:+.1f}°  '
             f'cross wrist +{CROSS_CUT_WRIST_DELTA_DEG:.0f}°'
         )
         self._status_sig.emit(f'Cutting fruit at {label}…', '#3a7aff')
@@ -1549,7 +1412,7 @@ class MainWindow(QMainWindow):
 
     def _reset(self):
         """
-        Drive the robot to the active profile's home pose.
+        Drive the robot to the HOME_DEG pose ([0, -90, 0, -90, 0, 0] degrees).
         This is a safe upright posture that keeps the arm clear of the cutting board.
         Blocked while a move is in progress — press E-STOP first if needed.
         """
@@ -1563,12 +1426,10 @@ class MainWindow(QMainWindow):
             return
         self._moving = True
         self._clear_resume_motion()
-        home_degrees = _profile_home_degrees()
-        home_txt = ', '.join(f'{j:+.1f}°' for j in home_degrees)
         self._set_status('Moving to Home…', '#e0a000')
-        self._log(f'Resetting to home position [{home_txt}]')
+        self._log('Resetting to home position')
         self._mover_node.move_to(
-            home_degrees,
+            HOME_DEG,
             done_cb=lambda: (
                 self._status_sig.emit('Home position reached', '#00cc00'),
                 setattr(self, '_moving', False),
@@ -1635,7 +1496,7 @@ class MainWindow(QMainWindow):
         info = QLabel(
             'Pick the robot, freedrive UR3e to each corner of the cutting '
             'board, click Capture. After all 4 corners, click Save & Use. '
-            'Load to switch to another robot’s saved calibration.'
+            'Load switches to another robot saved calibration.'
         )
         info.setWordWrap(True)
         info.setStyleSheet('color:#91a5b2; font-size:11px;')
@@ -1646,26 +1507,26 @@ class MainWindow(QMainWindow):
         prof_lbl = QLabel('Robot:')
         prof_lbl.setStyleSheet('color:#d1dde4; font-size:12px;')
         prof_row.addWidget(prof_lbl)
+
         self._profile_combo = QComboBox()
-        # Display labels are human friendly; the userData carries the
-        # canonical name used by grid_mover (robot1/2/3/4).
         for i, name in enumerate(CALIBRATION_PROFILES, start=1):
             self._profile_combo.addItem(f'Robot {i}', name)
         self._profile_combo.setStyleSheet(
             'QComboBox{background:#08131a;color:#c9d6de;border:1px solid #2f5161;'
             'border-radius:5px;padding:4px 8px;font-size:12px;}'
         )
+        self._profile_combo.currentIndexChanged.connect(self._refresh_profile_labels)
         prof_row.addWidget(self._profile_combo, stretch=1)
-        self._btn_calib_load = QPushButton('📂  Load')
+
+        self._btn_calib_load = QPushButton('Load')
         self._btn_calib_load.setStyleSheet(
-            'QPushButton{background:#1a3a5c;color:white;border-radius:5px;padding:6px 14px;font-size:12px;font-weight:bold;}'
+            'QPushButton{background:#1a3a5c;color:white;border-radius:5px;'
+            'padding:6px 14px;font-size:12px;font-weight:bold;}'
             'QPushButton:hover{background:#235080;}'
         )
         self._btn_calib_load.clicked.connect(self._load_selected_profile)
         prof_row.addWidget(self._btn_calib_load)
         layout.addLayout(prof_row)
-
-        self._profile_combo.currentIndexChanged.connect(self._refresh_profile_labels)
 
         row = QHBoxLayout()
         row.setSpacing(6)
@@ -1681,10 +1542,11 @@ class MainWindow(QMainWindow):
                 'QPushButton:hover{background:#235080;}'
                 'QPushButton:pressed{background:#122b44;}'
             )
-            btn.clicked.connect(lambda _c=False, cn=corner: self._capture_corner(cn))
+            btn.clicked.connect(lambda _checked=False, cn=corner: self._capture_corner(cn))
             self._calib_btns[corner] = btn
             col.addWidget(btn)
-            badge = QLabel('· not captured')
+
+            badge = QLabel('- not captured')
             badge.setAlignment(Qt.AlignCenter)
             badge.setStyleSheet('color:#7a8fa0; font-size:10px;')
             self._calib_status_lbls[corner] = badge
@@ -1694,9 +1556,10 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         actions.setSpacing(6)
-        self._btn_calib_save = QPushButton('💾  Save & Use')
+        self._btn_calib_save = QPushButton('Save & Use')
         self._btn_calib_save.setStyleSheet(
-            'QPushButton{background:#1a5c1a;color:white;border-radius:5px;padding:8px;font-size:12px;font-weight:bold;}'
+            'QPushButton{background:#1a5c1a;color:white;border-radius:5px;'
+            'padding:8px;font-size:12px;font-weight:bold;}'
             'QPushButton:disabled{background:#22302a;color:#5d7068;}'
             'QPushButton:hover:!disabled{background:#247a24;}'
         )
@@ -1704,9 +1567,10 @@ class MainWindow(QMainWindow):
         self._btn_calib_save.clicked.connect(self._save_calibration)
         actions.addWidget(self._btn_calib_save)
 
-        self._btn_calib_reset = QPushButton('↺  Reset')
+        self._btn_calib_reset = QPushButton('Reset Capture')
         self._btn_calib_reset.setStyleSheet(
-            'QPushButton{background:#3b4650;color:white;border-radius:5px;padding:8px;font-size:12px;font-weight:bold;}'
+            'QPushButton{background:#3b4650;color:white;border-radius:5px;'
+            'padding:8px;font-size:12px;font-weight:bold;}'
             'QPushButton:hover{background:#4c5b67;}'
         )
         self._btn_calib_reset.clicked.connect(self._reset_calibration)
@@ -1720,17 +1584,9 @@ class MainWindow(QMainWindow):
             'padding:5px; border:1px solid #2f4654; border-radius:4px;'
         )
         layout.addWidget(self._calib_status)
-
         return group
 
     def _capture_corner(self, corner: str):
-        """Read live joint angles and stash for this corner.
-
-        Only joint angles are stored — the movement pipeline interpolates
-        joints, never tool XYZ.  Reading TF was previously done to record
-        a human-readable cartesian pose; that's been dropped now that the
-        JSON keeps joints as the single source of truth.
-        """
         if not self._have_joint_state:
             self._set_status(f'Capture {corner} blocked: no live joint state', '#e0a000')
             return
@@ -1740,12 +1596,13 @@ class MainWindow(QMainWindow):
         badge_txt = '  '.join(
             f'{lbl}={j:+.1f}°' for lbl, j in zip(short_labels, joints_deg)
         )
-        self._calib_status_lbls[corner].setText(f'✓ {badge_txt}')
+        self._calib_status_lbls[corner].setText(f'OK {badge_txt}')
         self._calib_status_lbls[corner].setStyleSheet(
             'color:#79f7b2; font-size:10px; font-weight:bold;'
         )
-        joints_full = ', '.join(f'{j:+.2f}' for j in joints_deg)
-        self._log(f'Captured {corner}: joints=[{joints_full}]')
+        self._log(
+            f'Captured {corner}: joints=[{", ".join(f"{j:+.2f}" for j in joints_deg)}]'
+        )
         all_done = all(c in self._pending_calibration for c in REQUIRED_GRID_CORNERS)
         self._btn_calib_save.setEnabled(all_done)
         if all_done:
@@ -1755,7 +1612,10 @@ class MainWindow(QMainWindow):
         if not all(c in self._pending_calibration for c in REQUIRED_GRID_CORNERS):
             self._set_status('Capture all 4 corners before saving', '#e0a000')
             return
-        joints = {c: self._pending_calibration[c]['joints_deg'] for c in REQUIRED_GRID_CORNERS}
+        joints = {
+            c: self._pending_calibration[c]['joints_deg']
+            for c in REQUIRED_GRID_CORNERS
+        }
         profile = self._profile_combo.currentData()
         try:
             apply_calibration(joints_deg=joints)
@@ -1767,9 +1627,7 @@ class MainWindow(QMainWindow):
             return
         self._mark_calibration_active(path, profile)
         self._refresh_profile_labels()
-        self._set_status(
-            f'Saved & active: {self._profile_combo.currentText()}', '#00cc88'
-        )
+        self._set_status(f'Saved & active: {self._profile_combo.currentText()}', '#00cc88')
         self._log(f'Calibration saved to {path} (profile {profile}) and applied live')
 
     def _load_selected_profile(self):
@@ -1786,8 +1644,6 @@ class MainWindow(QMainWindow):
             set_active_profile(profile)
         except Exception as e:
             self._log(f'Could not mark {profile} active: {e}')
-        # Clear any in-progress capture badges so the panel reflects what is
-        # actually loaded (calibration came from disk, not the capture buffer).
         self._reset_calibration(silent=True)
         self._mark_calibration_active(msg, profile)
         self._set_status(
@@ -1795,71 +1651,12 @@ class MainWindow(QMainWindow):
             '#00cc88',
         )
         self._log(f'Loaded calibration from {msg}')
-        # Drive only the wrists to the lock configuration so the cutter is
-        # already in the correct orientation before any cell move.  Skips
-        # silently if the robot is not in a movable state (no joint state
-        # yet, external_control not running, already moving, etc.).
-        self._align_wrists_to_lock()
 
-    def _align_wrists_to_lock(self):
-        """Rotate ONLY the wrists to the locked configuration, keeping
-        base/shoulder/elbow at their live joint values.  Sent as a single
-        joint-space move via the normal mover pipeline.
-        """
-        if not LOCK_WRIST_JOINTS:
-            return
-        if not self._have_joint_state:
-            self._log('Wrist align skipped: no live joint state yet')
-            return
-        if self._moving:
-            self._log('Wrist align skipped: another move is in progress')
-            return
-        if not self._robot_ready_to_move():
-            # _robot_ready_to_move already surfaces a yellow status banner
-            # explaining what's missing (controller, program-running, etc.)
-            return
-        current = self._current_joint_degrees()
-        if current is None:
-            return
-        target = list(current)
-        # Use _lock_wrists so the same constants & auto-tool-down toggle
-        # apply here as everywhere else moves are constructed.
-        target = _lock_wrists(target)
-        self._moving = True
-        self._clear_resume_motion()
-        self._status_sig.emit(
-            f'Aligning wrists → w1={target[3]:+.1f}° w2={target[4]:+.1f}° w3={target[5]:+.1f}°',
-            '#3a7aff',
-        )
-        self._log(
-            f'Wrist align: from [{", ".join(f"{j:+.2f}" for j in current[3:])}] '
-            f'→ [{", ".join(f"{j:+.2f}" for j in target[3:])}]'
-        )
-
-        def _done():
-            self._moving = False
-            self._status_sig.emit('Wrist alignment complete', '#00cc88')
-            self._log_sig.emit('Wrist alignment complete')
-
-        def _fail(reason):
-            self._moving = False
-            if 'Cancelled' in reason:
-                return
-            self._status_sig.emit(f'Wrist align failed: {reason}', '#ff4444')
-            self._log_sig.emit(f'Wrist align failed: {reason}')
-
-        self._mover_node.move_to(
-            target,
-            done_cb=_done,
-            fail_cb=_fail,
-            current_degrees=current,
-        )
-
-    def _refresh_profile_labels(self):
+    def _refresh_profile_labels(self, *_args):
         saved = list_saved_profiles()
         for i, name in enumerate(CALIBRATION_PROFILES):
             base = f'Robot {i + 1}'
-            label = f'{base}  ✓' if saved[name] else f'{base}  (empty)'
+            label = f'{base}  saved' if saved[name] else f'{base}  empty'
             self._profile_combo.setItemText(i, label)
 
     def _mark_calibration_active(self, path: str, profile: str):
@@ -1876,37 +1673,11 @@ class MainWindow(QMainWindow):
     def _reset_calibration(self, silent: bool = False):
         self._pending_calibration = {}
         for corner in REQUIRED_GRID_CORNERS:
-            self._calib_status_lbls[corner].setText('· not captured')
+            self._calib_status_lbls[corner].setText('- not captured')
             self._calib_status_lbls[corner].setStyleSheet('color:#7a8fa0; font-size:10px;')
         self._btn_calib_save.setEnabled(False)
         if not silent:
             self._set_status('Calibration capture cleared', '#a9b8c4')
-
-    def _lookup_tool_pose(self):
-        """Return ((x, y, z), (rx, ry, rz)) in base_link, or (None, None)."""
-        try:
-            tf = self._tf_buffer.lookup_transform(
-                'base_link', 'tool0', rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.5),
-            )
-        except Exception as e:
-            self._log(f'TF lookup base_link → tool0 failed: {e}')
-            return None, None
-        t = tf.transform.translation
-        q = tf.transform.rotation
-        x, y, z, w = float(q.x), float(q.y), float(q.z), float(q.w)
-        norm = math.sqrt(x*x + y*y + z*z + w*w) or 1.0
-        x, y, z, w = x/norm, y/norm, z/norm, w/norm
-        vec = math.sqrt(x*x + y*y + z*z)
-        if vec < 1e-12:
-            rotvec = (0.0, 0.0, 0.0)
-        else:
-            angle = 2.0 * math.atan2(vec, w)
-            if angle > math.pi:
-                angle -= 2.0 * math.pi
-            scale = angle / vec
-            rotvec = (x*scale, y*scale, z*scale)
-        return (float(t.x), float(t.y), float(t.z)), rotvec
 
     # ── Camera panel ─────────────────────────────────────────────────────────
 
@@ -2047,13 +1818,11 @@ class MainWindow(QMainWindow):
         self._last_frame_wh = (w, h)
 
         self._frame_counter += 1
-        # Throttled work — display still runs at full camera FPS, but the
-        # heavy CPU paths run only every Nth frame.  Increased divisors here
-        # because safety_node now also runs MediaPipe on the published feed
-        # (auto-spawned by main()), so the GUI side no longer needs to do it
-        # at high rate.  Tune larger if the feed still lags after grid lock.
-        run_hands  = (self._frame_counter % 6 == 0)   # ~5 Hz local hand viz
-        run_detect = (self._frame_counter % 3 == 0)   # ~10 Hz red detection
+        # MediaPipe Hands runs every 3rd frame (~10 Hz hand detection).
+        # Red detection runs every 2nd frame (~15 Hz fruit detection).
+        # All frames still display, draw the grid overlay, and publish.
+        run_hands = (self._frame_counter % 3 == 0)
+        run_detect = (self._frame_counter % 2 == 0)
 
         # Only run detection/safety once the grid is fully defined. The safety
         # node also gets frames only while this locked zone exists, so it cannot
@@ -2080,12 +1849,10 @@ class MainWindow(QMainWindow):
         # Draw grid overlay / in-progress dots on top
         self._draw_grid_overlay(frame)
 
-        # Publish frame to safety_node every 4th frame, but only once the grid
+        # Publish frame to safety_node every 2nd frame, but only once the grid
         # is locked — the interlock is not active without a defined zone so
         # there is no point sending frames before the operator has set one up.
-        # ~7.5 Hz is plenty for hand-detection reaction time and halves the
-        # bridge node's encode work.
-        if len(self._grid_pts) == 4 and self._frame_counter % 4 == 0:
+        if len(self._grid_pts) == 4 and self._frame_counter % 2 == 0:
             self._bridge_node.publish_frame(frame)
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -2198,10 +1965,10 @@ class MainWindow(QMainWindow):
 
         Method:
           1. Build a perspective transform H from the 4 clicked corner points
-             that maps frame pixels → grid coordinates (0..14, 0..4).
+             that maps frame pixels → grid coordinates (0..7, 0..4).
           2. For each red contour:
              a. Use contour moments for the fruit origin/centroid.
-             b. Skip if centroid maps outside the grid (0 ≤ col < 14, 0 ≤ row < 4).
+             b. Skip if centroid maps outside the grid (0 ≤ col < 7, 0 ≤ row < 4).
              c. 'origin cell'  = the grid cell the centroid lands in.
              d. 'covered cells' = all cells touched by the bounding-box corners.
           3. Draws bounding box + label on the frame (annotations are visible in GUI).
@@ -2211,7 +1978,7 @@ class MainWindow(QMainWindow):
         Nothing is detected until the grid is fully defined (4 points clicked).
         """
         tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in self._grid_pts]
-        n_cols, n_rows = 14, 4
+        n_cols, n_rows = len(GRID_COLS), len(GRID_ROWS)
 
         src = np.float32([tl, tr, br, bl])
         dst = np.float32([[0, 0], [n_cols, 0], [n_cols, n_rows], [0, n_rows]])
@@ -2241,7 +2008,7 @@ class MainWindow(QMainWindow):
         MIN_SOLIDITY    = 0.70   # area / convex-hull area; skin patches are wispy
 
         def cell_name(c, r):
-            return f"{chr(ord('A') + c)}{r + 1}"
+            return f"{GRID_COLS[c]}{GRID_ROWS[r]}"
 
         info_lines = []
         fruits = []
@@ -2283,6 +2050,9 @@ class MainWindow(QMainWindow):
                 if not (0 <= col_i < n_cols and 0 <= row_i < n_rows):
                     continue
                 origin_cell = cell_name(col_i, row_i)
+                _rp_col, _rp_row, _u, _v, robot_target = _camera_grid_to_robot_target(
+                    grid_x, grid_y
+                )
 
                 # All cells covered by bounding box (transform 4 corners)
                 corners = np.float32([[
@@ -2303,22 +2073,23 @@ class MainWindow(QMainWindow):
                 # Draw bbox, origin marker, label
                 cv2.rectangle(frame, (x, y), (x + w, y + h), bgr, 2)
                 if len(covered) > 1:
-                    tag = f'{label} origin:{origin_cell} spans:{",".join(covered)}'
+                    tag = f'{label} {origin_cell}->{robot_target} spans:{",".join(covered)}'
                 else:
-                    tag = f'{label} [{origin_cell}]'
+                    tag = f'{label} [{origin_cell}->{robot_target}]'
                 cv2.putText(frame, tag, (x, y - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
                 cv2.drawMarker(frame, (cx, cy), bgr,
                                cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
 
                 info_lines.append(
-                    f'{label}  origin: {origin_cell}  '
+                    f'{label}  origin: {origin_cell}  cut: {robot_target}  '
                     f'grid: ({grid_x:.2f}, {grid_y:.2f})  '
                     f'cells ({len(covered)}): {", ".join(covered)}'
                 )
                 fruits.append({
                     'label': label,
                     'origin': origin_cell,
+                    'robot_target': robot_target,
                     'grid_xy': (grid_x, grid_y),
                     'frame_xy': (cx, cy),
                     'covered': covered,
@@ -2484,8 +2255,8 @@ class MainWindow(QMainWindow):
         During selection (< 4 points): draws a coloured dot + corner label (TL/TR/BR/BL)
         for each point clicked so far, giving the operator visual feedback.
 
-        After selection (== 4 points): draws the full 14-column × 4-row bilinear grid
-        using perspective-correct row and column lines, labels every cell centre (A1–N4),
+        After selection (== 4 points): draws the full 7-column × 4-row bilinear grid
+        using perspective-correct row and column lines, labels every cell centre (A1–G4),
         and outlines the quad border in blue.  The grid is drawn on every subsequent frame
         without moving because self._grid_pts is fixed after the 4th click.
         """
@@ -2507,7 +2278,7 @@ class MainWindow(QMainWindow):
             return
 
         tl, tr, br, bl = [np.array(p, dtype=np.float32) for p in pts]
-        n_cols, n_rows = 14, 4
+        n_cols, n_rows = len(GRID_COLS), len(GRID_ROWS)
         steps = 60
 
         def lerp(a, b, t):
@@ -2548,7 +2319,7 @@ class MainWindow(QMainWindow):
                 top = lerp(tl, tr, u)
                 bot = lerp(bl, br, u)
                 ctr = ipt(lerp(top, bot, v))
-                lbl = f"{chr(ord('A') + col)}{row + 1}"
+                lbl = f"{GRID_COLS[col]}{GRID_ROWS[row]}"
                 cv2.putText(frame, lbl, (ctr[0] - 8, ctr[1] + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 0), 2)
                 cv2.putText(frame, lbl, (ctr[0] - 8, ctr[1] + 4),
@@ -2580,11 +2351,6 @@ class MainWindow(QMainWindow):
             )
             self._mover_node = MoverNode()
             self._bridge_node = CameraBridgeNode(self._on_safety_node_detection)
-            # TF listener (used by the calibration panel to capture base_link →
-            # tool0 when each corner button is pressed).  Lives on the
-            # JointStateNode so it spins on the shared executor below.
-            self._tf_buffer = tf2_ros.Buffer()
-            self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self._js_node)
             # Spin JointStateNode + bridge node continuously in a shared executor
             exe = rclpy.executors.MultiThreadedExecutor()
             exe.add_node(self._js_node)
@@ -2592,10 +2358,7 @@ class MainWindow(QMainWindow):
             threading.Thread(target=exe.spin, daemon=True).start()
             self._bridge_node.clear_zone()
             self._log('ROS2 nodes started')
-            # Auto-load the remembered profile if there is one; the grid_mover
-            # module already attempted this on import, but we still need to
-            # sync the GUI controls (dropdown selection, status banner) so the
-            # user sees what is actually active.
+
             self._refresh_profile_labels()
             active = get_active_profile()
             if active is not None:
@@ -2645,52 +2408,11 @@ class MainWindow(QMainWindow):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def _spawn_safety_node(robot_ip: str):
-    """Launch safety_node alongside the GUI so the hand-detection interlock
-    is always on without the operator having to run a second terminal.
-
-    Uses the same compressed image pipeline the GUI already publishes on
-    /camera/image_raw/compressed — safety_node listens to that topic so
-    nothing else needs configuring.  The child process is terminated on GUI
-    exit via atexit.
-    """
-    import atexit
-    import subprocess
-    cmd = ['ros2', 'run', 'fruitninja', 'safety_node', '--robot-ip', robot_ip]
-    try:
-        # Inherit the parent's stdout/stderr so safety_node's logs are visible
-        # in the same terminal — needed for diagnosing pauses that take the
-        # robot out of remote-control mode (and cause MoveIt CONTROL_FAILED).
-        proc = subprocess.Popen(cmd)
-    except Exception as e:
-        print(f'[real_gui_points] could not auto-spawn safety_node: {e}')
-        return None
-    print(f'[real_gui_points] auto-spawned safety_node (pid={proc.pid}) — logs below')
-
-    def _shutdown():
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            except Exception:
-                pass
-
-    atexit.register(_shutdown)
-    return proc
-
-
 def main(args=None):
     parser = argparse.ArgumentParser(description='FruitNinja UR3e operator GUI')
     parser.add_argument('--robot-ip', default='192.168.0.194',
                         help='IP address of the UR3e controller (default: 192.168.0.194)')
-    parser.add_argument('--no-auto-safety', action='store_true',
-                        help='Do NOT auto-spawn safety_node alongside the GUI')
     parsed, remaining = parser.parse_known_args()
-    if not parsed.no_auto_safety:
-        _spawn_safety_node(parsed.robot_ip)
     app = QApplication([sys.argv[0]] + remaining)
     app.setStyle('Fusion')
     win = MainWindow(robot_ip=parsed.robot_ip)
