@@ -57,9 +57,9 @@ import numpy as np
 
 # All frames are resized to this before MediaPipe runs — matches the size
 # published by CameraBridgeNode so topic mode and direct mode are identical.
-SAFETY_FRAME_W   = 640
-SAFETY_FRAME_H   = 480
-SAFETY_JPEG_QUALITY = 60
+SAFETY_FRAME_W   = 480
+SAFETY_FRAME_H   = 360
+SAFETY_JPEG_QUALITY = 50
 
 try:
     import pyrealsense2 as rs

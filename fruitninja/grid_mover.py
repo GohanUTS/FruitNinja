@@ -24,7 +24,9 @@ Usage (CLI):
 """
 
 import argparse
+import json
 import math
+import os
 import time
 
 import rclpy
@@ -35,6 +37,64 @@ from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTolerance
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
+
+
+REQUIRED_GRID_CORNERS = ('A1', 'N1', 'N4', 'A4')
+
+GRID_CALIBRATION_ENV = 'FRUITNINJA_GRID_CALIBRATION'
+DEFAULT_GRID_CALIBRATION_PATH = '~/.fruitninja/grid_calibration.json'
+
+# Named per-robot profiles.  The lab has 4 UR3e stations whose base-to-board
+# distances differ slightly; each station's PC remembers which profile is
+# active so the operator does not have to re-select after every relaunch.
+CALIBRATION_PROFILES = ('robot1', 'robot2', 'robot3', 'robot4')
+CALIBRATION_PROFILE_DIR = '~/.fruitninja/calibrations'
+ACTIVE_PROFILE_MARKER = '~/.fruitninja/active_profile.txt'
+
+
+def grid_calibration_path() -> str:
+    return os.path.expanduser(
+        os.environ.get(GRID_CALIBRATION_ENV, DEFAULT_GRID_CALIBRATION_PATH)
+    )
+
+
+def profile_calibration_path(profile_name: str) -> str:
+    return os.path.expanduser(
+        os.path.join(CALIBRATION_PROFILE_DIR, f'{profile_name}.json')
+    )
+
+
+def get_active_profile() -> str | None:
+    p = os.path.expanduser(ACTIVE_PROFILE_MARKER)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            name = f.read().strip()
+        return name if name in CALIBRATION_PROFILES else None
+    except Exception:
+        return None
+
+
+def set_active_profile(profile_name: str | None) -> None:
+    p = os.path.expanduser(ACTIVE_PROFILE_MARKER)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    if profile_name is None:
+        if os.path.exists(p):
+            os.remove(p)
+        return
+    if profile_name not in CALIBRATION_PROFILES:
+        raise ValueError(f'unknown profile {profile_name!r}; expected one of {CALIBRATION_PROFILES}')
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(profile_name + '\n')
+
+
+def list_saved_profiles() -> dict[str, bool]:
+    """Return {profile_name: exists_on_disk} for each known profile."""
+    return {
+        name: os.path.exists(profile_calibration_path(name))
+        for name in CALIBRATION_PROFILES
+    }
 
 
 # ── Grid layout ────────────────────────────────────────────────────────────────
@@ -98,6 +158,107 @@ CORNER_JOINTS_DEG = {
     'N1': (-30.35, -132.74, -103.43,  -34.39,  88.55, 241.85),
     'N4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
 }
+
+# ── Per-robot calibration overrides ──────────────────────────────────────────
+# The hardcoded corner tables above were measured on one specific UR3e station.
+# In the lab each robot sits at a slightly different distance from its cutting
+# board, so reusing those numbers on a different station puts the cut points
+# outside that arm's reach (IK failures, controller rejects).
+#
+# apply_calibration() mutates the three corner dicts in place so that every
+# downstream function (cell_to_pose / cell_to_joints_deg / grid_uv_to_*) starts
+# returning the calibrated values without any caller change.  The calibration
+# JSON is captured per-machine via the FruitNinja GUI calibration panel and
+# saved to ~/.fruitninja/grid_calibration.json.
+
+def _validate_corners(corners: dict, expected_len: int, label: str):
+    missing = [c for c in REQUIRED_GRID_CORNERS if c not in corners]
+    if missing:
+        raise ValueError(f'{label}: missing corners {missing}')
+    for c in REQUIRED_GRID_CORNERS:
+        v = corners[c]
+        if len(v) != expected_len:
+            raise ValueError(f'{label}: corner {c} expected {expected_len} values, got {len(v)}')
+
+
+def apply_calibration(poses_m: dict | None = None,
+                      rot_vec_rad: dict | None = None,
+                      joints_deg: dict | None = None) -> None:
+    """Mutate the corner tables in place from a captured calibration."""
+    if poses_m is not None:
+        _validate_corners(poses_m, 3, 'corner_tool_poses_m')
+        for c in REQUIRED_GRID_CORNERS:
+            CORNER_TOOL_POSES_M[c] = tuple(float(x) for x in poses_m[c])
+    if rot_vec_rad is not None:
+        _validate_corners(rot_vec_rad, 3, 'corner_tool_rot_vec_rad')
+        for c in REQUIRED_GRID_CORNERS:
+            CORNER_TOOL_ROT_VEC_RAD[c] = tuple(float(x) for x in rot_vec_rad[c])
+    if joints_deg is not None:
+        _validate_corners(joints_deg, 6, 'corner_joints_deg')
+        for c in REQUIRED_GRID_CORNERS:
+            CORNER_JOINTS_DEG[c] = tuple(float(x) for x in joints_deg[c])
+
+
+def save_calibration(path: str | None = None,
+                     frame_id: str = 'base_link',
+                     eef_link: str = 'tool0',
+                     profile_name: str | None = None) -> str:
+    if profile_name is not None:
+        target = profile_calibration_path(profile_name)
+    elif path:
+        target = os.path.expanduser(path)
+    else:
+        target = grid_calibration_path()
+    # Save only joint angles — the movement pipeline interpolates from these
+    # exclusively (cell_to_joints_deg → CORNER_JOINTS_DEG).  XYZ/rotvec were
+    # previously included for human-readable logging but the system never
+    # used them for control; keeping a single source of truth avoids drift
+    # between the two.
+    data = {
+        'frame_id': frame_id,
+        'eef_link': eef_link,
+        'corner_joints_deg': {c: list(CORNER_JOINTS_DEG[c]) for c in REQUIRED_GRID_CORNERS},
+    }
+    directory = os.path.dirname(target)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(target, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write('\n')
+    return target
+
+
+def load_calibration(path: str | None = None,
+                     profile_name: str | None = None) -> tuple[bool, str]:
+    """Load + apply calibration from JSON. Returns (loaded, message)."""
+    if profile_name is not None:
+        target = profile_calibration_path(profile_name)
+    elif path:
+        target = os.path.expanduser(path)
+    else:
+        target = grid_calibration_path()
+    if not os.path.exists(target):
+        return False, f'no calibration file at {target}'
+    try:
+        with open(target, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        apply_calibration(
+            poses_m=data.get('corner_tool_poses_m'),
+            rot_vec_rad=data.get('corner_tool_rot_vec_rad'),
+            joints_deg=data.get('corner_joints_deg'),
+        )
+        return True, target
+    except Exception as e:
+        return False, f'calibration load failed ({target}): {e}'
+
+
+_active = get_active_profile()
+if _active:
+    load_calibration(profile_name=_active)
+else:
+    load_calibration()
+del _active
+
 
 # Backwards-compatible aliases for older scripts that imported the old A4 anchor
 # and average grid spacing constants directly.
