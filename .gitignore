@@ -2,6 +2,11 @@ trolley/*.dae
 trolley/*.STEP
 trolley/*.stl
 
+# ROS 2 / colcon build artifacts — never commit
+build/
+install/
+log/
+
 # RL training artifacts
 rl/checkpoints/
 rl/logs/

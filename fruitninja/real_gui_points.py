@@ -119,6 +119,19 @@ SAFE_TRANSIT_BASE_DEG = 45.0
 # still show what the operator clicked/defined.
 CAMERA_TO_ROBOT_ROW_OFFSET_CELLS = -1.0
 
+# Global trim applied to ALL grid moves (manual clicks AND camera detections).
+# Use these to correct a uniform offset between the calibrated robot grid and
+# the physical board.  Units are cells, fractional values allowed.
+#   ROW (Y): +1.0 = shift robot grid one row TOWARD the robot (row 4 side)
+#           -1.0 = shift one row AWAY from robot (row 1 / far side)
+#   COL (X): +1.0 = shift one column to the RIGHT (toward G)
+#           -1.0 = shift one column to the LEFT  (toward A)
+# Tune empirically: click cell X, watch where the tool lands, set the trim
+# so X is what gets cut.  After editing, rebuild:
+#   colcon build --packages-select fruitninja --symlink-install
+GLOBAL_GRID_ROW_TRIM_CELLS = -1.0
+GLOBAL_GRID_COL_TRIM_CELLS =  0.0
+
 # Raise all cut targets slightly. Shoulder lift uses the existing convention
 # where more negative means higher; -0.5° is roughly the 3 mm over-depth seen
 # on the board. The right-near corner gets a little extra because it was the
@@ -146,7 +159,7 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 # Older real-robot commits that moved reliably used MoveIt MoveGroup joint
 # constraints.  This is still joint-space movement, not a Cartesian pose / IK
 # target.  Keep direct controller execution as a fallback when MoveIt is absent.
-PREFER_MOVEIT_JOINT_GOALS = True
+PREFER_MOVEIT_JOINT_GOALS = False
 
 # Compressed frame size published to /camera/image_raw/compressed for safety_node.
 # 640x480 is the sweet spot for MediaPipe Hands — fast inference without losing
@@ -157,14 +170,27 @@ SAFETY_FRAME_H = 480
 SAFETY_JPEG_QUALITY = 60
 
 
+def _trimmed_uv(col_idx: float, row_idx: float) -> tuple[float, float]:
+    """Apply GLOBAL_GRID_*_TRIM_CELLS to a (col, row) and return normalised u, v."""
+    n_cols = len(GRID_COLS)
+    n_rows = len(GRID_ROWS)
+    col_pos = float(col_idx) + GLOBAL_GRID_COL_TRIM_CELLS
+    row_pos = float(row_idx) + GLOBAL_GRID_ROW_TRIM_CELLS
+    col_pos = max(0.0, min(n_cols - 1, col_pos))
+    row_pos = max(0.0, min(n_rows - 1, row_pos))
+    return col_pos / (n_cols - 1), row_pos / (n_rows - 1)
+
+
 def _board_position(col_idx: int, row_idx: int) -> tuple:
-    """Return (x, y, z) for a grid cell by index, delegating to grid_mover."""
-    return cell_to_pose(GRID_COLS[col_idx] + GRID_ROWS[row_idx])
+    """Return (x, y, z) for a grid cell by index, with global trim applied."""
+    u, v = _trimmed_uv(col_idx, row_idx)
+    return grid_uv_to_pose(u, v)
 
 
 def _board_joints(col_idx: int, row_idx: int) -> list:
-    """Return calibrated joint angles for the same fixed-grid cell."""
-    return cell_to_joints_deg(GRID_COLS[col_idx] + GRID_ROWS[row_idx])
+    """Return calibrated joint angles for the same grid cell, with global trim."""
+    u, v = _trimmed_uv(col_idx, row_idx)
+    return grid_uv_to_joints_deg(u, v)
 
 
 def _cut_joints_for_cell(cell: str, joints_deg: list) -> list:
@@ -175,10 +201,16 @@ def _cut_joints_for_cell(cell: str, joints_deg: list) -> list:
 
 def _camera_grid_to_robot_target(grid_x: float,
                                  grid_y: float) -> tuple[float, float, float, float, str]:
-    col_pos = min(len(GRID_COLS) - 1, max(0.0, grid_x - 0.5))
+    col_pos = min(
+        len(GRID_COLS) - 1,
+        max(0.0, grid_x - 0.5 + GLOBAL_GRID_COL_TRIM_CELLS),
+    )
     row_pos = min(
         len(GRID_ROWS) - 1,
-        max(0.0, grid_y - 0.5 + CAMERA_TO_ROBOT_ROW_OFFSET_CELLS),
+        max(0.0,
+            grid_y - 0.5
+            + CAMERA_TO_ROBOT_ROW_OFFSET_CELLS
+            + GLOBAL_GRID_ROW_TRIM_CELLS),
     )
     u = col_pos / (len(GRID_COLS) - 1)
     v = row_pos / (len(GRID_ROWS) - 1)
@@ -1183,40 +1215,16 @@ class MainWindow(QMainWindow):
         return [math.degrees(self._current_joints_rad[name]) for name in JOINT_NAMES]
 
     def _move_with_safe_transit(self, target_degrees: list, done_cb, fail_cb, label: str = ''):
-        """
-        Move to target_degrees, routing through HOME_DEG first if the base joint
-        would have to swing more than SAFE_TRANSIT_BASE_DEG from the current position.
-        This prevents the arm from sweeping through the table when transitioning
-        between cells that use different kinematic configurations (e.g. A-column
-        at base ~+35° vs N-column at base ~-40°).
-        """
         current = self._current_joint_degrees()
         if current is None:
             fail_cb('No live joint state')
             return
-        base_delta = abs(_wrap_deg(target_degrees[0] - current[0]))
-        if base_delta > SAFE_TRANSIT_BASE_DEG:
-            transit_label = f'safe transit → home (base swing {base_delta:.0f}°)' + (f' before {label}' if label else '')
-            self._log(f'Large base swing detected ({base_delta:.0f}°) — routing via home')
-            self._status_sig.emit(f'Safe transit via home ({base_delta:.0f}° base swing)…', '#e0a000')
-            self._mover_node.move_to(
-                HOME_DEG,
-                done_cb=lambda: self._mover_node.move_to(
-                    target_degrees,
-                    done_cb=done_cb,
-                    fail_cb=fail_cb,
-                    current_degrees=self._current_joint_degrees(),
-                ),
-                fail_cb=fail_cb,
-                current_degrees=self._current_joint_degrees(),
-            )
-        else:
-            self._mover_node.move_to(
-                target_degrees,
-                done_cb=done_cb,
-                fail_cb=fail_cb,
-                current_degrees=current,
-            )
+        self._mover_node.move_to(
+            target_degrees,
+            done_cb=done_cb,
+            fail_cb=fail_cb,
+            current_degrees=current,
+        )
 
     def _fruit_target(self, fruit: dict) -> dict:
         grid_x, grid_y = fruit['grid_xy']

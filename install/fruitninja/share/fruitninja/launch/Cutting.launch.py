@@ -1,1 +1,0 @@
-/home/gohan/ros2_ws/src/fruitninja/build/fruitninja/launch/Cutting.launch.py
