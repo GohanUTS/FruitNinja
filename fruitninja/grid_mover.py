@@ -172,6 +172,11 @@ CORNER_JOINTS_DEG = {
     'G4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
 }
 
+# Optional extra calibrated cells (poses + orientations) beyond the 4 corners,
+# captured via FK during calibration.  Mirror the joint extras below.
+EXTRA_CELL_POSES_M: dict = {}
+EXTRA_CELL_ROTVEC_RAD: dict = {}
+
 # Optional extra calibrated cells beyond the 4 corners.  Populated by
 # apply_calibration() when a calibration file ships extra row/column anchors.
 # When non-empty, the interpolation uses a Coons-patch surface that exactly
@@ -198,10 +203,26 @@ def _normalise_corner_map(corners: dict, expected_len: int, label: str) -> dict:
     return normalised
 
 
+def _apply_extra_map(target: dict, source: dict | None, n: int, label: str) -> None:
+    """Replace `target` extras dict from `source`, skipping corners, validating length."""
+    if source is None:
+        return
+    target.clear()
+    for cell, vals in source.items():
+        cell = str(cell).upper()
+        if cell in REQUIRED_GRID_CORNERS:
+            continue
+        if len(vals) != n:
+            raise ValueError(f'{label}: cell {cell} expected {n} values, got {len(vals)}')
+        target[cell] = tuple(float(v) for v in vals)
+
+
 def apply_calibration(poses_m: dict | None = None,
                       rot_vec_rad: dict | None = None,
                       joints_deg: dict | None = None,
-                      extra_joints_deg: dict | None = None) -> None:
+                      extra_joints_deg: dict | None = None,
+                      extra_poses_m: dict | None = None,
+                      extra_rot_vec_rad: dict | None = None) -> None:
     """Mutate the corner + extra-cell tables in place from a captured calibration."""
     if poses_m is not None:
         poses_m = _normalise_corner_map(poses_m, 3, 'corner_tool_poses_m')
@@ -215,25 +236,29 @@ def apply_calibration(poses_m: dict | None = None,
         joints_deg = _normalise_corner_map(joints_deg, 6, 'corner_joints_deg')
         for c in REQUIRED_GRID_CORNERS:
             CORNER_JOINTS_DEG[c] = tuple(float(x) for x in joints_deg[c])
-    if extra_joints_deg is not None:
-        # Reset extras so a load fully replaces previous state.
-        EXTRA_CELL_JOINTS_DEG.clear()
-        for cell, vals in extra_joints_deg.items():
-            cell = str(cell).upper()
-            if cell in REQUIRED_GRID_CORNERS:
-                # Corner values belong in the corner table, not extras.
-                continue
-            if len(vals) != 6:
-                raise ValueError(
-                    f'extra_joints_deg: cell {cell} expected 6 values, got {len(vals)}'
-                )
-            EXTRA_CELL_JOINTS_DEG[cell] = tuple(float(v) for v in vals)
+    _apply_extra_map(EXTRA_CELL_JOINTS_DEG, extra_joints_deg, 6, 'extra_joints_deg')
+    _apply_extra_map(EXTRA_CELL_POSES_M, extra_poses_m, 3, 'extra_poses_m')
+    _apply_extra_map(EXTRA_CELL_ROTVEC_RAD, extra_rot_vec_rad, 3, 'extra_rot_vec_rad')
 
 
 def calibrated_cell_joints_map() -> dict:
     """Return {cell_name: (6 floats)} for all calibrated cells (corners + extras)."""
     out = {c: tuple(CORNER_JOINTS_DEG[c]) for c in REQUIRED_GRID_CORNERS}
     out.update(EXTRA_CELL_JOINTS_DEG)
+    return out
+
+
+def calibrated_cell_poses_map() -> dict:
+    """Return {cell_name: (x, y, z)} for all cells with a calibrated pose."""
+    out = {c: tuple(CORNER_TOOL_POSES_M[c]) for c in REQUIRED_GRID_CORNERS}
+    out.update(EXTRA_CELL_POSES_M)
+    return out
+
+
+def calibrated_cell_rotvec_map() -> dict:
+    """Return {cell_name: (rx, ry, rz)} for all cells with a calibrated orientation."""
+    out = {c: tuple(CORNER_TOOL_ROT_VEC_RAD[c]) for c in REQUIRED_GRID_CORNERS}
+    out.update(EXTRA_CELL_ROTVEC_RAD)
     return out
 
 
@@ -247,14 +272,18 @@ def save_calibration(path: str | None = None,
         target = os.path.expanduser(path)
     else:
         target = grid_calibration_path()
-    all_cells = calibrated_cell_joints_map()
+    all_joints = calibrated_cell_joints_map()
+    all_poses = calibrated_cell_poses_map()
+    all_rotvec = calibrated_cell_rotvec_map()
     data = {
         'frame_id': frame_id,
         'eef_link': eef_link,
         # Legacy key — kept for backward compatibility with older readers.
         'corner_joints_deg': {c: list(CORNER_JOINTS_DEG[c]) for c in REQUIRED_GRID_CORNERS},
-        # New key — full map of every captured cell (corners + extras).
-        'calibrated_cells_joints_deg': {c: list(v) for c, v in all_cells.items()},
+        # New keys — full map of every captured cell (corners + extras).
+        'calibrated_cells_joints_deg': {c: list(v) for c, v in all_joints.items()},
+        'calibrated_cells_poses_m': {c: list(v) for c, v in all_poses.items()},
+        'calibrated_cells_rotvec_rad': {c: list(v) for c, v in all_rotvec.items()},
     }
     directory = os.path.dirname(target)
     if directory:
@@ -279,26 +308,29 @@ def load_calibration(path: str | None = None,
     try:
         with open(target, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # Prefer the new full-cell map; fall back to legacy corners-only.
-        all_cells = data.get('calibrated_cells_joints_deg')
-        corner_joints = data.get('corner_joints_deg')
-        extras = None
-        if all_cells:
-            # Split into "must be all 4 corners present" + extras for cells.
-            corners_from_all = {
-                c: all_cells[c] for c in REQUIRED_GRID_CORNERS if c in all_cells
-            }
-            if len(corners_from_all) == len(REQUIRED_GRID_CORNERS):
-                corner_joints = corners_from_all
-            extras = {
-                c: v for c, v in all_cells.items()
-                if c not in REQUIRED_GRID_CORNERS
-            }
+        def _split(full_map, legacy_corner_map):
+            """Return (corner_dict_or_None, extras_dict_or_None) from a full cell map."""
+            if not full_map:
+                return legacy_corner_map, None
+            corners = {c: full_map[c] for c in REQUIRED_GRID_CORNERS if c in full_map}
+            corners = corners if len(corners) == len(REQUIRED_GRID_CORNERS) else legacy_corner_map
+            extras = {c: v for c, v in full_map.items() if c not in REQUIRED_GRID_CORNERS}
+            return corners, extras
+
+        corner_joints, extra_joints = _split(
+            data.get('calibrated_cells_joints_deg'), data.get('corner_joints_deg'))
+        corner_poses, extra_poses = _split(
+            data.get('calibrated_cells_poses_m'), data.get('corner_tool_poses_m'))
+        corner_rotvec, extra_rotvec = _split(
+            data.get('calibrated_cells_rotvec_rad'), data.get('corner_tool_rot_vec_rad'))
+
         apply_calibration(
-            poses_m=data.get('corner_tool_poses_m'),
-            rot_vec_rad=data.get('corner_tool_rot_vec_rad'),
+            poses_m=corner_poses,
+            rot_vec_rad=corner_rotvec,
             joints_deg=corner_joints,
-            extra_joints_deg=extras,
+            extra_joints_deg=extra_joints,
+            extra_poses_m=extra_poses,
+            extra_rot_vec_rad=extra_rotvec,
         )
         return True, target
     except Exception as e:
@@ -475,33 +507,47 @@ def _joints_interp_tuple(u: float, v: float) -> tuple[float, ...]:
     return _coons_tuple(cells, u, v)
 
 
+def _pose_interp_tuple(u: float, v: float) -> tuple[float, ...]:
+    """Pose interpolation: Coons patch when extra cell poses exist, else bilinear."""
+    if not EXTRA_CELL_POSES_M:
+        return _bilinear_tuple(CORNER_TOOL_POSES_M, u, v)
+    return _coons_tuple(calibrated_cell_poses_map(), u, v)
+
+
+def _rotvec_interp_tuple(u: float, v: float) -> tuple[float, ...]:
+    """Orientation interpolation: Coons patch when extra rotvecs exist, else bilinear."""
+    if not EXTRA_CELL_ROTVEC_RAD:
+        return _bilinear_tuple(CORNER_TOOL_ROT_VEC_RAD, u, v)
+    return _coons_tuple(calibrated_cell_rotvec_map(), u, v)
+
+
 def cell_to_pose(cell: str) -> tuple[float, float, float]:
     """
     Return (x, y, z) in metres for the centre of a grid cell.
     Raises ValueError for invalid cell names.
     """
     u, v = _cell_uv(cell)
-    return _bilinear_tuple(CORNER_TOOL_POSES_M, u, v)
+    return _pose_interp_tuple(u, v)
 
 
 def grid_uv_to_pose(u: float, v: float) -> tuple[float, float, float]:
     """Return (x, y, z) for normalized grid coordinates u/v in [0, 1]."""
     u = min(1.0, max(0.0, float(u)))
     v = min(1.0, max(0.0, float(v)))
-    return _bilinear_tuple(CORNER_TOOL_POSES_M, u, v)
+    return _pose_interp_tuple(u, v)
 
 
 def cell_to_tool_rotvec_rad(cell: str) -> tuple[float, float, float]:
     """Return interpolated UR tool rotation-vector (RX, RY, RZ) in radians."""
     u, v = _cell_uv(cell)
-    return _bilinear_tuple(CORNER_TOOL_ROT_VEC_RAD, u, v)
+    return _rotvec_interp_tuple(u, v)
 
 
 def grid_uv_to_rotvec_rad(u: float, v: float) -> tuple[float, float, float]:
     """Return interpolated UR tool rotation-vector for normalized u/v in [0, 1]."""
     u = min(1.0, max(0.0, float(u)))
     v = min(1.0, max(0.0, float(v)))
-    return _bilinear_tuple(CORNER_TOOL_ROT_VEC_RAD, u, v)
+    return _rotvec_interp_tuple(u, v)
 
 
 def cell_to_joints_deg(cell: str) -> list[float]:

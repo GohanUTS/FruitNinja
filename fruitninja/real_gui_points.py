@@ -10,7 +10,7 @@ HOW IT WORKS (overview)
    using the fixed calibrated joint pose for that cell.
 4. A camera feed (top-right) can run colour detection once the operator has
    manually defined the grid by clicking 4 corner points on the image.
-   Only red and blue objects inside that grid are detected.
+   Only strongly-coloured red, yellow, and green objects inside that grid are detected.
 5. Detected fruits can be cut automatically using the "Cut Detected" button,
    which also publishes MoveIt collision spheres for any OTHER fruits so the
    planner routes around them.
@@ -41,7 +41,7 @@ from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTolerance
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
-from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.srv import GetPositionIK, GetPositionFK
 from geometry_msgs.msg import Pose, PoseStamped
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
@@ -155,17 +155,18 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 # target.  Keep direct controller execution as a fallback when MoveIt is absent.
 PREFER_MOVEIT_JOINT_GOALS = False
 
-# When True, camera-detected fruit cuts solve IK against the bilinearly
-# interpolated Cartesian pose of the corners instead of using the bilinearly
-# interpolated joint angles.  This eliminates the joint-space curvature error
-# that makes the middle cells drift when only 4 corners are calibrated.  Falls
-# back to the joint-interpolation path if the /compute_ik service isn't up.
-# Manual cell clicks and Trace Grid are not affected.
-USE_IK_FOR_CAMERA_FRUITS = True
+# When True, camera-detected fruit cuts solve IK against the interpolated
+# Cartesian pose of the calibrated cells.  Disabled: IK was producing an
+# awkward wrist/elbow twist on the way to the target (the solver picked a
+# different arm branch than the calibrated configuration).  Camera cuts now use
+# the same joint-space interpolation the manual path uses — the original,
+# predictable movement.  Set back to True only with fully pose-calibrated cells.
+USE_IK_FOR_CAMERA_FRUITS = False
 IK_TIMEOUT_SEC = 1.0
 IK_BASE_FRAME = 'base_link'
 IK_EEF_LINK = 'tool0'
 IK_SERVICE_NAME = '/compute_ik'
+FK_SERVICE_NAME = '/compute_fk'
 
 # Compressed frame size published to /camera/image_raw/compressed for safety_node.
 # 640x480 is the sweet spot for MediaPipe Hands — fast inference without losing
@@ -230,6 +231,22 @@ def _wrap_deg(deg: float) -> float:
     return ((deg + 180.0) % 360.0) - 180.0
 
 
+# Max per-joint deviation (deg) an IK solution may have from the calibrated
+# joint-bilinear seed before we distrust it as an arm-flip / self-collision
+# branch and fall back to the seed.
+IK_MAX_SEED_DEVIATION_DEG = 35.0
+
+
+def _ik_close_to_seed(ik_deg: list, seed_deg: list,
+                      max_per_joint_deg: float = IK_MAX_SEED_DEVIATION_DEG) -> bool:
+    """True if every joint of the IK solution is within max_per_joint_deg of the
+    seed (comparing on the shortest angular path, so ±360° wraps don't count)."""
+    for a, b in zip(ik_deg, seed_deg):
+        if abs(_wrap_deg(a - b)) > max_per_joint_deg:
+            return False
+    return True
+
+
 def _rotvec_to_quat(rx: float, ry: float, rz: float) -> tuple[float, float, float, float]:
     """UR tool rotation-vector (axis * angle, in radians) → quaternion (x, y, z, w)."""
     angle = math.sqrt(rx * rx + ry * ry + rz * rz)
@@ -238,6 +255,22 @@ def _rotvec_to_quat(rx: float, ry: float, rz: float) -> tuple[float, float, floa
     half = angle * 0.5
     s = math.sin(half) / angle
     return (rx * s, ry * s, rz * s, math.cos(half))
+
+
+def _quat_to_rotvec(x: float, y: float, z: float, w: float) -> tuple[float, float, float]:
+    """Quaternion (x, y, z, w) → rotation-vector (axis * angle, in radians)."""
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm < 1e-12:
+        return (0.0, 0.0, 0.0)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    vec_norm = math.sqrt(x * x + y * y + z * z)
+    if vec_norm < 1e-12:
+        return (0.0, 0.0, 0.0)
+    angle = 2.0 * math.atan2(vec_norm, w)
+    if angle > math.pi:
+        angle -= 2.0 * math.pi
+    scale = angle / vec_norm
+    return (x * scale, y * scale, z * scale)
 
 
 # ── ROS2 nodes ─────────────────────────────────────────────────────────────────
@@ -305,6 +338,7 @@ class MoverNode(Node):
         self._client      = ActionClient(self, FollowJointTrajectory, TRAJECTORY_ACTION)
         self._moveit_client = ActionClient(self, MoveGroup, MOVE_GROUP_ACTION)
         self._ik_client   = self.create_client(GetPositionIK, IK_SERVICE_NAME)
+        self._fk_client   = self.create_client(GetPositionFK, FK_SERVICE_NAME)
         self._cancel_flag = False
         self._cancel_generation = 0
         self._goal_handle = None
@@ -525,7 +559,8 @@ class MoverNode(Node):
         req = GetPositionIK.Request()
         req.ik_request.group_name = MOVE_GROUP_NAME
         req.ik_request.ik_link_name = IK_EEF_LINK
-        req.ik_request.avoid_collisions = False
+        # Reject self-colliding / scene-colliding solutions at the source.
+        req.ik_request.avoid_collisions = True
         req.ik_request.timeout = self._duration_msg(timeout_sec)
 
         pose = PoseStamped()
@@ -566,6 +601,46 @@ class MoverNode(Node):
         if not all(name in positions for name in JOINT_NAMES):
             return None
         return [math.degrees(positions[name]) for name in JOINT_NAMES]
+
+    def solve_fk(self, joints_deg: list,
+                 timeout_sec: float = IK_TIMEOUT_SEC) -> tuple | None:
+        """
+        Forward kinematics via MoveIt's /compute_fk: joint angles (deg) →
+        ((x, y, z) metres, (rx, ry, rz) rotation-vector radians) of the EEF
+        link in IK_BASE_FRAME.  Returns None on any failure.
+        """
+        if not self._fk_client.wait_for_service(timeout_sec=0.5):
+            return None
+
+        req = GetPositionFK.Request()
+        req.header.frame_id = IK_BASE_FRAME
+        req.fk_link_names = [IK_EEF_LINK]
+        js = JointState()
+        js.name = list(JOINT_NAMES)
+        js.position = [math.radians(d) for d in joints_deg]
+        req.robot_state.joint_state = js
+
+        future = self._fk_client.call_async(req)
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        try:
+            executor.spin_until_future_complete(future, timeout_sec=timeout_sec + 0.5)
+        finally:
+            executor.remove_node(self)
+
+        if not future.done():
+            return None
+        result = future.result()
+        if (result is None
+                or result.error_code.val != MoveItErrorCodes.SUCCESS
+                or not result.pose_stamped):
+            return None
+
+        pose = result.pose_stamped[0].pose
+        xyz = (pose.position.x, pose.position.y, pose.position.z)
+        rotvec = _quat_to_rotvec(pose.orientation.x, pose.orientation.y,
+                                 pose.orientation.z, pose.orientation.w)
+        return xyz, rotvec
 
     def cancel(self):
         self._cancel_flag = True
@@ -699,7 +774,7 @@ class UR3eDashboard:
 # ── Camera worker ─────────────────────────────────────────────────────────────
 # Runs cv2.VideoCapture in a daemon thread so the GUI never blocks on frame reads.
 # Emits raw BGR numpy frames via frame_ready signal.
-# Detection (red/blue inside the manual grid) is done in the main thread inside
+# Detection (red/yellow/green inside the manual grid) is done in the main thread inside
 # MainWindow._update_camera_frame so it has access to the current grid points.
 
 class CameraWorker(QObject):
@@ -1334,14 +1409,27 @@ class MainWindow(QMainWindow):
             ik_solution = self._mover_node.solve_ik(
                 target_xyz, target_rotvec, bilinear_cut
             )
-            if ik_solution is not None:
-                cut = _cut_joints_for_cell(target_cell, ik_solution)
-                ik_used = True
-            else:
+            if ik_solution is None:
                 self._log(
                     f'IK fallback for {target_cell}: /compute_ik unavailable '
                     'or no solution — using joint-bilinear interp'
                 )
+            elif not _ik_close_to_seed(ik_solution, bilinear_cut):
+                # IK jumped to a different arm configuration (e.g. elbow flip /
+                # self-collision branch).  The joint-bilinear seed is a pose the
+                # robot physically reached during calibration, so trust it instead.
+                worst = max(
+                    abs(_wrap_deg(a - b))
+                    for a, b in zip(ik_solution, bilinear_cut)
+                )
+                self._log(
+                    f'IK fallback for {target_cell}: solution deviated '
+                    f'{worst:.0f}° from calibrated seed (likely arm flip) — '
+                    'using joint-bilinear interp'
+                )
+            else:
+                cut = _cut_joints_for_cell(target_cell, ik_solution)
+                ik_used = True
 
         approach = list(cut)
         approach[1] += APPROACH_LIFT_DELTA
@@ -1725,7 +1813,22 @@ class MainWindow(QMainWindow):
             self._set_status(f'Capture {cell} blocked: no live joint state', '#e0a000')
             return
         joints_deg = [math.degrees(self._current_joints_rad[n]) for n in JOINT_NAMES]
-        self._pending_calibration[cell] = {'joints_deg': joints_deg}
+        entry = {'joints_deg': joints_deg}
+
+        # Also record the TCP pose at this configuration via FK, so the camera/IK
+        # path interpolates the operator's real board instead of factory defaults.
+        fk = self._mover_node.solve_fk(joints_deg)
+        pose_note = ''
+        if fk is not None:
+            xyz, rotvec = fk
+            entry['pose_m'] = list(xyz)
+            entry['rotvec_rad'] = list(rotvec)
+            pose_note = (f'  pose=({xyz[0]*1000:.0f}, {xyz[1]*1000:.0f}, '
+                         f'{xyz[2]*1000:.0f}) mm')
+        else:
+            pose_note = '  (FK unavailable — pose not captured)'
+
+        self._pending_calibration[cell] = entry
         if cell in self._calib_status_lbls:
             self._calib_status_lbls[cell].setText('✓')
             self._calib_status_lbls[cell].setStyleSheet(
@@ -1737,6 +1840,7 @@ class MainWindow(QMainWindow):
             btn.setStyleSheet(_theme.success_button_qss())
         self._log(
             f'Captured {cell}: joints=[{", ".join(f"{j:+.2f}" for j in joints_deg)}]'
+            + pose_note
         )
         self._refresh_calibration_progress()
 
@@ -1774,18 +1878,34 @@ class MainWindow(QMainWindow):
         if not all(c in self._pending_calibration for c in REQUIRED_GRID_CORNERS):
             self._set_status('Capture all 4 corners before saving', '#e0a000')
             return
-        corner_joints = {
-            c: self._pending_calibration[c]['joints_deg']
-            for c in REQUIRED_GRID_CORNERS
-        }
-        extra_joints = {
-            c: self._pending_calibration[c]['joints_deg']
-            for c in self._pending_calibration
-            if c not in REQUIRED_GRID_CORNERS
-        }
+
+        def _pick(field, cells):
+            return {c: self._pending_calibration[c][field]
+                    for c in cells if field in self._pending_calibration[c]}
+
+        corners = list(REQUIRED_GRID_CORNERS)
+        extras = [c for c in self._pending_calibration if c not in REQUIRED_GRID_CORNERS]
+
+        corner_joints = _pick('joints_deg', corners)
+        extra_joints = _pick('joints_deg', extras)
+        # Poses are only present when FK succeeded at capture time.
+        corner_poses = _pick('pose_m', corners)
+        extra_poses = _pick('pose_m', extras)
+        corner_rotvec = _pick('rotvec_rad', corners)
+        extra_rotvec = _pick('rotvec_rad', extras)
+        # Only apply pose tables if we have all 4 corners — interpolation needs them.
+        have_corner_poses = len(corner_poses) == len(REQUIRED_GRID_CORNERS)
+
         profile = self._profile_combo.currentData()
         try:
-            apply_calibration(joints_deg=corner_joints, extra_joints_deg=extra_joints)
+            apply_calibration(
+                joints_deg=corner_joints,
+                extra_joints_deg=extra_joints,
+                poses_m=corner_poses if have_corner_poses else None,
+                rot_vec_rad=corner_rotvec if have_corner_poses else None,
+                extra_poses_m=extra_poses if have_corner_poses else None,
+                extra_rot_vec_rad=extra_rotvec if have_corner_poses else None,
+            )
             path = save_calibration(profile_name=profile)
             set_active_profile(profile)
         except Exception as e:
@@ -1794,14 +1914,16 @@ class MainWindow(QMainWindow):
             return
         self._mark_calibration_active(path, profile)
         self._refresh_profile_labels()
+        pose_note = ('poses captured' if have_corner_poses
+                     else 'joints only (FK was unavailable — camera/IK uses defaults)')
         self._set_status(
             f'Saved & active: {self._profile_combo.currentText()} '
-            f'({len(corner_joints)} corners + {len(extra_joints)} extras)',
+            f'({len(corner_joints)} corners + {len(extra_joints)} extras, {pose_note})',
             '#00cc88',
         )
         self._log(
-            f'Calibration saved to {path}: corners={list(corner_joints)}, '
-            f'extras={list(extra_joints)} — profile {profile}'
+            f'Calibration saved to {path}: corners={corners}, '
+            f'extras={extras}, {pose_note} — profile {profile}'
         )
 
     def _load_selected_profile(self):
@@ -2173,13 +2295,29 @@ class MainWindow(QMainWindow):
         cv2.fillConvexPoly(quad_mask,
                            np.array(self._grid_pts, dtype=np.int32), 255)
 
-        # HSV gates tuned to reject skin: skin sits around H 0..20, S 30..130.
-        # Real ripe-red fruit pegs S above ~170, so the high S floor here
-        # rejects faces/hands/arms while still catching tomatoes/apples.
+        # HSV gates tuned to reject skin AND the wooden board.
+        #   OpenCV ranges: H 0..179, S 0..255, V 0..255.
+        #   Skin sits around H 0..20, S 30..130.
+        #   The tan/wood board sits around H 12..28, S 40..130 (low saturation).
+        # Each colour below uses a HIGH saturation floor so only vivid, strongly
+        # coloured fruit triggers it — the desaturated board never reaches the
+        # S floor, so it is rejected.  If a real fruit is missed under your
+        # lighting, lower that colour's S floor by ~20 at a time.
         profiles = [
+            # Red wraps the hue circle, so it needs two bands.
             ('Red',  (0, 80, 255), [
                 (np.array([0,   170, 90]),   np.array([8,   255, 255])),
                 (np.array([172, 170, 90]),   np.array([180, 255, 255])),
+            ]),
+            # Strong yellow: tight hue band (22..34) well clear of the wood's
+            # orange hue, with a high S floor so tan board never qualifies.
+            ('Yellow', (0, 255, 255), [
+                (np.array([22, 150, 150]),   np.array([34, 255, 255])),
+            ]),
+            # Strong green: hue 40..85 is naturally outside skin/wood, with a
+            # high S floor to ignore dull/shadowed greens.
+            ('Green', (0, 200, 0), [
+                (np.array([40, 120,  80]),   np.array([85, 255, 255])),
             ]),
         ]
 
