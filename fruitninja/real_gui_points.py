@@ -136,8 +136,12 @@ RIGHT_NEAR_CELL = f'{GRID_COLS[-1]}{GRID_ROWS[-1]}'
 CELL_CUT_LIFT_DEG = {}
 
 START_HOLD_SEC = 0.5
-MIN_MOVE_DURATION_SEC = 4.0
-MAX_JOINT_SPEED_DEG_S = 10.0
+# Trajectory timing. Move duration = max(MIN_MOVE_DURATION_SEC, biggest joint
+# delta / MAX_JOINT_SPEED_DEG_S).  Raise MAX_JOINT_SPEED_DEG_S to go faster,
+# lower it to go slower.  (The teach-pendant speed slider scales this further
+# on the real robot, so if it is still slow, check the pendant slider is ~100%.)
+MIN_MOVE_DURATION_SEC = 2.0
+MAX_JOINT_SPEED_DEG_S = 30.0
 CROSS_CUT_WRIST_DELTA_DEG = 90.0
 HAND_ZONE_MIN_LANDMARKS = 5
 HAND_ZONE_PALM_INDICES = (0, 5, 9, 13, 17)
