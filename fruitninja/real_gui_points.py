@@ -41,16 +41,20 @@ from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTolerance
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
+from moveit_msgs.srv import GetPositionIK
+from geometry_msgs.msg import Pose, PoseStamped
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 from fruitninja.grid_mover import (
     cell_to_pose, cell_to_joints_deg, grid_uv_to_pose,
-    grid_uv_to_joints_deg, GRID_COLS, GRID_ROWS,
-    REQUIRED_GRID_CORNERS, apply_calibration, save_calibration,
+    grid_uv_to_joints_deg, grid_uv_to_rotvec_rad, GRID_COLS, GRID_ROWS,
+    REQUIRED_GRID_CORNERS, EXTENDED_ROW1_CELLS, EXTENDED_COL_A_CELLS,
+    EXTENDED_CALIBRATION_CELLS, apply_calibration, save_calibration,
     load_calibration, CALIBRATION_PROFILES,
     get_active_profile, set_active_profile, list_saved_profiles,
 )
+from fruitninja import theme as _theme
 
 import argparse
 import socket as _socket
@@ -113,24 +117,14 @@ APPROACH_LIFT_DELTA = -11.0  # matches legacy hover(-52°) → cut(-41°) spacin
 # Grid deliberately skips it so A→G corner checks do not reset to home.
 SAFE_TRANSIT_BASE_DEG = 45.0
 
-# Camera-to-robot grid trim. The camera grid was reading fruit one row lower
-# than the robot cut grid: a fruit shown as D2 was physically cut by D1.
-# Apply this only to detected-fruit robot targets; the visible camera labels
-# still show what the operator clicked/defined.
-CAMERA_TO_ROBOT_ROW_OFFSET_CELLS = -1.0
-
-# Global trim applied to ALL grid moves (manual clicks AND camera detections).
-# Use these to correct a uniform offset between the calibrated robot grid and
-# the physical board.  Units are cells, fractional values allowed.
-#   ROW (Y): +1.0 = shift robot grid one row TOWARD the robot (row 4 side)
-#           -1.0 = shift one row AWAY from robot (row 1 / far side)
-#   COL (X): +1.0 = shift one column to the RIGHT (toward G)
-#           -1.0 = shift one column to the LEFT  (toward A)
-# Tune empirically: click cell X, watch where the tool lands, set the trim
-# so X is what gets cut.  After editing, rebuild:
-#   colcon build --packages-select fruitninja --symlink-install
-GLOBAL_GRID_ROW_TRIM_CELLS = -1.0
-GLOBAL_GRID_COL_TRIM_CELLS =  0.0
+# Vestigial cell-trim constants.  Previously used to paper over the
+# joint-space curvature error of the 4-corner bilinear interpolation.  With
+# the new Coons-patch interpolation (which honours any extra row/column
+# anchors captured by the operator) and the IK-based camera-cut path, these
+# are no longer needed.  Kept at 0.0 in case a future tuning pass needs them.
+CAMERA_TO_ROBOT_ROW_OFFSET_CELLS = 0.0
+GLOBAL_GRID_ROW_TRIM_CELLS = 0.0
+GLOBAL_GRID_COL_TRIM_CELLS = 0.0
 
 # Raise all cut targets slightly. Shoulder lift uses the existing convention
 # where more negative means higher; -0.5° is roughly the 3 mm over-depth seen
@@ -160,6 +154,18 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 # constraints.  This is still joint-space movement, not a Cartesian pose / IK
 # target.  Keep direct controller execution as a fallback when MoveIt is absent.
 PREFER_MOVEIT_JOINT_GOALS = False
+
+# When True, camera-detected fruit cuts solve IK against the bilinearly
+# interpolated Cartesian pose of the corners instead of using the bilinearly
+# interpolated joint angles.  This eliminates the joint-space curvature error
+# that makes the middle cells drift when only 4 corners are calibrated.  Falls
+# back to the joint-interpolation path if the /compute_ik service isn't up.
+# Manual cell clicks and Trace Grid are not affected.
+USE_IK_FOR_CAMERA_FRUITS = True
+IK_TIMEOUT_SEC = 1.0
+IK_BASE_FRAME = 'base_link'
+IK_EEF_LINK = 'tool0'
+IK_SERVICE_NAME = '/compute_ik'
 
 # Compressed frame size published to /camera/image_raw/compressed for safety_node.
 # 640x480 is the sweet spot for MediaPipe Hands — fast inference without losing
@@ -222,6 +228,16 @@ def _camera_grid_to_robot_target(grid_x: float,
 
 def _wrap_deg(deg: float) -> float:
     return ((deg + 180.0) % 360.0) - 180.0
+
+
+def _rotvec_to_quat(rx: float, ry: float, rz: float) -> tuple[float, float, float, float]:
+    """UR tool rotation-vector (axis * angle, in radians) → quaternion (x, y, z, w)."""
+    angle = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if angle < 1e-9:
+        return (0.0, 0.0, 0.0, 1.0)
+    half = angle * 0.5
+    s = math.sin(half) / angle
+    return (rx * s, ry * s, rz * s, math.cos(half))
 
 
 # ── ROS2 nodes ─────────────────────────────────────────────────────────────────
@@ -288,6 +304,7 @@ class MoverNode(Node):
         super().__init__('real_gui_points_mover')
         self._client      = ActionClient(self, FollowJointTrajectory, TRAJECTORY_ACTION)
         self._moveit_client = ActionClient(self, MoveGroup, MOVE_GROUP_ACTION)
+        self._ik_client   = self.create_client(GetPositionIK, IK_SERVICE_NAME)
         self._cancel_flag = False
         self._cancel_generation = 0
         self._goal_handle = None
@@ -490,6 +507,65 @@ class MoverNode(Node):
                 if self._goal_handle is goal_handle:
                     self._goal_handle = None
             executor.remove_node(self)
+
+    def solve_ik(self,
+                 target_xyz: tuple,
+                 target_rotvec: tuple,
+                 seed_joints_deg: list,
+                 timeout_sec: float = IK_TIMEOUT_SEC) -> list | None:
+        """
+        Ask MoveIt's /compute_ik service for joint angles that reach the given
+        Cartesian pose in the IK_BASE_FRAME, seeded by seed_joints_deg.
+        Returns a list of 6 degrees in JOINT_NAMES order, or None on any
+        failure (service down, timeout, no IK solution, name mismatch).
+        """
+        if not self._ik_client.wait_for_service(timeout_sec=0.5):
+            return None
+
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = MOVE_GROUP_NAME
+        req.ik_request.ik_link_name = IK_EEF_LINK
+        req.ik_request.avoid_collisions = False
+        req.ik_request.timeout = self._duration_msg(timeout_sec)
+
+        pose = PoseStamped()
+        pose.header.frame_id = IK_BASE_FRAME
+        pose.pose.position.x = float(target_xyz[0])
+        pose.pose.position.y = float(target_xyz[1])
+        pose.pose.position.z = float(target_xyz[2])
+        qx, qy, qz, qw = _rotvec_to_quat(*target_rotvec)
+        pose.pose.orientation.x = qx
+        pose.pose.orientation.y = qy
+        pose.pose.orientation.z = qz
+        pose.pose.orientation.w = qw
+        req.ik_request.pose_stamped = pose
+
+        seed_state = JointState()
+        seed_state.name = list(JOINT_NAMES)
+        seed_state.position = [math.radians(d) for d in seed_joints_deg]
+        req.ik_request.robot_state.joint_state = seed_state
+
+        future = self._ik_client.call_async(req)
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(self)
+        try:
+            executor.spin_until_future_complete(future, timeout_sec=timeout_sec + 0.5)
+        finally:
+            executor.remove_node(self)
+
+        if not future.done():
+            return None
+        result = future.result()
+        if result is None or result.error_code.val != MoveItErrorCodes.SUCCESS:
+            return None
+
+        positions = dict(zip(
+            result.solution.joint_state.name,
+            result.solution.joint_state.position,
+        ))
+        if not all(name in positions for name in JOINT_NAMES):
+            return None
+        return [math.degrees(positions[name]) for name in JOINT_NAMES]
 
     def cancel(self):
         self._cancel_flag = True
@@ -786,9 +862,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self, robot_ip: str = '192.168.0.194'):
         super().__init__()
-        self.setWindowTitle('FruitNinja — UR3e Grid Control')
+        self.setWindowTitle('FruitNinja — UR3e Operator Console')
         self.setMinimumSize(1240, 740)
-        self.setStyleSheet('background:#0b1117; color:white;')
+        self.setStyleSheet(_theme.root_qss())
 
         self._selected_cells = []
         self._moving = False
@@ -979,20 +1055,14 @@ class MainWindow(QMainWindow):
         # ── status ────────────────────────────────────────────────────────────
         self._status_label = QLabel('● Idle — select a cell and press Move')
         self._status_label.setAlignment(Qt.AlignCenter)
-        self._status_label.setStyleSheet(
-            'background:#101a22; color:#a9b8c4; font-size:13px; font-weight:bold;'
-            'padding:9px; border:1px solid #2f4654; border-radius:6px;'
-        )
+        self._status_label.setStyleSheet(_theme.status_label_qss(_theme.THEME['fg_muted']))
         root.addWidget(self._status_label)
 
         # ── log ───────────────────────────────────────────────────────────────
         self._log_widget = QTextEdit()
         self._log_widget.setReadOnly(True)
-        self._log_widget.setMaximumHeight(90)
-        self._log_widget.setStyleSheet(
-            'background:#071016; color:#79f7b2; border:1px solid #1c303b;'
-            'border-radius:6px; font-family:monospace; font-size:11px; padding:6px;'
-        )
+        self._log_widget.setMaximumHeight(96)
+        self._log_widget.setStyleSheet(_theme.log_widget_qss())
         root.addWidget(self._log_widget)
 
         # ── spacebar E-STOP shortcut ──────────────────────────────────────────
@@ -1004,36 +1074,47 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _group(title):
         g = QGroupBox(title)
-        g.setStyleSheet(
-            'QGroupBox{color:#f5f9fa;font-weight:bold;'
-            'border:1px solid #314652;border-radius:7px;margin-top:10px;'
-            'background:#0f1820;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}'
-        )
+        g.setStyleSheet(_theme.panel_qss())
         layout = QVBoxLayout()
-        layout.setSpacing(8)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 16, 12, 12)
         g.setLayout(layout)
         return g
 
     @staticmethod
     def _cell_style_normal():
+        # Selector-grid cell toggle style with the centralised theme.
         return (
-            'QPushButton{background:#14222b;color:#c9d6de;border:1px solid #2f4654;'
-            'border-radius:4px;font-size:10px;font-weight:bold;}'
-            'QPushButton:checked{background:#2f8bd8;color:white;border:1px solid #91cfff;}'
-            'QPushButton:hover{background:#203442;}'
+            f'QPushButton{{background:{_theme.THEME["bg_input"]};'
+            f' color:{_theme.THEME["fg_primary"]};'
+            f' border:1px solid {_theme.THEME["border"]};'
+            f' border-radius:{_theme.THEME["radius_sm"]};'
+            f' font-size:11px; font-weight:600;}}'
+            f'QPushButton:checked{{background:{_theme.THEME["accent"]}; color:#ffffff;'
+            f' border:1px solid {_theme.THEME["accent_hover"]};}}'
+            f'QPushButton:hover{{background:{_theme.THEME["bg_hover"]};}}'
         )
 
     @staticmethod
     def _action_btn(text, colour, slot):
         b = QPushButton(text)
-        b.setStyleSheet(
-            f'QPushButton{{background:{colour};color:white;border-radius:6px;'
-            f'padding:12px;font-size:13px;font-weight:bold;border:1px solid rgba(255,255,255,40);}}'
-            f'QPushButton:hover{{background:{colour};border:1px solid rgba(255,255,255,110);}}'
-            f'QPushButton:pressed{{background:{colour};padding-top:13px;padding-bottom:11px;}}'
-        )
+        # Map legacy hex colours to theme variants so existing call-sites keep
+        # working without changing every caller.
+        colour_to_qss = {
+            '#1a5c1a': _theme.success_button_qss(),
+            '#2a7a2a': _theme.success_button_qss(),
+            '#0b6b6b': _theme.primary_button_qss(),
+            '#0b5b8b': _theme.primary_button_qss(),
+            '#3a7aff': _theme.primary_button_qss(),
+            '#2a3a5c': _theme.ghost_button_qss(),
+            '#3b4650': _theme.ghost_button_qss(),
+            '#5c1a1a': _theme.danger_button_qss(),
+            '#a83232': _theme.danger_button_qss(),
+            '#ff4444': _theme.danger_button_qss(),
+            '#a07020': _theme.warning_button_qss(),
+            '#e0a000': _theme.warning_button_qss(),
+        }
+        b.setStyleSheet(colour_to_qss.get(colour, _theme.primary_button_qss()))
         b.clicked.connect(slot)
         return b
 
@@ -1228,12 +1309,40 @@ class MainWindow(QMainWindow):
 
     def _fruit_target(self, fruit: dict) -> dict:
         grid_x, grid_y = fruit['grid_xy']
-        _col_pos, _row_pos, u, v, target_cell = _camera_grid_to_robot_target(
+        _col_pos, _row_pos, u_trim, v_trim, target_cell = _camera_grid_to_robot_target(
             grid_x, grid_y
         )
 
-        cut = grid_uv_to_joints_deg(u, v)
-        cut = _cut_joints_for_cell(target_cell, cut)
+        # Joint-bilinear interp at the trimmed (u, v): used as the IK seed AND
+        # as the fallback when /compute_ik is unavailable.  Keeping the trim on
+        # the seed preserves the same arm configuration the operator is used to.
+        bilinear_cut = _cut_joints_for_cell(
+            target_cell, grid_uv_to_joints_deg(u_trim, v_trim)
+        )
+
+        cut = bilinear_cut
+        ik_used = False
+        if USE_IK_FOR_CAMERA_FRUITS:
+            # The IK target is the pose at the RAW camera (u, v) — no trim/offset.
+            # Camera homography already maps pixels → physical board coordinates,
+            # so the bilinear corner-pose interp lands on the actual fruit position.
+            n_cols, n_rows = len(GRID_COLS), len(GRID_ROWS)
+            u_raw = min(1.0, max(0.0, (grid_x - 0.5) / (n_cols - 1)))
+            v_raw = min(1.0, max(0.0, (grid_y - 0.5) / (n_rows - 1)))
+            target_xyz = grid_uv_to_pose(u_raw, v_raw)
+            target_rotvec = grid_uv_to_rotvec_rad(u_raw, v_raw)
+            ik_solution = self._mover_node.solve_ik(
+                target_xyz, target_rotvec, bilinear_cut
+            )
+            if ik_solution is not None:
+                cut = _cut_joints_for_cell(target_cell, ik_solution)
+                ik_used = True
+            else:
+                self._log(
+                    f'IK fallback for {target_cell}: /compute_ik unavailable '
+                    'or no solution — using joint-bilinear interp'
+                )
+
         approach = list(cut)
         approach[1] += APPROACH_LIFT_DELTA
 
@@ -1242,7 +1351,7 @@ class MainWindow(QMainWindow):
         approach_cross = list(cut_cross)
         approach_cross[1] += APPROACH_LIFT_DELTA
 
-        x, y, z = grid_uv_to_pose(u, v)
+        x, y, z = grid_uv_to_pose(u_trim, v_trim)
         return {
             'cut': cut,
             'approach': approach,
@@ -1251,6 +1360,7 @@ class MainWindow(QMainWindow):
             'tool': (x, y, z),
             'target_cell': target_cell,
             'cut_lift_deg': GLOBAL_CUT_LIFT_DEG + CELL_CUT_LIFT_DEG.get(target_cell, 0.0),
+            'ik_used': ik_used,
         }
 
     def _cut_detected_fruit(self):
@@ -1313,9 +1423,10 @@ class MainWindow(QMainWindow):
         label = fruit['origin']
         target_cell = target.get('target_cell', label)
         gx, gy = fruit['grid_xy']
+        solver = 'IK' if target.get('ik_used') else 'joint-interp'
         self._log(
             f'Fruit {label}: centroid grid=({gx:.2f}, {gy:.2f})  '
-            f'robot_target={target_cell}  '
+            f'robot_target={target_cell}  solver={solver}  '
             f'tool=({x*1000:.1f}, {y*1000:.1f}, {z*1000:.1f}) mm  '
             f'cut_lift={target["cut_lift_deg"]:+.1f}°  '
             f'cross wrist +{CROSS_CUT_WRIST_DELTA_DEG:.0f}°'
@@ -1485,11 +1596,10 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _set_status(self, text: str, colour: str = '#aaaaaa'):
+    def _set_status(self, text: str, colour: str = None):
         self._status_label.setText(text)
         self._status_label.setStyleSheet(
-            f'background:#101a22; color:{colour}; font-size:13px; font-weight:bold;'
-            f'padding:9px; border:1px solid #2f4654; border-radius:6px;'
+            _theme.status_label_qss(colour or _theme.THEME['fg_muted'])
         )
 
     def _log(self, text: str):
@@ -1498,135 +1608,184 @@ class MainWindow(QMainWindow):
     # ── Robot calibration panel ─────────────────────────────────────────────
 
     def _build_calibration_panel(self) -> QGroupBox:
-        group = self._group('Robot Calibration — Per-Robot Corners')
+        group = self._group('Robot Calibration')
         layout = group.layout()
 
         info = QLabel(
-            'Pick the robot, freedrive UR3e to each corner of the cutting '
-            'board, click Capture. After all 4 corners, click Save & Use. '
-            'Load switches to another robot saved calibration.'
+            'Freedrive the UR3e to each cell, click its Capture button. '
+            'The 4 corners (A1, G1, G4, A4) are required. Capturing the '
+            'extra cells along Row 1 and Column A improves middle-cell '
+            'accuracy via Coons-patch interpolation.'
         )
         info.setWordWrap(True)
-        info.setStyleSheet('color:#91a5b2; font-size:11px;')
+        info.setStyleSheet(f'color:{_theme.THEME["fg_muted"]}; font-size:11px;')
         layout.addWidget(info)
 
         prof_row = QHBoxLayout()
-        prof_row.setSpacing(6)
+        prof_row.setSpacing(8)
         prof_lbl = QLabel('Robot:')
-        prof_lbl.setStyleSheet('color:#d1dde4; font-size:12px;')
+        prof_lbl.setStyleSheet(f'color:{_theme.THEME["fg_primary"]}; font-size:12px; font-weight:600;')
         prof_row.addWidget(prof_lbl)
 
         self._profile_combo = QComboBox()
         for i, name in enumerate(CALIBRATION_PROFILES, start=1):
             self._profile_combo.addItem(f'Robot {i}', name)
-        self._profile_combo.setStyleSheet(
-            'QComboBox{background:#08131a;color:#c9d6de;border:1px solid #2f5161;'
-            'border-radius:5px;padding:4px 8px;font-size:12px;}'
-        )
+        self._profile_combo.setStyleSheet(_theme.combo_qss())
         self._profile_combo.currentIndexChanged.connect(self._refresh_profile_labels)
         prof_row.addWidget(self._profile_combo, stretch=1)
 
         self._btn_calib_load = QPushButton('Load')
-        self._btn_calib_load.setStyleSheet(
-            'QPushButton{background:#1a3a5c;color:white;border-radius:5px;'
-            'padding:6px 14px;font-size:12px;font-weight:bold;}'
-            'QPushButton:hover{background:#235080;}'
-        )
+        self._btn_calib_load.setStyleSheet(_theme.ghost_button_qss())
         self._btn_calib_load.clicked.connect(self._load_selected_profile)
         prof_row.addWidget(self._btn_calib_load)
         layout.addLayout(prof_row)
 
-        row = QHBoxLayout()
-        row.setSpacing(6)
+        # ── Grid-of-cells capture pad ─────────────────────────────────────────
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        grid.setContentsMargins(0, 4, 0, 4)
+        # Column header
+        for col_i, col_char in enumerate(GRID_COLS):
+            header = QLabel(col_char)
+            header.setAlignment(Qt.AlignCenter)
+            header.setStyleSheet(
+                f'color:{_theme.THEME["fg_muted"]}; font-size:11px; font-weight:700;'
+            )
+            grid.addWidget(header, 0, col_i + 1)
+        # Row header + cells
         self._calib_btns = {}
         self._calib_status_lbls = {}
-        for corner in REQUIRED_GRID_CORNERS:
-            col = QVBoxLayout()
-            col.setSpacing(2)
-            btn = QPushButton(f'Capture {corner}')
-            btn.setStyleSheet(
-                'QPushButton{background:#1a3a5c;color:white;border:1px solid #2f5f8f;'
-                'border-radius:5px;padding:8px;font-size:12px;font-weight:bold;}'
-                'QPushButton:hover{background:#235080;}'
-                'QPushButton:pressed{background:#122b44;}'
+        capturable = set(EXTENDED_CALIBRATION_CELLS)
+        for row_i, row_char in enumerate(GRID_ROWS):
+            row_lbl = QLabel(row_char)
+            row_lbl.setAlignment(Qt.AlignCenter)
+            row_lbl.setStyleSheet(
+                f'color:{_theme.THEME["fg_muted"]}; font-size:11px; font-weight:700;'
             )
-            btn.clicked.connect(lambda _checked=False, cn=corner: self._capture_corner(cn))
-            self._calib_btns[corner] = btn
-            col.addWidget(btn)
+            grid.addWidget(row_lbl, row_i + 1, 0)
+            for col_i, col_char in enumerate(GRID_COLS):
+                cell = f'{col_char}{row_char}'
+                btn = QPushButton(cell)
+                btn.setMinimumHeight(34)
+                if cell in capturable:
+                    btn.setStyleSheet(_theme.ghost_button_qss())
+                    btn.clicked.connect(
+                        lambda _checked=False, cn=cell: self._capture_cell(cn)
+                    )
+                    btn.setToolTip(
+                        f'Capture {cell}'
+                        + ('  (required corner)' if cell in REQUIRED_GRID_CORNERS
+                           else '  (optional, improves accuracy)')
+                    )
+                    self._calib_btns[cell] = btn
+                    badge = QLabel('◌')
+                    badge.setAlignment(Qt.AlignCenter)
+                    badge.setStyleSheet(
+                        f'color:{_theme.THEME["fg_dim"]}; font-size:14px;'
+                    )
+                    self._calib_status_lbls[cell] = badge
+                else:
+                    btn.setEnabled(False)
+                    btn.setStyleSheet(_theme.cell_button_qss(False))
+                    btn.setToolTip(f'{cell} — not part of the extended calibration set')
+                grid.addWidget(btn, row_i + 1, col_i + 1)
+        # Badges sit under each capturable button via tooltip — keep compact.
+        layout.addLayout(grid)
 
-            badge = QLabel('- not captured')
-            badge.setAlignment(Qt.AlignCenter)
-            badge.setStyleSheet('color:#7a8fa0; font-size:10px;')
-            self._calib_status_lbls[corner] = badge
-            col.addWidget(badge)
-            row.addLayout(col)
-        layout.addLayout(row)
+        # Captured-count strip
+        self._calib_progress = QLabel('Captured 0 / 4 corners  •  0 extra cells')
+        self._calib_progress.setAlignment(Qt.AlignCenter)
+        self._calib_progress.setStyleSheet(
+            f'color:{_theme.THEME["fg_muted"]}; font-size:11px; padding:4px;'
+        )
+        layout.addWidget(self._calib_progress)
 
         actions = QHBoxLayout()
-        actions.setSpacing(6)
+        actions.setSpacing(8)
         self._btn_calib_save = QPushButton('Save & Use')
-        self._btn_calib_save.setStyleSheet(
-            'QPushButton{background:#1a5c1a;color:white;border-radius:5px;'
-            'padding:8px;font-size:12px;font-weight:bold;}'
-            'QPushButton:disabled{background:#22302a;color:#5d7068;}'
-            'QPushButton:hover:!disabled{background:#247a24;}'
-        )
+        self._btn_calib_save.setStyleSheet(_theme.success_button_qss())
         self._btn_calib_save.setEnabled(False)
         self._btn_calib_save.clicked.connect(self._save_calibration)
-        actions.addWidget(self._btn_calib_save)
+        actions.addWidget(self._btn_calib_save, stretch=1)
 
         self._btn_calib_reset = QPushButton('Reset Capture')
-        self._btn_calib_reset.setStyleSheet(
-            'QPushButton{background:#3b4650;color:white;border-radius:5px;'
-            'padding:8px;font-size:12px;font-weight:bold;}'
-            'QPushButton:hover{background:#4c5b67;}'
-        )
+        self._btn_calib_reset.setStyleSheet(_theme.ghost_button_qss())
         self._btn_calib_reset.clicked.connect(self._reset_calibration)
         actions.addWidget(self._btn_calib_reset)
         layout.addLayout(actions)
 
         self._calib_status = QLabel('Calibration: not loaded — using built-in defaults')
         self._calib_status.setAlignment(Qt.AlignCenter)
-        self._calib_status.setStyleSheet(
-            'background:#101a22; color:#a9b8c4; font-size:11px;'
-            'padding:5px; border:1px solid #2f4654; border-radius:4px;'
-        )
+        self._calib_status.setStyleSheet(_theme.status_label_qss(_theme.THEME['fg_muted']))
         layout.addWidget(self._calib_status)
         return group
 
-    def _capture_corner(self, corner: str):
+    def _capture_cell(self, cell: str):
         if not self._have_joint_state:
-            self._set_status(f'Capture {corner} blocked: no live joint state', '#e0a000')
+            self._set_status(f'Capture {cell} blocked: no live joint state', '#e0a000')
             return
         joints_deg = [math.degrees(self._current_joints_rad[n]) for n in JOINT_NAMES]
-        self._pending_calibration[corner] = {'joints_deg': joints_deg}
-        short_labels = ['pan', 'lift', 'elbow', 'w1', 'w2', 'w3']
-        badge_txt = '  '.join(
-            f'{lbl}={j:+.1f}°' for lbl, j in zip(short_labels, joints_deg)
-        )
-        self._calib_status_lbls[corner].setText(f'OK {badge_txt}')
-        self._calib_status_lbls[corner].setStyleSheet(
-            'color:#79f7b2; font-size:10px; font-weight:bold;'
-        )
+        self._pending_calibration[cell] = {'joints_deg': joints_deg}
+        if cell in self._calib_status_lbls:
+            self._calib_status_lbls[cell].setText('✓')
+            self._calib_status_lbls[cell].setStyleSheet(
+                f'color:{_theme.THEME["success"]}; font-size:14px; font-weight:bold;'
+            )
+        # Tint the captured button so the user sees green-on-green progress.
+        btn = self._calib_btns.get(cell)
+        if btn is not None:
+            btn.setStyleSheet(_theme.success_button_qss())
         self._log(
-            f'Captured {corner}: joints=[{", ".join(f"{j:+.2f}" for j in joints_deg)}]'
+            f'Captured {cell}: joints=[{", ".join(f"{j:+.2f}" for j in joints_deg)}]'
         )
-        all_done = all(c in self._pending_calibration for c in REQUIRED_GRID_CORNERS)
-        self._btn_calib_save.setEnabled(all_done)
-        if all_done:
-            self._set_status('All 4 corners captured — click Save & Use', '#79f7b2')
+        self._refresh_calibration_progress()
+
+    # Legacy alias — old internal callers expected this name.
+    def _capture_corner(self, corner: str):
+        self._capture_cell(corner)
+
+    def _refresh_calibration_progress(self):
+        corners_done = sum(
+            1 for c in REQUIRED_GRID_CORNERS if c in self._pending_calibration
+        )
+        extras_total = (
+            set(EXTENDED_CALIBRATION_CELLS) - set(REQUIRED_GRID_CORNERS)
+        )
+        extras_done = sum(1 for c in extras_total if c in self._pending_calibration)
+        self._calib_progress.setText(
+            f'Captured {corners_done} / 4 corners  •  '
+            f'{extras_done} / {len(extras_total)} extra cells'
+        )
+        all_corners = corners_done == len(REQUIRED_GRID_CORNERS)
+        self._btn_calib_save.setEnabled(all_corners)
+        if all_corners:
+            if extras_done == 0:
+                self._set_status(
+                    'Corners ready — capture extras for better accuracy, or Save & Use',
+                    '#79f7b2',
+                )
+            else:
+                self._set_status(
+                    f'Corners + {extras_done} extras ready — click Save & Use',
+                    '#79f7b2',
+                )
 
     def _save_calibration(self):
         if not all(c in self._pending_calibration for c in REQUIRED_GRID_CORNERS):
             self._set_status('Capture all 4 corners before saving', '#e0a000')
             return
-        joints = {
+        corner_joints = {
             c: self._pending_calibration[c]['joints_deg']
             for c in REQUIRED_GRID_CORNERS
         }
+        extra_joints = {
+            c: self._pending_calibration[c]['joints_deg']
+            for c in self._pending_calibration
+            if c not in REQUIRED_GRID_CORNERS
+        }
         profile = self._profile_combo.currentData()
         try:
-            apply_calibration(joints_deg=joints)
+            apply_calibration(joints_deg=corner_joints, extra_joints_deg=extra_joints)
             path = save_calibration(profile_name=profile)
             set_active_profile(profile)
         except Exception as e:
@@ -1635,8 +1794,15 @@ class MainWindow(QMainWindow):
             return
         self._mark_calibration_active(path, profile)
         self._refresh_profile_labels()
-        self._set_status(f'Saved & active: {self._profile_combo.currentText()}', '#00cc88')
-        self._log(f'Calibration saved to {path} (profile {profile}) and applied live')
+        self._set_status(
+            f'Saved & active: {self._profile_combo.currentText()} '
+            f'({len(corner_joints)} corners + {len(extra_joints)} extras)',
+            '#00cc88',
+        )
+        self._log(
+            f'Calibration saved to {path}: corners={list(corner_joints)}, '
+            f'extras={list(extra_joints)} — profile {profile}'
+        )
 
     def _load_selected_profile(self):
         profile = self._profile_combo.currentData()
@@ -1673,17 +1839,23 @@ class MainWindow(QMainWindow):
             [f'Robot {i+1}' for i in range(len(CALIBRATION_PROFILES))]
         )).get(profile, profile)
         self._calib_status.setText(f'Calibration active ({label}): {path}')
-        self._calib_status.setStyleSheet(
-            'background:#0e2418; color:#79f7b2; font-size:11px; font-weight:bold;'
-            'padding:5px; border:1px solid #2f7f4f; border-radius:4px;'
-        )
+        self._calib_status.setStyleSheet(_theme.status_label_qss(_theme.THEME['success']))
 
     def _reset_calibration(self, silent: bool = False):
         self._pending_calibration = {}
-        for corner in REQUIRED_GRID_CORNERS:
-            self._calib_status_lbls[corner].setText('- not captured')
-            self._calib_status_lbls[corner].setStyleSheet('color:#7a8fa0; font-size:10px;')
+        for cell, lbl in self._calib_status_lbls.items():
+            lbl.setText('◌')
+            lbl.setStyleSheet(
+                f'color:{_theme.THEME["fg_dim"]}; font-size:14px;'
+            )
+        for cell, btn in self._calib_btns.items():
+            btn.setStyleSheet(_theme.ghost_button_qss())
         self._btn_calib_save.setEnabled(False)
+        if hasattr(self, '_calib_progress'):
+            self._calib_progress.setText(
+                f'Captured 0 / {len(REQUIRED_GRID_CORNERS)} corners  •  '
+                f'0 / {len(EXTENDED_CALIBRATION_CELLS) - len(REQUIRED_GRID_CORNERS)} extra cells'
+            )
         if not silent:
             self._set_status('Calibration capture cleared', '#a9b8c4')
 

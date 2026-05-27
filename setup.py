@@ -31,6 +31,7 @@ setup(
             'grid_mover = fruitninja.grid_mover:main',
             'real_gui_points = fruitninja.real_gui_points:main',
             'startup_gui = fruitninja.startup_gui:main',
+            'home_screen = fruitninja.home_screen:main',
             'safety_node = fruitninja.safety_node:main',
             'robot_camera_viewer = fruitninja.robot_camera_viewer:main',
         ],

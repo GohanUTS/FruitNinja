@@ -99,7 +99,9 @@ class PlanningSceneSetup(Node):
             10
         )
         self._publish_count = 0
-        self._timer = self.create_timer(5.0, self.setup_scene)
+        # One-shot publish on startup.  PlanningScene with is_diff=True is
+        # latched into MoveIt + RViz; republishing the trolley mesh on a timer
+        # was causing periodic RViz lag spikes during motion.
         self.setup_scene()
 
     def setup_scene(self):

@@ -7,11 +7,9 @@ HOW IT WORKS (overview)
 The UR3e robot stack requires several processes to start in order:
   Step 0 (sim only) — URSim Docker container running the virtual Polyscope
   Step 1 — ur_robot_driver   : speaks the RTDE protocol to the physical/sim robot
-  Step 2 — switch_controller : one-shot service call to activate the right controller
-  Step 3 — ur_moveit.launch  : MoveIt planner + RViz visualisation
-  Step 4 — planning_scene    : publishes workcell collision objects to MoveIt
-  Step 5 — real_gui_points   : the main operator GUI for cell selection + cutting
-  Step 6 — safety_node       : redundant hand-detection interlock
+  Step 2 — ur_moveit.launch  : MoveIt planner + RViz visualisation
+  Step 3 — planning_scene    : publishes workcell collision objects to MoveIt
+  Step 4 — real_gui_points   : the main operator GUI; safety interlock auto-starts
 
 Each step runs as an independent QProcess inside its own tab.
 The operator presses Start on each row in order and watches the tab output.
@@ -45,6 +43,8 @@ from PyQt5.QtGui import (
     QFont, QColor, QTextCursor, QPainter, QPen, QBrush,
     QLinearGradient, QRadialGradient,
 )
+
+from fruitninja import theme as _theme
 
 
 # ── Step definitions ──────────────────────────────────────────────────────────
@@ -120,17 +120,10 @@ def make_steps(robot_ip: str, sim: bool = False) -> list:
         },
         {
             'label':   'Step 4 — Main GUI',
-            'desc':    'Open the grid-control GUI for cutting',
+            'desc':    'Open the grid-control GUI for cutting (safety interlock auto-starts)',
             'cmd':     SOURCE + f'ros2 run fruitninja real_gui_points --robot-ip {ip}',
             'oneshot': False,
-            'note':    '',
-        },
-        {
-            'label':   'Step 5 — Safety Node',
-            'desc':    'Hand-detection safety interlock (subscribes to camera topic)',
-            'cmd':     SOURCE + f'ros2 run fruitninja safety_node --robot-ip {ip}',
-            'oneshot': False,
-            'note':    'Start after Step 3. Define the grid in the GUI to activate the interlock.',
+            'note':    'The hand-detection safety node is launched automatically by fruitninja.launch.py — no separate step needed.',
         },
     ]
     return steps
@@ -144,30 +137,7 @@ STATUS_DONE    = ('✔ Done',    '#00ddff')
 STATUS_FAILED  = ('✖ Failed',  '#ff4444')
 STATUS_STOPPED = ('■ Stopped', '#e0a000')
 
-TAB_STYLE = """
-QTabWidget::pane {
-    border: 1px solid #33414a;
-    background: #081016;
-    border-radius: 6px;
-}
-QTabBar::tab {
-    background: #172028;
-    color: #a9b9c5;
-    padding: 7px 14px;
-    border: 1px solid #33414a;
-    border-bottom: none;
-    font-size: 11px;
-    min-width: 96px;
-}
-QTabBar::tab:selected {
-    background: #243241;
-    color: white;
-    font-weight: bold;
-}
-QTabBar::tab:hover {
-    background: #2e3f4f;
-}
-"""
+TAB_STYLE = _theme.tab_qss()
 
 
 # ── Animated brand strip ─────────────────────────────────────────────────────
@@ -274,16 +244,14 @@ class StepRow(QObject):
         # ── output tab widget ─────────────────────────────────────────────────
         self.output_widget = QTextEdit()
         self.output_widget.setReadOnly(True)
-        self.output_widget.setStyleSheet(
-            'background:#071016; color:#79f7b2; border:1px solid #1c303b;'
-            'border-radius:6px; font-family:monospace; font-size:11px;'
-            'padding:8px;'
-        )
+        self.output_widget.setStyleSheet(_theme.log_widget_qss())
 
         # ── row container ─────────────────────────────────────────────────────
         self.container = QWidget()
         self.container.setStyleSheet(
-            'QWidget{background:#111c24; border:1px solid #263946; border-radius:6px;}'
+            f'QWidget{{background:{_theme.THEME["bg_panel"]};'
+            f' border:1px solid {_theme.THEME["border"]};'
+            f' border-radius:{_theme.THEME["radius"]};}}'
             'QLabel{border:none; background:transparent;}'
             'QPushButton{border:none;}'
         )
@@ -317,15 +285,15 @@ class StepRow(QObject):
         layout.addWidget(self._status_lbl)
 
         self._btn_start = QPushButton('▶  Start')
-        self._btn_start.setFixedWidth(90)
-        self._btn_start.setStyleSheet(self._btn_style('#1a5c1a'))
+        self._btn_start.setFixedWidth(100)
+        self._btn_start.setStyleSheet(_theme.success_button_qss())
         self._btn_start.clicked.connect(self.start)
         layout.addWidget(self._btn_start)
 
         self._btn_stop = QPushButton('■  Stop')
-        self._btn_stop.setFixedWidth(90)
+        self._btn_stop.setFixedWidth(100)
         self._btn_stop.setEnabled(False)
-        self._btn_stop.setStyleSheet(self._btn_style('#5a1a1a'))
+        self._btn_stop.setStyleSheet(_theme.danger_button_qss())
         self._btn_stop.clicked.connect(self.stop)
         layout.addWidget(self._btn_stop)
 
@@ -455,7 +423,7 @@ class StartupWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle('FruitNinja — Startup Launcher')
         self.setMinimumSize(960, 760)
-        self.setStyleSheet('background:#0b1117; color:white;')
+        self.setStyleSheet(_theme.root_qss())
 
         self._step_rows    = []
         self._steps_layout = None
@@ -774,12 +742,7 @@ class StartupWindow(QMainWindow):
 
     @staticmethod
     def _group_style():
-        return (
-            'QGroupBox{color:#f5f9fa;font-weight:bold;'
-            'border:1px solid #314652;border-radius:7px;margin-top:10px;'
-            'background:#0f1820;}'
-            'QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;}'
-        )
+        return _theme.panel_qss()
 
     def _stop_all(self):
         """Send SIGTERM to every running process (graceful shutdown of all steps)."""

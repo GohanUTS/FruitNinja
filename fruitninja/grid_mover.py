@@ -45,6 +45,16 @@ LEGACY_GRID_CORNER_ALIASES = {
     'G4': 'N4',
 }
 
+# Cells the GUI can optionally capture in addition to the 4 corners.
+# Capturing the full row 1 line + the full column A line lets the Coons-patch
+# interpolation honour those edges exactly, which removes the joint-space
+# curvature error in middle cells.  Order matters for UI layout only.
+EXTENDED_ROW1_CELLS = ('B1', 'C1', 'D1', 'E1', 'F1')
+EXTENDED_COL_A_CELLS = ('A2', 'A3')
+EXTENDED_CALIBRATION_CELLS = (
+    REQUIRED_GRID_CORNERS + EXTENDED_ROW1_CELLS + EXTENDED_COL_A_CELLS
+)
+
 GRID_CALIBRATION_ENV = 'FRUITNINJA_GRID_CALIBRATION'
 DEFAULT_GRID_CALIBRATION_PATH = '~/.fruitninja/grid_calibration.json'
 
@@ -162,6 +172,13 @@ CORNER_JOINTS_DEG = {
     'G4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
 }
 
+# Optional extra calibrated cells beyond the 4 corners.  Populated by
+# apply_calibration() when a calibration file ships extra row/column anchors.
+# When non-empty, the interpolation uses a Coons-patch surface that exactly
+# honours every captured cell — this removes the joint-space curvature error
+# that plagues 4-corner bilinear at middle cells.
+EXTRA_CELL_JOINTS_DEG: dict = {}
+
 # ── Per-robot calibration overrides ──────────────────────────────────────────
 
 def _normalise_corner_map(corners: dict, expected_len: int, label: str) -> dict:
@@ -183,8 +200,9 @@ def _normalise_corner_map(corners: dict, expected_len: int, label: str) -> dict:
 
 def apply_calibration(poses_m: dict | None = None,
                       rot_vec_rad: dict | None = None,
-                      joints_deg: dict | None = None) -> None:
-    """Mutate the corner tables in place from a captured calibration."""
+                      joints_deg: dict | None = None,
+                      extra_joints_deg: dict | None = None) -> None:
+    """Mutate the corner + extra-cell tables in place from a captured calibration."""
     if poses_m is not None:
         poses_m = _normalise_corner_map(poses_m, 3, 'corner_tool_poses_m')
         for c in REQUIRED_GRID_CORNERS:
@@ -197,6 +215,26 @@ def apply_calibration(poses_m: dict | None = None,
         joints_deg = _normalise_corner_map(joints_deg, 6, 'corner_joints_deg')
         for c in REQUIRED_GRID_CORNERS:
             CORNER_JOINTS_DEG[c] = tuple(float(x) for x in joints_deg[c])
+    if extra_joints_deg is not None:
+        # Reset extras so a load fully replaces previous state.
+        EXTRA_CELL_JOINTS_DEG.clear()
+        for cell, vals in extra_joints_deg.items():
+            cell = str(cell).upper()
+            if cell in REQUIRED_GRID_CORNERS:
+                # Corner values belong in the corner table, not extras.
+                continue
+            if len(vals) != 6:
+                raise ValueError(
+                    f'extra_joints_deg: cell {cell} expected 6 values, got {len(vals)}'
+                )
+            EXTRA_CELL_JOINTS_DEG[cell] = tuple(float(v) for v in vals)
+
+
+def calibrated_cell_joints_map() -> dict:
+    """Return {cell_name: (6 floats)} for all calibrated cells (corners + extras)."""
+    out = {c: tuple(CORNER_JOINTS_DEG[c]) for c in REQUIRED_GRID_CORNERS}
+    out.update(EXTRA_CELL_JOINTS_DEG)
+    return out
 
 
 def save_calibration(path: str | None = None,
@@ -209,10 +247,14 @@ def save_calibration(path: str | None = None,
         target = os.path.expanduser(path)
     else:
         target = grid_calibration_path()
+    all_cells = calibrated_cell_joints_map()
     data = {
         'frame_id': frame_id,
         'eef_link': eef_link,
+        # Legacy key — kept for backward compatibility with older readers.
         'corner_joints_deg': {c: list(CORNER_JOINTS_DEG[c]) for c in REQUIRED_GRID_CORNERS},
+        # New key — full map of every captured cell (corners + extras).
+        'calibrated_cells_joints_deg': {c: list(v) for c, v in all_cells.items()},
     }
     directory = os.path.dirname(target)
     if directory:
@@ -237,10 +279,26 @@ def load_calibration(path: str | None = None,
     try:
         with open(target, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        # Prefer the new full-cell map; fall back to legacy corners-only.
+        all_cells = data.get('calibrated_cells_joints_deg')
+        corner_joints = data.get('corner_joints_deg')
+        extras = None
+        if all_cells:
+            # Split into "must be all 4 corners present" + extras for cells.
+            corners_from_all = {
+                c: all_cells[c] for c in REQUIRED_GRID_CORNERS if c in all_cells
+            }
+            if len(corners_from_all) == len(REQUIRED_GRID_CORNERS):
+                corner_joints = corners_from_all
+            extras = {
+                c: v for c, v in all_cells.items()
+                if c not in REQUIRED_GRID_CORNERS
+            }
         apply_calibration(
             poses_m=data.get('corner_tool_poses_m'),
             rot_vec_rad=data.get('corner_tool_rot_vec_rad'),
-            joints_deg=data.get('corner_joints_deg'),
+            joints_deg=corner_joints,
+            extra_joints_deg=extras,
         )
         return True, target
     except Exception as e:
@@ -310,6 +368,113 @@ def _bilinear_tuple(corners: dict[str, tuple[float, ...]],
     )
 
 
+def _piecewise_linear(anchors: list[tuple[float, tuple[float, ...]]],
+                      t: float) -> tuple[float, ...]:
+    """
+    1-D piecewise-linear interp through a list of (param, value-tuple) anchors.
+    `anchors` is assumed sorted by param.  Clamps `t` to the anchor range.
+    """
+    if not anchors:
+        raise ValueError('_piecewise_linear: no anchors')
+    if t <= anchors[0][0]:
+        return anchors[0][1]
+    if t >= anchors[-1][0]:
+        return anchors[-1][1]
+    for (t0, v0), (t1, v1) in zip(anchors, anchors[1:]):
+        if t0 <= t <= t1:
+            span = t1 - t0
+            if span <= 1e-12:
+                return v0
+            f = (t - t0) / span
+            return tuple(a + (b - a) * f for a, b in zip(v0, v1))
+    return anchors[-1][1]
+
+
+def _edge_anchors(cells: dict[str, tuple[float, ...]],
+                  axis: str,
+                  fixed_letter: str) -> list[tuple[float, tuple[float, ...]]]:
+    """
+    Collect (param, value) anchors along one edge of the grid.
+
+    axis='row'  → walk all columns at the row whose char == fixed_letter.
+                  param = col_idx / (n_cols - 1).
+    axis='col'  → walk all rows    at the column whose char == fixed_letter.
+                  param = row_idx / (n_rows - 1).
+
+    Only includes cells that exist in `cells`.
+    """
+    out: list[tuple[float, tuple[float, ...]]] = []
+    if axis == 'row':
+        n = len(GRID_COLS) - 1
+        for i, col_char in enumerate(GRID_COLS):
+            name = f'{col_char}{fixed_letter}'
+            if name in cells:
+                out.append((i / n, cells[name]))
+    else:
+        n = len(GRID_ROWS) - 1
+        for i, row_char in enumerate(GRID_ROWS):
+            name = f'{fixed_letter}{row_char}'
+            if name in cells:
+                out.append((i / n, cells[name]))
+    return out
+
+
+def _coons_tuple(cells: dict[str, tuple[float, ...]],
+                 u: float,
+                 v: float) -> tuple[float, ...]:
+    """
+    Transfinite (Coons-patch) interpolation over a tuple-valued cell map.
+
+    Uses the four edge curves (row 1, row 4, col A, col G) plus a bilinear
+    correction over the 4 corners.  Each edge is piecewise-linear through
+    whatever calibration anchors are available on that edge.  When only the
+    4 corners are anchored, this collapses exactly to the bilinear surface.
+
+    Formula per component:
+        C(u, v) = (1-v)·Row1(u) + v·Row4(u)
+                + (1-u)·ColA(v) + u·ColG(v)
+                - [(1-u)(1-v)·A1 + u(1-v)·G1 + (1-u)v·A4 + uv·G4]
+    """
+    row1 = _edge_anchors(cells, 'row', '1')
+    row4 = _edge_anchors(cells, 'row', '4')
+    col_a = _edge_anchors(cells, 'col', 'A')
+    col_g = _edge_anchors(cells, 'col', 'G')
+
+    r1 = _piecewise_linear(row1, u)
+    r4 = _piecewise_linear(row4, u)
+    ca = _piecewise_linear(col_a, v)
+    cg = _piecewise_linear(col_g, v)
+    A1, G1, A4, G4 = (cells['A1'], cells['G1'], cells['A4'], cells['G4'])
+
+    def bil(i):
+        return ((1 - u) * (1 - v) * A1[i]
+                + u * (1 - v) * G1[i]
+                + (1 - u) * v * A4[i]
+                + u * v * G4[i])
+
+    n = len(A1)
+    return tuple(
+        (1 - v) * r1[i] + v * r4[i]
+        + (1 - u) * ca[i] + u * cg[i]
+        - bil(i)
+        for i in range(n)
+    )
+
+
+def _joints_interp_tuple(u: float, v: float) -> tuple[float, ...]:
+    """
+    Pick the right interpolation for the joint table.
+    - With no extra calibrated cells: original 4-corner bilinear (unchanged behaviour).
+    - With any extras: Coons patch over corners + extras.  This still returns
+      the original corners exactly at u,v ∈ {0,1}, but bends to honour the
+      extra anchors along row 1 / column A.
+    """
+    if not EXTRA_CELL_JOINTS_DEG:
+        return _bilinear_tuple(CORNER_JOINTS_DEG, u, v)
+    cells = calibrated_cell_joints_map()
+    return _coons_tuple(cells, u, v)
+
+
 def cell_to_pose(cell: str) -> tuple[float, float, float]:
     """
     Return (x, y, z) in metres for the centre of a grid cell.
@@ -332,17 +497,24 @@ def cell_to_tool_rotvec_rad(cell: str) -> tuple[float, float, float]:
     return _bilinear_tuple(CORNER_TOOL_ROT_VEC_RAD, u, v)
 
 
+def grid_uv_to_rotvec_rad(u: float, v: float) -> tuple[float, float, float]:
+    """Return interpolated UR tool rotation-vector for normalized u/v in [0, 1]."""
+    u = min(1.0, max(0.0, float(u)))
+    v = min(1.0, max(0.0, float(v)))
+    return _bilinear_tuple(CORNER_TOOL_ROT_VEC_RAD, u, v)
+
+
 def cell_to_joints_deg(cell: str) -> list[float]:
-    """Return interpolated corner-calibrated joint angles in degrees."""
+    """Return interpolated joint angles in degrees (Coons patch if extras exist)."""
     u, v = _cell_uv(cell)
-    return list(_bilinear_tuple(CORNER_JOINTS_DEG, u, v))
+    return list(_joints_interp_tuple(u, v))
 
 
 def grid_uv_to_joints_deg(u: float, v: float) -> list[float]:
     """Return interpolated joint angles for normalized grid coordinates."""
     u = min(1.0, max(0.0, float(u)))
     v = min(1.0, max(0.0, float(v)))
-    return list(_bilinear_tuple(CORNER_JOINTS_DEG, u, v))
+    return list(_joints_interp_tuple(u, v))
 
 
 # ── Direct trajectory construction ─────────────────────────────────────────────
