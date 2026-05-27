@@ -126,15 +126,14 @@ CAMERA_TO_ROBOT_ROW_OFFSET_CELLS = 0.0
 GLOBAL_GRID_ROW_TRIM_CELLS = 0.0
 GLOBAL_GRID_COL_TRIM_CELLS = 0.0
 
-# Raise all cut targets slightly. Shoulder lift uses the existing convention
-# where more negative means higher; -0.5° is roughly the 3 mm over-depth seen
-# on the board. The right-near corner gets a little extra because it was the
-# protective-stop corner.
-GLOBAL_CUT_LIFT_DEG = -0.5
+# Extra cut-depth correction on top of the calibrated joints.
+# Calibration is now taught with the end-effector AT the final cut position,
+# so the robot should go exactly to the calibrated pose — no extra lift.
+# (Set GLOBAL_CUT_LIFT_DEG slightly negative only if cuts come out too deep;
+#  more negative = higher / shallower. Per-cell tweaks go in CELL_CUT_LIFT_DEG.)
+GLOBAL_CUT_LIFT_DEG = 0.0
 RIGHT_NEAR_CELL = f'{GRID_COLS[-1]}{GRID_ROWS[-1]}'
-CELL_CUT_LIFT_DEG = {
-    RIGHT_NEAR_CELL: -0.5,
-}
+CELL_CUT_LIFT_DEG = {}
 
 START_HOLD_SEC = 0.5
 MIN_MOVE_DURATION_SEC = 4.0

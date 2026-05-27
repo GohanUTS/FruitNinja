@@ -12,7 +12,7 @@ poses instead of using the old fixed joint table:
 Capture flow:
   1. Freedrive/jog the tool tip to A1 on the physical board.
   2. ros2 run fruitninja grid_calibrator --capture A1
-  3. Repeat for N1, N4, A4.
+  3. Repeat for F1, F4, A4.
 
 For URSim smoke tests you can write a small reachable demo grid around the
 current tool pose:
@@ -107,8 +107,8 @@ def _demo_calibration(center_tf, frame_id: str, eef_link: str,
         'eef_link': eef_link,
         'corner_tool_poses_m': {
             'A1': [cx - half_w, cy - half_d, cz],
-            'N1': [cx + half_w, cy - half_d, cz],
-            'N4': [cx + half_w, cy + half_d, cz],
+            'F1': [cx + half_w, cy - half_d, cz],
+            'F4': [cx + half_w, cy + half_d, cz],
             'A4': [cx - half_w, cy + half_d, cz],
         },
         'corner_tool_rot_vec_rad': {

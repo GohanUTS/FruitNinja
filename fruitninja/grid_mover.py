@@ -2,7 +2,7 @@
 """
 FruitNinja Grid Mover
 =====================
-Moves the UR3e end-effector to any cell in a 7×4 grid (A1–G4).
+Moves the UR3e end-effector to any cell in a 6×4 grid (A1–F4).
 
 Positions are computed from a fixed four-corner calibration measured on the
 UR3e teach pendant.  The photographed corner readings are stored below as both
@@ -14,7 +14,7 @@ calibrated grid angles.  Tool positions are logged for checking, but no
 Cartesian position goal / IK target is sent.
 
 Coordinate mapping (base_link frame):
-  X axis  width  :  A → N  (left → right,  +X direction)
+  X axis  width  :  A → F  (left → right,  +X direction)
   Y axis  depth  :  row 4 → row 1  (far → near robot,  +Y direction)
   Z              :  interpolated from measured corner heights
 
@@ -39,17 +39,20 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 
-REQUIRED_GRID_CORNERS = ('A1', 'G1', 'G4', 'A4')
+REQUIRED_GRID_CORNERS = ('A1', 'F1', 'F4', 'A4')
+# New corner name → ordered list of older names it may appear under in saved
+# calibration files (7-column 'G' grids, and the even older 'N' naming).
+# Lets old files load without crashing; re-calibrate for correct 6-col geometry.
 LEGACY_GRID_CORNER_ALIASES = {
-    'G1': 'N1',
-    'G4': 'N4',
+    'F1': ('G1', 'N1'),
+    'F4': ('G4', 'N4'),
 }
 
 # Cells the GUI can optionally capture in addition to the 4 corners.
 # Capturing the full row 1 line + the full column A line lets the Coons-patch
 # interpolation honour those edges exactly, which removes the joint-space
 # curvature error in middle cells.  Order matters for UI layout only.
-EXTENDED_ROW1_CELLS = ('B1', 'C1', 'D1', 'E1', 'F1')
+EXTENDED_ROW1_CELLS = ('B1', 'C1', 'D1', 'E1')
 EXTENDED_COL_A_CELLS = ('A2', 'A3')
 EXTENDED_CALIBRATION_CELLS = (
     REQUIRED_GRID_CORNERS + EXTENDED_ROW1_CELLS + EXTENDED_COL_A_CELLS
@@ -112,7 +115,7 @@ def list_saved_profiles() -> dict[str, bool]:
 
 # ── Grid layout ────────────────────────────────────────────────────────────────
 
-GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+GRID_COLS = ['A', 'B', 'C', 'D', 'E', 'F']
 GRID_ROWS = ['1', '2', '3', '4']
 
 JOINT_NAMES = [
@@ -144,8 +147,12 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 # Corner assignment from the base joint in the photos:
 #   Base  31.07° → A1
 #   Base  43.97° → A4
-#   Base -30.35° → G1
-#   Base -42.83° → G4
+#   Base -30.35° → F1
+#   Base -42.83° → F4
+#
+# NOTE: these are built-in DEFAULTS only.  They were measured on the old 7-col
+# (A–G) board so the F1/F4 values here are geometrically stale for the 6-col
+# (A–F) grid — re-calibrate the 4 corners in the GUI for accurate cutting.
 #
 # Tool positions are stored in metres in the UR/base_link frame.  RX/RY/RZ are
 # the UR tool rotation-vector values in radians, kept here for traceability.
@@ -153,23 +160,23 @@ GOAL_TOLERANCE_RAD = math.radians(2.0)
 CORNER_TOOL_POSES_M = {
     'A1': (-0.24444, -0.30023, -0.34079),
     'A4': (-0.24502, -0.42324, -0.33927),
-    'G1': ( 0.25091, -0.30122, -0.33918),
-    'G4': ( 0.25719, -0.42685, -0.33850),
+    'F1': ( 0.25091, -0.30122, -0.33918),
+    'F4': ( 0.25719, -0.42685, -0.33850),
 }
 
 CORNER_TOOL_ROT_VEC_RAD = {
     'A1': (3.093, -0.047, -0.145),
     'A4': (3.118, -0.057,  0.017),
-    'G1': (3.124, -0.060, -0.035),
-    'G4': (3.137, -0.034, -0.179),
+    'F1': (3.124, -0.060, -0.035),
+    'F4': (3.137, -0.034, -0.179),
 }
 
 CORNER_JOINTS_DEG = {
     # shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
     'A1': ( 31.07, -46.60, 107.83, -157.25, -90.72, 123.03),
     'A4': ( 43.97, -30.44,  65.77, -125.94, -88.64, 136.30),
-    'G1': (-30.35, -132.74, -103.43,  -34.39,  88.55, 241.85),
-    'G4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
+    'F1': (-30.35, -132.74, -103.43,  -34.39,  88.55, 241.85),
+    'F4': (-42.83, -152.31,  -57.19,  294.72,  85.65, 228.51),
 }
 
 # Optional extra calibrated cells (poses + orientations) beyond the 4 corners,
@@ -188,9 +195,13 @@ EXTRA_CELL_JOINTS_DEG: dict = {}
 
 def _normalise_corner_map(corners: dict, expected_len: int, label: str) -> dict:
     normalised = dict(corners)
-    for new_key, old_key in LEGACY_GRID_CORNER_ALIASES.items():
-        if new_key not in normalised and old_key in normalised:
-            normalised[new_key] = normalised[old_key]
+    for new_key, old_keys in LEGACY_GRID_CORNER_ALIASES.items():
+        if new_key in normalised:
+            continue
+        for old_key in old_keys:
+            if old_key in normalised:
+                normalised[new_key] = normalised[old_key]
+                break
 
     missing = [c for c in REQUIRED_GRID_CORNERS if c not in normalised]
     if missing:
@@ -349,12 +360,12 @@ del _active
 # and average grid spacing constants directly.
 A4_X, A4_Y, A4_Z = CORNER_TOOL_POSES_M['A4']
 COL_SPACING = (
-    (CORNER_TOOL_POSES_M['G1'][0] - CORNER_TOOL_POSES_M['A1'][0]) +
-    (CORNER_TOOL_POSES_M['G4'][0] - CORNER_TOOL_POSES_M['A4'][0])
+    (CORNER_TOOL_POSES_M['F1'][0] - CORNER_TOOL_POSES_M['A1'][0]) +
+    (CORNER_TOOL_POSES_M['F4'][0] - CORNER_TOOL_POSES_M['A4'][0])
 ) / (2 * (len(GRID_COLS) - 1))
 ROW_SPACING = (
     (CORNER_TOOL_POSES_M['A1'][1] - CORNER_TOOL_POSES_M['A4'][1]) +
-    (CORNER_TOOL_POSES_M['G1'][1] - CORNER_TOOL_POSES_M['G4'][1])
+    (CORNER_TOOL_POSES_M['F1'][1] - CORNER_TOOL_POSES_M['F4'][1])
 ) / (2 * (len(GRID_ROWS) - 1))
 
 # ── Cell → fixed-grid interpolation ────────────────────────────────────────────
@@ -371,7 +382,7 @@ def _cell_uv(cell: str) -> tuple[float, float]:
     if row_char not in GRID_ROWS:
         raise ValueError(f"Invalid row '{row_char}'. Valid: {GRID_ROWS}")
 
-    col_idx = GRID_COLS.index(col_char)   # 0 = A … 6 = G
+    col_idx = GRID_COLS.index(col_char)   # 0 = A … 5 = F
     row_idx = GRID_ROWS.index(row_char)   # 0 = row1 … 3 = row4
     return col_idx / (len(GRID_COLS) - 1), row_idx / (len(GRID_ROWS) - 1)
 
@@ -386,7 +397,7 @@ def _bilinear_tuple(corners: dict[str, tuple[float, ...]],
     """
     Interpolate a tuple-valued corner table.
 
-    Top edge is A1→G1, bottom edge is A4→G4, then v blends row1→row4.
+    Top edge is A1→F1, bottom edge is A4→F4, then v blends row1→row4.
     """
     n = len(corners['A1'])
     tl, tr, br, bl = REQUIRED_GRID_CORNERS
@@ -457,37 +468,39 @@ def _coons_tuple(cells: dict[str, tuple[float, ...]],
     """
     Transfinite (Coons-patch) interpolation over a tuple-valued cell map.
 
-    Uses the four edge curves (row 1, row 4, col A, col G) plus a bilinear
-    correction over the 4 corners.  Each edge is piecewise-linear through
-    whatever calibration anchors are available on that edge.  When only the
-    4 corners are anchored, this collapses exactly to the bilinear surface.
+    Uses the four edge curves (first/last row, first/last column) plus a
+    bilinear correction over the 4 corners.  Each edge is piecewise-linear
+    through whatever calibration anchors are available on that edge.  When only
+    the 4 corners are anchored, this collapses exactly to the bilinear surface.
+
+    Corner/edge letters are taken from GRID_COLS / GRID_ROWS so this works for
+    any grid size (the corners are tl, tr, br, bl == REQUIRED_GRID_CORNERS).
 
     Formula per component:
-        C(u, v) = (1-v)·Row1(u) + v·Row4(u)
-                + (1-u)·ColA(v) + u·ColG(v)
-                - [(1-u)(1-v)·A1 + u(1-v)·G1 + (1-u)v·A4 + uv·G4]
+        C(u, v) = (1-v)·RowFirst(u) + v·RowLast(u)
+                + (1-u)·ColFirst(v) + u·ColLast(v)
+                - [(1-u)(1-v)·tl + u(1-v)·tr + (1-u)v·bl + uv·br]
     """
-    row1 = _edge_anchors(cells, 'row', '1')
-    row4 = _edge_anchors(cells, 'row', '4')
-    col_a = _edge_anchors(cells, 'col', 'A')
-    col_g = _edge_anchors(cells, 'col', 'G')
+    first_col, last_col = GRID_COLS[0], GRID_COLS[-1]
+    first_row, last_row = GRID_ROWS[0], GRID_ROWS[-1]
+    tl, tr, br, bl = REQUIRED_GRID_CORNERS   # (A1, F1, F4, A4)
 
-    r1 = _piecewise_linear(row1, u)
-    r4 = _piecewise_linear(row4, u)
-    ca = _piecewise_linear(col_a, v)
-    cg = _piecewise_linear(col_g, v)
-    A1, G1, A4, G4 = (cells['A1'], cells['G1'], cells['A4'], cells['G4'])
+    row_first = _piecewise_linear(_edge_anchors(cells, 'row', first_row), u)
+    row_last = _piecewise_linear(_edge_anchors(cells, 'row', last_row), u)
+    col_first = _piecewise_linear(_edge_anchors(cells, 'col', first_col), v)
+    col_last = _piecewise_linear(_edge_anchors(cells, 'col', last_col), v)
+    c_tl, c_tr, c_br, c_bl = cells[tl], cells[tr], cells[br], cells[bl]
 
     def bil(i):
-        return ((1 - u) * (1 - v) * A1[i]
-                + u * (1 - v) * G1[i]
-                + (1 - u) * v * A4[i]
-                + u * v * G4[i])
+        return ((1 - u) * (1 - v) * c_tl[i]
+                + u * (1 - v) * c_tr[i]
+                + (1 - u) * v * c_bl[i]
+                + u * v * c_br[i])
 
-    n = len(A1)
+    n = len(c_tl)
     return tuple(
-        (1 - v) * r1[i] + v * r4[i]
-        + (1 - u) * ca[i] + u * cg[i]
+        (1 - v) * row_first[i] + v * row_last[i]
+        + (1 - u) * col_first[i] + u * col_last[i]
         - bil(i)
         for i in range(n)
     )
@@ -752,7 +765,7 @@ class GridMoverNode(Node):
         return success
 
     def trace_corners(self) -> bool:
-        """Visit all 4 grid corners in order: A1 → G1 → G4 → A4."""
+        """Visit all 4 grid corners in order: A1 → F1 → F4 → A4."""
         for cell in REQUIRED_GRID_CORNERS:
             self.get_logger().info(f'Tracing corner {cell}')
             if not self.move_to_cell(cell):
@@ -767,9 +780,9 @@ def main(args=None):
     parser = argparse.ArgumentParser(description='Move UR3e to a grid cell')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--cell',  type=str,
-                       help='Grid cell e.g. A1, B3, G4')
+                       help='Grid cell e.g. A1, B3, F4')
     group.add_argument('--trace', action='store_true',
-                       help='Trace all 4 grid corners: A1 → G1 → G4 → A4')
+                       help='Trace all 4 grid corners: A1 → F1 → F4 → A4')
     parsed, remaining = parser.parse_known_args()
 
     rclpy.init(args=remaining)
